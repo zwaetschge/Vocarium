@@ -1,0 +1,250 @@
+name: vocarium
+
+# ---------------------------------------------------------------------------
+# Vocarium — self-hosted, ElevenLabs-compatible voice platform.
+#
+# Configuration is driven by `.env` (copy `.env.example` first). All host
+# port mappings, GPU assignments, idle timeouts, and external service URLs
+# can be overridden without editing this file.
+# ---------------------------------------------------------------------------
+
+x-podcast-env: &podcast-env
+  # Podcast Studio external services. Empty = podcast features disabled.
+  LLM_API_URL: ${LLM_API_URL:-}
+  LLM_MODEL: ${LLM_MODEL:-}
+  LLM_API_KEY: ${LLM_API_KEY:-}
+  LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0.8}
+  LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-16384}
+  EMBEDDING_API_URL: ${EMBEDDING_API_URL:-}
+  EMBEDDING_MODEL: ${EMBEDDING_MODEL:-}
+  EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+  EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1024}
+  DOCLING_API_URL: ${DOCLING_API_URL:-}
+
+services:
+  # --- ASR (Qwen3-ASR with on-demand vLLM backend) ---------------------------
+  qwen3-asr:
+    image: qwenllm/qwen3-asr:latest
+    container_name: qwen3-asr
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${GPU_ASR:-0}
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - GPU_MEM_UTIL=0.3
+      - MAX_MODEL_LEN=2048
+      - IDLE_TIMEOUT=${ASR_IDLE_TIMEOUT:-300}
+    ports:
+      - "${ASR_PORT:-8200}:8000"
+    volumes:
+      - ${HF_CACHE_DIR:-./models}:/root/.cache/huggingface
+      - ./entrypoint.sh:/entrypoint.sh:ro
+      - ./asr_proxy.py:/app/asr_proxy.py:ro
+    entrypoint: ["/bin/bash", "/entrypoint.sh"]
+    shm_size: "4g"
+    restart: unless-stopped
+    networks:
+      - voice-network
+
+  # --- TTS replica 1 ---------------------------------------------------------
+  qwen3-tts:
+    build:
+      context: ./qwen3-tts
+      dockerfile: Dockerfile
+    container_name: qwen3-tts
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${GPU_TTS_1:-0}
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - MODELS_DIR=/app/models
+      - VOICES_DIR=/app/voices
+      - DEFAULT_MODEL=${DEFAULT_TTS_MODEL:-1.7b-base}
+      - IDLE_TIMEOUT=${TTS_IDLE_TIMEOUT:-120}
+      - ATTN_IMPL=${TTS_ATTN_IMPL:-eager}
+    ports:
+      - "${TTS_PORT:-8201}:8880"
+    volumes:
+      - ./qwen3-tts/models:/app/models
+      - ./qwen3-tts/server.py:/app/server.py:ro
+      - ./qwen3-tts/ref_audio:/app/ref_audio:ro
+      - voices-data:/app/voices
+    shm_size: "4g"
+    restart: unless-stopped
+    networks:
+      - voice-network
+
+  # --- TTS replica 2 (second GPU; opportunistic) -----------------------------
+  qwen3-tts-2:
+    build:
+      context: ./qwen3-tts
+      dockerfile: Dockerfile
+    container_name: qwen3-tts-2
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${GPU_TTS_2:-1}
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - MODELS_DIR=/app/models
+      - VOICES_DIR=/app/voices
+      - DEFAULT_MODEL=${DEFAULT_TTS_MODEL:-1.7b-base}
+      - IDLE_TIMEOUT=${TTS_IDLE_TIMEOUT:-120}
+      - ATTN_IMPL=${TTS_ATTN_IMPL:-eager}
+    ports:
+      - "${TTS_PORT_2:-8202}:8880"
+    volumes:
+      - ./qwen3-tts/models:/app/models
+      - ./qwen3-tts/server.py:/app/server.py:ro
+      - ./qwen3-tts/ref_audio:/app/ref_audio:ro
+      - voices-data:/app/voices
+    shm_size: "4g"
+    restart: unless-stopped
+    networks:
+      - voice-network
+
+  # --- ACE-Step (music) ------------------------------------------------------
+  acestep:
+    build:
+      context: ./acestep
+      dockerfile: Dockerfile
+    container_name: acestep
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${GPU_MUSIC:-1}
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - ACESTEP_CONFIG_PATH=acestep-v15-xl-turbo
+      - ACESTEP_LM_MODEL_PATH=acestep-5Hz-lm-1.7B
+      - ACESTEP_LM_BACKEND=pt
+      - IDLE_TIMEOUT=${MUSIC_IDLE_TIMEOUT:-600}
+    ports:
+      - "${MUSIC_PORT:-8203}:8003"
+    volumes:
+      - ./acestep/proxy.py:/app/proxy.py:ro
+      - acestep-cache:/root/.cache/huggingface
+      - acestep-output:/app/acestep/.cache/acestep
+    shm_size: "4g"
+    restart: unless-stopped
+    networks:
+      - voice-network
+
+  # --- MMAudio (sound effects) -----------------------------------------------
+  mmaudio:
+    build:
+      context: ./mmaudio
+      dockerfile: Dockerfile
+    container_name: mmaudio
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${GPU_SFX:-1}
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - IDLE_TIMEOUT=${SFX_IDLE_TIMEOUT:-600}
+    ports:
+      - "${SFX_PORT:-8204}:8004"
+    volumes:
+      - mmaudio-cache:/root/.cache
+    shm_size: "4g"
+    restart: unless-stopped
+    networks:
+      - voice-network
+
+  # --- Gateway API (replica 1) -----------------------------------------------
+  vocarium-api:
+    build:
+      context: ./vocarium-api
+      dockerfile: Dockerfile
+    container_name: vocarium-api
+    environment:
+      <<: *podcast-env
+      TTS_URL: http://qwen3-tts:8880
+      TTS_URL_2: http://qwen3-tts-2:8880
+      ASR_URL: http://qwen3-asr:8000
+      MUSIC_URL: http://acestep:8003
+      SFX_URL: http://mmaudio:8004
+      DATA_DIR: /app/data
+      VOICES_DIR: /app/voices
+      PODCAST_AUDIO_PATH: /app/data/podcast_audio
+      PODCAST_SFX_PATH: /app/data/podcast_sfx
+      PODCAST_UPLOAD_PATH: /app/data/podcast_uploads
+      ALLOW_ANONYMOUS: ${ALLOW_ANONYMOUS:-true}
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "${VOCARIUM_API_PORT:-8280}:8280"
+    volumes:
+      - ./vocarium-api/main.py:/app/main.py:ro
+      - ./vocarium-api/database.py:/app/database.py:ro
+      - ./vocarium-api/gpu_queue.py:/app/gpu_queue.py:ro
+      - ./vocarium-api/podcast:/app/podcast:ro
+      - type: tmpfs
+        target: /app/podcast/__pycache__
+      - vocarium-data:/app/data
+      - voices-data:/app/voices
+    restart: unless-stopped
+    depends_on:
+      - qwen3-tts
+    networks:
+      - voice-network
+
+  # --- Gateway API (replica 2 — sister apps / round-robin) -------------------
+  vocarium-api-2:
+    build:
+      context: ./vocarium-api
+      dockerfile: Dockerfile
+    container_name: vocarium-api-2
+    environment:
+      <<: *podcast-env
+      TTS_URL: http://qwen3-tts-2:8880
+      TTS_URL_2: http://qwen3-tts:8880
+      ASR_URL: http://qwen3-asr:8000
+      MUSIC_URL: http://acestep:8003
+      SFX_URL: http://mmaudio:8004
+      DATA_DIR: /app/data
+      VOICES_DIR: /app/voices
+      PODCAST_AUDIO_PATH: /app/data/podcast_audio
+      PODCAST_SFX_PATH: /app/data/podcast_sfx
+      PODCAST_UPLOAD_PATH: /app/data/podcast_uploads
+      ALLOW_ANONYMOUS: ${ALLOW_ANONYMOUS:-true}
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "${VOCARIUM_API_PORT_2:-8281}:8280"
+    volumes:
+      - ./vocarium-api/main.py:/app/main.py:ro
+      - ./vocarium-api/database.py:/app/database.py:ro
+      - ./vocarium-api/gpu_queue.py:/app/gpu_queue.py:ro
+      - ./vocarium-api/podcast:/app/podcast:ro
+      - type: tmpfs
+        target: /app/podcast/__pycache__
+      - vocarium-data-2:/app/data
+      - voices-data:/app/voices
+    restart: unless-stopped
+    depends_on:
+      - qwen3-tts-2
+    networks:
+      - voice-network
+
+  # --- UI --------------------------------------------------------------------
+  vocarium-ui:
+    build:
+      context: ./vocarium-ui
+      dockerfile: Dockerfile
+    container_name: vocarium-ui
+    ports:
+      - "${VOCARIUM_UI_PORT:-3100}:3000"
+    restart: unless-stopped
+    depends_on:
+      - vocarium-api
+    networks:
+      - voice-network
+
+volumes:
+  voices-data:
+  vocarium-data:
+  vocarium-data-2:
+  acestep-cache:
+  acestep-output:
+  mmaudio-cache:
+
+networks:
+  voice-network:
+    name: voice-network
+    driver: bridge

@@ -1,0 +1,25 @@
+# Production overlay
+# ---------------------------------------------------------------------------
+# Hides backend services from the host network — only the UI (and optionally
+# the gateway) are reachable from outside `voice-network`.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+# ---------------------------------------------------------------------------
+
+services:
+  qwen3-asr:
+    ports: []
+  qwen3-tts:
+    ports: []
+  qwen3-tts-2:
+    ports: []
+  acestep:
+    ports: []
+  mmaudio:
+    ports: []
+  # By default, only the UI is published. If you front Vocarium with an
+  # external reverse proxy (Authelia / Traefik / nginx), drop the API port
+  # below as well and put the proxy on `voice-network`.
+  vocarium-api-2:
+    ports: []

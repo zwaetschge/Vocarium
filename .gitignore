@@ -1,0 +1,77 @@
+# --- Secrets / runtime config ---
+.env
+.env.*
+!.env.example
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# --- Node / Vite ---
+node_modules/
+dist/
+.vite/
+*.log
+npm-debug.log*
+
+# --- Databases ---
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+
+# --- Generated / runtime data ---
+data/
+voices/
+*.wav
+*.mp3
+*.flac
+*.opus
+*.m4a
+*.aac
+*.ogg
+
+# Allow license-clear sample fixtures (place under qwen3-tts/ref_audio/samples/)
+!qwen3-tts/ref_audio/samples/*.wav
+
+# --- HuggingFace / model caches ---
+models/
+qwen3-tts/models/
+**/.cache/
+**/huggingface/
+
+# --- IDE / editor ---
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# --- Claude Code working files ---
+.claude-webui-attachments/
+.claude/
+.claude.local/
+CLAUDE.local.md
+
+# --- Docker / build artifacts ---
+*.pid
+*.seed
+.dockerignore.local
+
+# --- Misc personal ---
+*.bak
+*.tmp
+notes.local.md
+
+# --- Unrelated nested project (separate git repo, own stack) ---
+vibevoice-api/
