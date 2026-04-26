@@ -20,6 +20,28 @@ management path (`/api/voices/clone`, `/api/generate`, `/api/transcribe`).
 
 ---
 
+## Screenshots
+
+**Text to Speech** — pick a voice, paste text, generate or stream.
+![Speech](docs/screenshots/speech.png)
+
+**Voice Library** — every cloned, designed and prebuilt voice in one place.
+![Voice Library](docs/screenshots/voice-library.png)
+
+**Custom voices** — nine prebuilt speakers with optional steering prompt.
+![Custom](docs/screenshots/custom-voice.png)
+
+**Music Studio** — ACE-Step text-to-music with optional lyrics and presets.
+![Music](docs/screenshots/music.png)
+
+**Sound Effects** — MMAudio cinematic sound design from a sentence.
+![Sound Effects](docs/screenshots/sound-effects.png)
+
+**Podcast Studio** — turn a PDF into a multi-voice scripted podcast.
+![Podcast Studio](docs/screenshots/podcast-studio.png)
+
+---
+
 ## Hardware
 
 - **GPU**: NVIDIA, ≥ 12 GB VRAM. **One GPU is the default** — TTS, ASR,

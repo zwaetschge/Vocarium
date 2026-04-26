@@ -40,11 +40,11 @@ const EXAMPLES = [
     accent: 'accent',
   },
   {
-    title: 'Indie Pop',
+    title: 'Synth Pop',
     badge: 'Vocals',
-    prompt: 'indie pop, upbeat, jangly guitars, catchy chorus, danceable, summer vibes',
+    prompt: 'retro synth pop, 80s vibes, gated reverb drums, warm analog synths, soaring vocals',
     lyrics:
-      '[Verse 1]\nThe sun is shining bright today\nSummer finally found its way\n\n[Chorus]\nLa la la, we dance tonight\nLa la la, the world feels right',
+      '[Verse 1]\nNeon lights across the sky\nWe were never meant to fly\n\n[Chorus]\nHold on tight, we burn so bright\nLost in the glow of the city lights',
     accent: 'aurora-4',
   },
 ] as const;
