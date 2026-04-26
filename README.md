@@ -9,8 +9,10 @@ third party. One Docker Compose stack gives you:
 - **ASR** — Qwen3-ASR transcription for voice cloning and arbitrary audio.
 - **Music** — ACE-Step text-to-music with optional lyrics.
 - **SFX** — MMAudio sound effects from text prompts.
-- **Podcast Studio** — turn an uploaded PDF or document into a multi-host
-  dialogue script and render it across both GPUs in parallel.
+- **Podcast Studio (beta)** — turn an uploaded PDF or document into a
+  multi-host dialogue script and render it to audio. Works, but the
+  script-generation prompts and pacing are still being tuned; expect
+  rough edges.
 - **React UI** with pages for every feature, plus a settings panel for
   per-user LLM provider configuration.
 
@@ -37,7 +39,7 @@ management path (`/api/voices/clone`, `/api/generate`, `/api/transcribe`).
 **Sound Effects** — MMAudio cinematic sound design from a sentence.
 ![Sound Effects](docs/screenshots/sound-effects.png)
 
-**Podcast Studio** — turn a PDF into a multi-voice scripted podcast.
+**Podcast Studio (beta)** — turn a PDF into a multi-voice scripted podcast.
 ![Podcast Studio](docs/screenshots/podcast-studio.png)
 
 ---
@@ -61,8 +63,8 @@ management path (`/api/voices/clone`, `/api/generate`, `/api/transcribe`).
 ## Quick start
 
 ```bash
-git clone https://github.com/<your-fork>/vocarium.git
-cd vocarium
+git clone https://github.com/zwaetschge/Vocarium.git
+cd Vocarium
 ./scripts/install.sh
 ```
 
@@ -145,7 +147,11 @@ For a quick local single-user setup, leave `ALLOW_ANONYMOUS=true`. Every
 header-less request is then routed to a shared `api` user. **Do not use
 this in any deployment exposed to the internet.**
 
-### Podcast Studio (optional)
+### Podcast Studio (beta, optional)
+
+> **Beta:** the podcast pipeline produces watchable output but the script
+> prompts, pacing and voice-routing are still being iterated on. Quality
+> varies with the input document and the LLM you point it at.
 
 The podcast pipeline depends on three external services that you supply:
 
