@@ -27,7 +27,10 @@ from gpu_queue import gpu_queue, register_unloaders
 from podcast.routes import create_podcast_router
 
 TTS_URL = os.environ.get("TTS_URL", "http://qwen3-tts:8880")
-TTS_URL_2 = os.environ.get("TTS_URL_2", "http://qwen3-tts-2:8880")
+# Optional second TTS replica (set when running with COMPOSE_PROFILES=dual-gpu).
+# Empty/unset means single-GPU mode — all TTS goes through TTS_URL.
+TTS_URL_2 = os.environ.get("TTS_URL_2", "").strip()
+EXTRA_TTS_URLS = [TTS_URL_2] if TTS_URL_2 else []
 ASR_URL = os.environ.get("ASR_URL", "http://qwen3-asr:8000")
 MUSIC_URL = os.environ.get("MUSIC_URL", "http://acestep:8003")
 SFX_URL = os.environ.get("SFX_URL", "http://mmaudio:8004")
@@ -152,7 +155,7 @@ async def _run_tts_job(description: str, work_maker):
 podcast_router, audio_assembler = create_podcast_router(
     get_current_user=get_current_user,
     tts_url=TTS_URL,
-    extra_tts_urls=[TTS_URL_2],
+    extra_tts_urls=EXTRA_TTS_URLS,
     db_getter=get_db,
     gpu_submit=gpu_queue.submit,
 )

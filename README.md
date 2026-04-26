@@ -22,9 +22,10 @@ management path (`/api/voices/clone`, `/api/generate`, `/api/transcribe`).
 
 ## Hardware
 
-- **GPU**: NVIDIA, ≥ 12 GB VRAM. Two GPUs recommended (the stack splits
-  TTS replicas across both and runs music/SFX on the secondary). One GPU
-  works — set every `GPU_*` variable in `.env` to the same index.
+- **GPU**: NVIDIA, ≥ 12 GB VRAM. **One GPU is the default** — TTS, ASR,
+  music, and SFX share the GPU and auto-unload when idle. A second GPU
+  is optional (opt-in via `COMPOSE_PROFILES=dual-gpu`) and adds a parallel
+  TTS replica plus dedicated music/SFX placement.
 - Tested on **RTX 3060 (12 GB)** and **RTX 5060 Ti (16 GB, Blackwell SM 12.0)**.
 - **CPU/RAM**: 8 cores, 32 GB RAM is comfortable.
 - **Disk**: ~25 GB for model weights + working space for generated audio.
@@ -82,20 +83,31 @@ Everything is in `.env`. Highlights:
 | `VOCARIUM_UI_PORT` | `3100`         | Public UI port.                                           |
 | `VOCARIUM_API_PORT`| `8280`         | Gateway API.                                              |
 | `GPU_TTS_1`        | `0`            | GPU index for the primary TTS replica.                    |
-| `GPU_TTS_2`        | `1`            | GPU index for the secondary TTS replica.                  |
-| `GPU_ASR`          | `0`            | GPU index for ASR. Coexists with TTS on GPU 0.            |
-| `GPU_MUSIC` / `GPU_SFX` | `1` / `1` | Music + SFX share the secondary GPU.                      |
+| `GPU_ASR`          | `0`            | GPU index for ASR. Coexists with TTS via idle-unload.     |
+| `GPU_MUSIC` / `GPU_SFX` | `0` / `0` | Default: same GPU as TTS. Re-pin to `1` for dual-GPU.     |
+| `COMPOSE_PROFILES` | (empty)        | Set to `dual-gpu` to enable a second TTS replica.         |
+| `TTS_URL_2`        | (empty)        | Set to `http://qwen3-tts-2:8880` in dual-GPU mode.        |
 | `TTS_IDLE_TIMEOUT` | `120` s        | Auto-unload after this idle period. `0` = never.          |
 | `ALLOW_ANONYMOUS`  | `true`         | Single-user fallback when no `Remote-User` header.        |
 | `CORS_ORIGINS`     | `*`            | Restrict to your UI origins in production.                |
 | `DEFAULT_TTS_MODEL`| `1.7b-base`    | One of `1.7b-base`, `1.7b-design`, `1.7b-custom`.         |
 | `LLM_API_URL` etc. | (empty)        | Required for **Podcast Studio**; see below.               |
 
-### Single-GPU layout
+### Dual-GPU mode (optional)
 
-Set every `GPU_*=0` in `.env`. The auto-unload logic (`*_IDLE_TIMEOUT`) is
-designed for this: TTS unloads while ASR runs, ACE-Step evicts whoever
-holds the GPU, etc. Throughput is lower but it works.
+If you have two GPUs, uncomment two lines in `.env` to spin up a second
+TTS replica on GPU 1 and pin music/SFX there:
+
+```
+COMPOSE_PROFILES=dual-gpu
+TTS_URL_2=http://qwen3-tts-2:8880
+GPU_MUSIC=1
+GPU_SFX=1
+```
+
+Then `docker compose up -d` brings up the extra `qwen3-tts-2` and
+`vocarium-api-2` containers. With one GPU, leave these commented and the
+auto-unload logic (`*_IDLE_TIMEOUT`) keeps everything coexisting on GPU 0.
 
 ### Authentication
 
@@ -135,20 +147,20 @@ Vocarium works without them.
                     ▼
               vocarium-api:8280 (FastAPI)
                     │
-                    ├──► qwen3-tts        (GPU 0, port 8880)
-                    ├──► qwen3-tts-2      (GPU 1, port 8880)
-                    ├──► qwen3-asr        (GPU 0, port 8000) — lazy
-                    ├──► acestep          (GPU 1, port 8003) — lazy
-                    └──► mmaudio          (GPU 1, port 8004) — lazy
+                    ├──► qwen3-tts        (port 8880)
+                    ├──► qwen3-tts-2      (port 8880) — dual-gpu profile only
+                    ├──► qwen3-asr        (port 8000) — lazy
+                    ├──► acestep          (port 8003) — lazy
+                    └──► mmaudio          (port 8004) — lazy
 ```
 
 - **GPU coordination** is handled by `vocarium-api/gpu_queue.py` (FIFO with
   per-job kind; conflicting models are evicted before the next job runs).
-- **Podcast TTS bypasses the queue** and round-robins across both TTS
-  replicas with `asyncio.Semaphore(3)` — typical scripts have 50-100+
-  segments and serializing them through the queue would take an hour.
 - **Lazy services** (ASR / music / SFX) start a child process on first
-  request and shut it down after `*_IDLE_TIMEOUT` seconds.
+  request and shut it down after `*_IDLE_TIMEOUT` seconds — this is what
+  makes single-GPU operation viable.
+- **Dual-GPU mode** adds a second TTS replica on the secondary GPU and
+  uses it as a failover/parallel target for podcast rendering.
 
 See `CLAUDE.md` for the full architecture write-up and `AGENTS.md` for
 non-obvious gotchas (CUDA-graph hangs on Blackwell, pycache poisoning

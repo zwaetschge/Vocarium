@@ -255,7 +255,7 @@ export default function SoundEffectsPage() {
           </span>
         </div>
         <span style={{ fontSize: '11px', color: 'var(--color-text-dim)', letterSpacing: '0.04em', textTransform: 'uppercase', fontWeight: 500 }}>
-          GPU 1 · shared with Music
+          Shared GPU with Music
         </span>
       </motion.div>
 

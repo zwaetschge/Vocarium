@@ -94,10 +94,11 @@ class VocariumTTSGenerator:
         extra_tts_urls: list[str] | None = None,
         max_parallel_workers: int = 2,
     ):
-        # Primary TTS endpoint (GPU 0 via gpu_queue)
+        # Primary TTS endpoint
         self.tts_url = tts_url
-        # Extra TTS endpoints (GPU 1 direct) – round-robin used for parallel workers
-        self._extra_tts_urls = list(extra_tts_urls or [])
+        # Extra TTS endpoints (failover order). Empty entries are filtered so
+        # callers can pass an unconditional list with optional URLs.
+        self._extra_tts_urls = [u for u in (extra_tts_urls or []) if u]
         self._db_getter = db_getter
         self._gpu_submit = gpu_submit
         self._max_parallel_workers = max_parallel_workers

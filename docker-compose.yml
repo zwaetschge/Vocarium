@@ -72,8 +72,9 @@ services:
     networks:
       - voice-network
 
-  # --- TTS replica 2 (second GPU; opportunistic) -----------------------------
+  # --- TTS replica 2 (opt-in: enable with COMPOSE_PROFILES=dual-gpu) --------
   qwen3-tts-2:
+    profiles: ["dual-gpu"]
     build:
       context: ./qwen3-tts
       dockerfile: Dockerfile
@@ -153,7 +154,7 @@ services:
     environment:
       <<: *podcast-env
       TTS_URL: http://qwen3-tts:8880
-      TTS_URL_2: http://qwen3-tts-2:8880
+      TTS_URL_2: ${TTS_URL_2:-}
       ASR_URL: http://qwen3-asr:8000
       MUSIC_URL: http://acestep:8003
       SFX_URL: http://mmaudio:8004
@@ -183,8 +184,9 @@ services:
     networks:
       - voice-network
 
-  # --- Gateway API (replica 2 — sister apps / round-robin) -------------------
+  # --- Gateway API (replica 2 — opt-in: COMPOSE_PROFILES=dual-gpu) ----------
   vocarium-api-2:
+    profiles: ["dual-gpu"]
     build:
       context: ./vocarium-api
       dockerfile: Dockerfile

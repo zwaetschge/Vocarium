@@ -4,32 +4,32 @@ This file provides guidance to Claude Code (Claude.ai/code) when working with co
 
 ## What this repo is
 
-Self-hosted, ElevenLabs-compatible voice platform named **Vocarium**. A Docker Compose stack that orchestrates eight services: a central FastAPI gateway (`vocarium-api`), a React/Vite UI, and five GPU inference workers (TTS ×2, ASR, music, SFX). Inter-service traffic runs on the `voice-network` bridge; public traffic lands on the gateway.
+Self-hosted, ElevenLabs-compatible voice platform named **Vocarium**. A Docker Compose stack that orchestrates a central FastAPI gateway (`vocarium-api`), a React/Vite UI, and four GPU inference workers (TTS, ASR, music, SFX). A second TTS replica (`qwen3-tts-2`) and a second API (`vocarium-api-2`) are gated behind the `dual-gpu` Compose profile and only start when explicitly enabled. Inter-service traffic runs on the `voice-network` bridge; public traffic lands on the gateway.
 
-The stack also includes a **Podcast Studio** (`/podcasts` endpoints): an LLM-driven script generator that turns uploaded documents into a multi-speaker dialogue script, then renders the script to audio via parallel TTS across two GPUs.
+The stack also includes a **Podcast Studio** (`/podcasts` endpoints): an LLM-driven script generator that turns uploaded documents into a multi-speaker dialogue script, then renders the script to audio with optional failover to the second TTS replica.
 
 ## Architecture
 
 ```
-UI (3100) ──► vocarium-api (8280) ──► gpu_queue ──┬─► qwen3-tts     (8880 internal, 8201 host) [GPU 0, TTS]
-                   │                               ├─► qwen3-tts-2   (8880 internal, 8202 host) [GPU 1, TTS]
-                   │                               ├─► qwen3-asr     (8000 internal, 8200 host) [GPU 0, ASR]
-                   │                               ├─► acestep       (8003 internal, 8203 host) [GPU 1, Music]
-                   │                               └─► mmaudio       (8004 internal, 8204 host) [GPU 1, SFX]
+UI (3100) ──► vocarium-api (8280) ──► gpu_queue ──┬─► qwen3-tts     (8880 internal, 8201 host)
+                   │                               ├─► qwen3-tts-2   (dual-gpu profile only)
+                   │                               ├─► qwen3-asr     (8000 internal, 8200 host)
+                   │                               ├─► acestep       (8003 internal, 8203 host)
+                   │                               └─► mmaudio       (8004 internal, 8204 host)
                    └── SQLite at /app/data/vocarium.db (users, voices, podcasts, benchmarks, hosts, llm_providers)
                    └── Shared voices volume: /app/voices (custom voice metadata + ref audio)
 ```
 
-Inter-container URLs use service names on `voice-network`: `http://qwen3-tts:8880`, `http://qwen3-tts-2:8880`, `http://qwen3-asr:8000`, `http://acestep:8003`, `http://mmaudio:8004`. These are set via env vars on `vocarium-api`.
+Inter-container URLs use service names on `voice-network`: `http://qwen3-tts:8880`, `http://qwen3-asr:8000`, `http://acestep:8003`, `http://mmaudio:8004`. `TTS_URL_2` is empty by default; in dual-GPU mode it's set to `http://qwen3-tts-2:8880`.
 
 ### GPU coordination (non-obvious)
 
-Two physical GPUs, five inference workers — GPU sharing is actively managed:
+GPU placement is env-driven (`GPU_TTS_1`, `GPU_TTS_2`, `GPU_ASR`, `GPU_MUSIC`, `GPU_SFX`). Defaults put everything on GPU 0; idle-unload timeouts are what make that viable.
 
-- **GPU 0 (RTX 3060, 12GB)**: `qwen3-tts` + `qwen3-asr` coexist, but cannot both hold full model context at once. `qwen3-asr` runs as a lazy-start proxy (`asr_proxy.py`) — spins up vLLM on first `/v1/models` request, unloads after `IDLE_TIMEOUT=300s`. `qwen3-tts` now uses `IDLE_TIMEOUT=120` (not 0) so sequential podcast segments reuse the same model without a 20s reload, while still freeing VRAM for ASR after idle.
-- **GPU 1 (RTX 5060 Ti, 16GB, Blackwell SM 12.0)**: `qwen3-tts-2` (TTS replica), `acestep` (music), `mmaudio` (SFX). These are opportunistically shared. TTS-2 uses `IDLE_TIMEOUT=120`. Music and SFX request eviction of TTS before starting; they mutually exclude each other and both unload after 600s idle.
+- **Single-GPU (default)**: All workers target GPU 0. `qwen3-tts` uses `IDLE_TIMEOUT=120` so sequential podcast segments reuse the loaded model without a 20s reload, while still freeing VRAM after idle so ASR/music/SFX can claim the GPU. `qwen3-asr` runs as a lazy-start proxy (`asr_proxy.py`) — spins up vLLM on first `/v1/models` request, unloads after `IDLE_TIMEOUT=300s`. ACE-Step/MMAudio are similarly lazy; they request TTS eviction before starting, mutually exclude each other, and both unload after 600s idle.
+- **Dual-GPU (opt-in via `COMPOSE_PROFILES=dual-gpu` + `TTS_URL_2=http://qwen3-tts-2:8880`)**: `qwen3-tts-2` starts on GPU 1 (`GPU_TTS_2=1`). Recommended to also set `GPU_MUSIC=1`/`GPU_SFX=1` to move music/SFX off GPU 0. `vocarium-api-2` also starts (uses `vocarium-data-2` volume) for sister-app deployments.
 - **`vocarium-api/gpu_queue.py`** is a FIFO coordinator that serializes GPU work. Before running a job it evicts conflicting models (e.g., unloads ACE-Step before starting MMAudio). Non-podcast TTS/Music/SFX calls from `main.py` go through `gpu_queue.submit(kind, description, work)`.
-- **Podcast TTS bypasses `gpu_queue` entirely** — the `AudioAssembler` round-robins directly across `qwen3-tts` and `qwen3-tts-2` via plain HTTP with `aiohttp`, using `asyncio.Semaphore(3)` to limit concurrency. This is necessary because podcast audio has 50–100+ segments; queuing them through the single `gpu_queue` "tts" slot would serialize all work to one GPU and take over an hour.
+- **Podcast TTS bypasses `gpu_queue` entirely** — the `AudioAssembler` calls `qwen3-tts` (and `qwen3-tts-2` as failover when configured) directly via `aiohttp`, using `asyncio.Semaphore(3)` to limit concurrency. In single-GPU mode the second URL is filtered out (`EXTRA_TTS_URLS = []` in `main.py`) and all parallel workers hit `qwen3-tts`, which queues them internally.
 
 ### Podcast Data Flow
 
