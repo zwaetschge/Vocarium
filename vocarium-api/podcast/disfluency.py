@@ -17,7 +17,7 @@ from typing import Literal
 logger = logging.getLogger(__name__)
 
 
-SegmentType = Literal["speech", "reaction", "pause", "sfx"]
+SegmentType = Literal["speech", "reaction", "pause", "sfx", "music"]
 Language = Literal["german", "english"]
 ReactionType = Literal[
     "agreement",
@@ -44,6 +44,13 @@ class ScriptSegment:
     regenerated_from: str | None = None
     created_at: str = ""
     updated_at: str = ""
+    # Mixing offset relative to the previous segment's end (ms).
+    # 0 = use the contextual gap; <0 = overlap (interruption); >0 = forced gap.
+    overlap_ms: int = 0
+    # Audio-track fields. Used by type="music" and type="sfx" with prompt.
+    prompt: str | None = None
+    duration_ms: int = 0
+    volume_db: float = 0.0
 
 
 @dataclass

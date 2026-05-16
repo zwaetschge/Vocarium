@@ -8,11 +8,12 @@ cloning / design / benchmark workflows.
 import asyncio
 import io
 import json
+import logging
 import os
 import time
 import uuid
 from pathlib import Path
-from typing import Optional
+from urllib.parse import urlparse
 
 import aiohttp
 import uvicorn
@@ -26,6 +27,8 @@ from database import init_db, get_db, get_or_create_user, backfill_hosts_for_all
 from gpu_queue import gpu_queue, register_unloaders
 from podcast.routes import create_podcast_router
 
+logger = logging.getLogger(__name__)
+
 TTS_URL = os.environ.get("TTS_URL", "http://qwen3-tts:8880")
 # Optional second TTS replica (set when running with COMPOSE_PROFILES=dual-gpu).
 # Empty/unset means single-GPU mode — all TTS goes through TTS_URL.
@@ -36,6 +39,11 @@ MUSIC_URL = os.environ.get("MUSIC_URL", "http://acestep:8003")
 SFX_URL = os.environ.get("SFX_URL", "http://mmaudio:8004")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 VOICES_DIR = Path(os.environ.get("VOICES_DIR", "/app/voices"))
+MAX_VOICE_UPLOAD_BYTES = int(os.environ.get("MAX_VOICE_UPLOAD_BYTES", str(50 * 1024 * 1024)))
+MAX_TRANSCRIBE_UPLOAD_BYTES = int(
+    os.environ.get("MAX_TRANSCRIBE_UPLOAD_BYTES", str(500 * 1024 * 1024))
+)
+MAX_TTS_TEXT_CHARS = int(os.environ.get("MAX_TTS_TEXT_CHARS", "20000"))
 
 # `true` allows OpenAI-style endpoints to fall back to a shared "api" user
 # when no Remote-User header is present. Disable for multi-user deployments.
@@ -88,32 +96,102 @@ def get_current_user(request: Request, allow_anonymous: bool = False) -> dict:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def _mb(n_bytes: int) -> int:
+    return max(1, n_bytes // (1024 * 1024))
+
+
+async def _read_upload_limited(
+    upload: UploadFile,
+    max_bytes: int,
+    label: str,
+) -> bytes:
+    data = await upload.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise HTTPException(413, f"{label} too large (max {_mb(max_bytes)} MB)")
+    return data
+
+
+def _require_text_limit(text: str, field: str = "text") -> None:
+    if len(text) > MAX_TTS_TEXT_CHARS:
+        raise HTTPException(
+            413,
+            f"{field} too long (max {MAX_TTS_TEXT_CHARS} characters)",
+        )
+
+
+def _is_youtube_url(raw_url: str) -> bool:
+    parsed = urlparse(raw_url)
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = (parsed.hostname or "").lower()
+    return (
+        host == "youtu.be"
+        or host == "youtube.com"
+        or host.endswith(".youtube.com")
+    )
+
+
+async def _post_unload(
+    url: str,
+    label: str,
+    loaded_key: str,
+    *,
+    wait_if_busy: bool = False,
+) -> None:
+    attempts = 60 if wait_if_busy else 1
+    for attempt in range(attempts):
+        try:
+            timeout = aiohttp.ClientTimeout(total=30)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(f"{url}/unload") as resp:
+                    if resp.status < 400:
+                        try:
+                            data = await resp.json()
+                        except Exception:
+                            data = {}
+                        if data.get("status") == "busy":
+                            if attempt + 1 < attempts:
+                                await asyncio.sleep(2)
+                                continue
+                            logger.warning(
+                                "%s stayed busy; continuing without unloading", label
+                            )
+                            return
+                        if data.get(loaded_key):
+                            logger.info("Unloaded %s to free shared GPU VRAM", label)
+                        return
+                    body = await resp.text()
+                    logger.warning("%s unload failed (%s): %s", label, resp.status, body[:200])
+                    return
+        except Exception as exc:
+            logger.debug("%s unload skipped: %s", label, exc)
+            return
+
+
+async def _unload_tts():
+    """Unload the primary TTS model if it is idle."""
+    await _post_unload(TTS_URL, "Qwen3-TTS", "was_loaded", wait_if_busy=True)
+
+
+async def _unload_extra_tts():
+    """Unload the optional secondary TTS model if configured and idle."""
+    if TTS_URL_2:
+        await _post_unload(TTS_URL_2, "Qwen3-TTS-2", "was_loaded", wait_if_busy=True)
+
+
+async def _unload_asr():
+    """Tell the ASR proxy to unload its backend, freeing shared GPU VRAM."""
+    await _post_unload(ASR_URL, "Qwen3-ASR", "was_running")
+
+
 async def _unload_music():
-    """Tell ACE-Step proxy to unload backend, freeing GPU 1 VRAM."""
-    try:
-        timeout = aiohttp.ClientTimeout(total=30)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(f"{MUSIC_URL}/unload") as resp:
-                if resp.status < 400:
-                    data = await resp.json()
-                    if data.get("was_running"):
-                        print("Unloaded ACE-Step to free GPU 1 for SFX", flush=True)
-    except Exception:
-        pass
+    """Tell ACE-Step proxy to unload backend, freeing shared GPU VRAM."""
+    await _post_unload(MUSIC_URL, "ACE-Step", "was_running")
 
 
 async def _unload_sfx():
-    """Tell MMAudio to unload model, freeing GPU 1 VRAM."""
-    try:
-        timeout = aiohttp.ClientTimeout(total=30)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(f"{SFX_URL}/unload") as resp:
-                if resp.status < 400:
-                    data = await resp.json()
-                    if data.get("was_loaded"):
-                        print("Unloaded MMAudio to free GPU 1 for music", flush=True)
-    except Exception:
-        pass
+    """Tell MMAudio to unload model, freeing shared GPU VRAM."""
+    await _post_unload(SFX_URL, "MMAudio", "was_loaded")
 
 
 async def tts_request(method: str, path: str, *, url: str | None = None, **kwargs) -> tuple[int, dict, bytes]:
@@ -158,6 +236,8 @@ podcast_router, audio_assembler = create_podcast_router(
     extra_tts_urls=EXTRA_TTS_URLS,
     db_getter=get_db,
     gpu_submit=gpu_queue.submit,
+    music_url=MUSIC_URL,
+    sfx_url=SFX_URL,
 )
 app.include_router(podcast_router)
 
@@ -176,14 +256,16 @@ async def auth_me(request: Request):
 # Queue status
 # ---------------------------------------------------------------------------
 @app.get("/api/queue/status")
-async def queue_status():
+async def queue_status(request: Request):
     """Return current GPU queue state."""
+    get_current_user(request)
     return gpu_queue.get_status()
 
 
 @app.get("/api/queue/status/{job_id}")
-async def queue_job_status(job_id: str):
+async def queue_job_status(job_id: str, request: Request):
     """Return status of a specific queued job."""
+    get_current_user(request)
     info = gpu_queue.get_job_status(job_id)
     if not info:
         raise HTTPException(404, "Job not found")
@@ -199,23 +281,29 @@ async def startup():
     # Backfill preset hosts for existing users (idempotent)
     backfill = backfill_hosts_for_all_users()
     if backfill:
-        print(f"Backfilled {backfill} preset host(s)", flush=True)
+        logger.info("Backfilled %d preset host(s)", backfill)
     # Sync voices from TTS filesystem into SQLite if needed
     await _sync_voices_from_tts()
-    # Start GPU queue with unload callbacks
-    # TTS+ASR stay loaded on GPU 0 (dedicated). Only music/sfx on GPU 1 need unloading.
-    register_unloaders({
+    # Start GPU queue with unload callbacks. The queue decides conflicts from
+    # GPU_TTS_*/GPU_ASR/GPU_MUSIC/GPU_SFX, so single-GPU and dual-GPU layouts
+    # both unload only what can actually collide.
+    unloaders = {
+        "tts": _unload_tts,
+        "asr": _unload_asr,
         "music": _unload_music,
         "sfx": _unload_sfx,
-    })
+    }
+    if TTS_URL_2:
+        unloaders["tts_extra"] = _unload_extra_tts
+    register_unloaders(unloaders)
     gpu_queue.start()
     try:
         cleaned = await audio_assembler.clean_stale_jobs()
         if cleaned:
-            print(f"Cleaned {cleaned} stale podcast assembly job(s)", flush=True)
+            logger.info("Cleaned %d stale podcast assembly job(s)", cleaned)
     except Exception as exc:
-        print(f"Podcast cleanup skipped: {exc}", flush=True)
-    print("Vocarium API ready (GPU queue active)", flush=True)
+        logger.warning("Podcast cleanup skipped: %s", exc)
+    logger.info("Vocarium API ready (GPU queue active)")
 
 
 async def _sync_voices_from_tts():
@@ -247,12 +335,14 @@ async def _sync_voices_from_tts():
 # Models
 # ---------------------------------------------------------------------------
 @app.get("/api/models")
-async def list_models():
+async def list_models(request: Request):
+    get_current_user(request)
     return await tts_json("GET", "/v1/models")
 
 
 @app.get("/api/models/current")
-async def current_model():
+async def current_model(request: Request):
+    get_current_user(request)
     return await tts_json("GET", "/v1/models/current")
 
 
@@ -261,7 +351,8 @@ class SwitchModelRequest(BaseModel):
 
 
 @app.post("/api/models/switch")
-async def switch_model(req: SwitchModelRequest):
+async def switch_model(req: SwitchModelRequest, request: Request):
+    get_current_user(request)
     return await tts_json("POST", "/v1/models/load", json={"model_id": req.model_id})
 
 
@@ -358,9 +449,9 @@ async def _register_voice_on_tts(
                        filename="ref_audio.wav", content_type="audio/wav")
         status, _, body = await tts_request("POST", endpoint, url=TTS_URL, data=form)
         if status >= 400:
-            print(f"TTS registration warning: {body.decode()}", flush=True)
+            logger.warning("TTS registration warning: %s", body.decode(errors="replace"))
     except Exception as e:
-        print(f"TTS registration failed: {e}", flush=True)
+        logger.warning("TTS registration failed: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -381,7 +472,9 @@ async def clone_voice(
     voice_dir = VOICES_DIR / voice_id
     voice_dir.mkdir(parents=True, exist_ok=True)
 
-    audio_bytes = await ref_audio.read()
+    audio_bytes = await _read_upload_limited(
+        ref_audio, MAX_VOICE_UPLOAD_BYTES, "Reference audio"
+    )
     audio_path = voice_dir / "ref_audio.wav"
 
     # Convert to WAV
@@ -401,7 +494,7 @@ async def clone_voice(
         try:
             ref_text = await _transcribe_audio(audio_path)
         except Exception as e:
-            print(f"Auto-transcription failed: {e}", flush=True)
+            logger.warning("Auto-transcription failed: %s", e)
             ref_text = ""
 
     if not ref_text.strip():
@@ -467,6 +560,7 @@ class DesignPreviewRequest(BaseModel):
 async def design_preview(req: DesignPreviewRequest, request: Request):
     """Preview a designed voice (does not save it)."""
     get_current_user(request)  # auth check
+    _require_text_limit(req.text)
 
     async def work_maker(tts_url):
         status, headers, body = await tts_request(
@@ -493,6 +587,7 @@ class DesignSaveRequest(BaseModel):
 async def design_and_save(req: DesignSaveRequest, request: Request):
     """Design a voice and save it for future use."""
     user = get_current_user(request)
+    _require_text_limit(req.text)
 
     async def work_maker(tts_url):
         status, headers, audio_bytes = await tts_request(
@@ -563,6 +658,7 @@ class CustomVoicePreviewRequest(BaseModel):
 async def custom_voice_preview(req: CustomVoicePreviewRequest, request: Request):
     """Preview a custom-voice generation (does not save)."""
     get_current_user(request)  # auth check
+    _require_text_limit(req.text)
 
     async def work_maker(tts_url):
         status, headers, body = await tts_request(
@@ -666,6 +762,7 @@ async def openai_tts_custom(req: CustomSpeechRequest, request: Request):
     applied server-side.
     """
     user = get_current_user(request, allow_anonymous=True)
+    _require_text_limit(req.input, "input")
     preset = _resolve_custom_voice(req.voice, user_id=user["id"])
 
     async def work_maker(tts_url):
@@ -744,6 +841,7 @@ def _verify_voice_source(voice_id: str, allowed_sources: tuple[str, ...], user_i
 async def generate_speech_stream(req: GenerateRequest, request: Request):
     """Stream speech generation via SSE — queued for GPU access, buffered then streamed."""
     user = get_current_user(request)
+    _require_text_limit(req.text)
     _verify_voice_exists(req.voice_id, user_id=user["id"])
     payload = {
         "input": req.text,
@@ -791,6 +889,7 @@ async def generate_speech_stream(req: GenerateRequest, request: Request):
 async def generate_speech(req: GenerateRequest, request: Request):
     """Generate speech using a stored voice."""
     user = get_current_user(request)
+    _require_text_limit(req.text)
     _verify_voice_exists(req.voice_id, user_id=user["id"])
     payload = {
         "input": req.text,
@@ -827,7 +926,12 @@ class BenchmarkRequest(BaseModel):
 @app.post("/api/benchmark/run")
 async def run_benchmark(req: BenchmarkRequest, request: Request):
     """Run a benchmark across model × voice combinations."""
-    get_current_user(request)  # auth check
+    user = get_current_user(request)
+    if not req.text.strip():
+        raise HTTPException(400, "text is required")
+    _require_text_limit(req.text)
+    for voice_id in req.voice_ids:
+        _verify_voice_exists(voice_id, user_id=user["id"])
 
     async def work():
         results = []
@@ -872,9 +976,10 @@ async def run_benchmark(req: BenchmarkRequest, request: Request):
                         results.append(result)
 
                         db.execute(
-                            "INSERT INTO benchmarks (voice_id, model_id, text, audio_duration, generation_time, rtf) "
-                            "VALUES (?,?,?,?,?,?)",
-                            (voice_id, model_id, req.text, audio_dur, gen_time, rtf),
+                            "INSERT INTO benchmarks "
+                            "(user_id, voice_id, model_id, text, audio_duration, generation_time, rtf) "
+                            "VALUES (?,?,?,?,?,?,?)",
+                            (user["id"], voice_id, model_id, req.text, audio_dur, gen_time, rtf),
                         )
                     except Exception as e:
                         results.append({
@@ -889,11 +994,14 @@ async def run_benchmark(req: BenchmarkRequest, request: Request):
 
 
 @app.get("/api/benchmark/results")
-async def get_benchmark_results(limit: int = 50):
+async def get_benchmark_results(request: Request, limit: int = 50):
+    user = get_current_user(request)
+    limit = max(1, min(int(limit), 200))
     db = get_db()
     rows = db.execute(
         "SELECT id, voice_id, model_id, text, audio_duration, generation_time, rtf, created_at "
-        "FROM benchmarks ORDER BY created_at DESC LIMIT ?", (limit,)
+        "FROM benchmarks WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
+        (user["id"], limit),
     ).fetchall()
     return {
         "results": [
@@ -952,7 +1060,8 @@ def _download_youtube(url: str) -> bytes:
     try:
         result = subprocess.run(
             ["yt-dlp", "--no-playlist", "-x", "--audio-format", "wav",
-             "--audio-quality", "0", "--postprocessor-args",
+             "--audio-quality", "0", "--max-filesize", f"{_mb(MAX_TRANSCRIBE_UPLOAD_BYTES)}M",
+             "--postprocessor-args",
              "ffmpeg:-ar 16000 -ac 1", "-o", out_template, url],
             capture_output=True, timeout=600,
         )
@@ -992,13 +1101,17 @@ async def transcribe(
     loop = asyncio.get_event_loop()
 
     if url.strip():
+        if not _is_youtube_url(url.strip()):
+            raise HTTPException(400, "Only YouTube URLs are supported")
         try:
             wav_bytes = await loop.run_in_executor(None, _download_youtube, url.strip())
         except Exception as e:
             raise HTTPException(400, f"Download failed: {e}")
 
     elif file:
-        raw = await file.read()
+        raw = await _read_upload_limited(
+            file, MAX_TRANSCRIBE_UPLOAD_BYTES, "Transcription upload"
+        )
         filename = file.filename or "upload.wav"
         suffix = Path(filename).suffix.lower()
 
@@ -1059,6 +1172,16 @@ async def _music_request(method: str, path: str, **kwargs) -> tuple[int, bytes]:
 async def music_generate(req: MusicGenerateRequest, request: Request):
     """Submit music generation, hold GPU lock until complete, return result."""
     get_current_user(request)  # auth check
+    if not req.prompt.strip():
+        raise HTTPException(400, "prompt is required")
+    if len(req.prompt) > 2000:
+        raise HTTPException(413, "prompt too long (max 2000 characters)")
+    if len(req.lyrics) > 10000:
+        raise HTTPException(413, "lyrics too long (max 10000 characters)")
+    if req.audio_duration < 10 or req.audio_duration > 300:
+        raise HTTPException(400, "audio_duration must be between 10 and 300 seconds")
+    if req.batch_size < 1 or req.batch_size > 4:
+        raise HTTPException(400, "batch_size must be between 1 and 4")
 
     payload = {
         "prompt": req.prompt,
@@ -1134,7 +1257,7 @@ async def music_status(req: MusicStatusRequest, request: Request):
 async def music_audio(path: str, request: Request):
     """Download generated music audio file."""
     get_current_user(request)  # auth check
-    status, body = await _music_request("GET", f"/v1/audio?path={path}")
+    status, body = await _music_request("GET", "/v1/audio", params={"path": path})
     if status >= 400:
         raise HTTPException(status, body.decode(errors="replace"))
     # Guess content type from path
@@ -1187,17 +1310,36 @@ async def _sfx_request(method: str, path: str, **kwargs) -> tuple[int, bytes]:
 @app.post("/api/sfx/generate")
 async def sfx_generate(request: Request):
     """Generate a sound effect from a text prompt. Returns WAV audio."""
+    get_current_user(request)
     body = await request.json()
     prompt = body.get("prompt", "").strip()
     if not prompt:
         raise HTTPException(400, "prompt is required")
+    if len(prompt) > 1000:
+        raise HTTPException(413, "prompt too long (max 1000 characters)")
+    negative_prompt = (body.get("negative_prompt") or "").strip()
+    if len(negative_prompt) > 1000:
+        raise HTTPException(413, "negative_prompt too long (max 1000 characters)")
+
+    try:
+        duration = float(body.get("duration", 8.0))
+        cfg_strength = float(body.get("cfg_strength", 4.5))
+        num_steps = int(body.get("num_steps", 25))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "duration, cfg_strength, and num_steps must be numeric")
+    if duration < 1 or duration > 30:
+        raise HTTPException(400, "duration must be between 1 and 30 seconds")
+    if cfg_strength < 1 or cfg_strength > 10:
+        raise HTTPException(400, "cfg_strength must be between 1 and 10")
+    if num_steps < 1 or num_steps > 100:
+        raise HTTPException(400, "num_steps must be between 1 and 100")
 
     sfx_params = {
         "prompt": prompt,
-        "negative_prompt": body.get("negative_prompt", ""),
-        "duration": body.get("duration", 8.0),
-        "cfg_strength": body.get("cfg_strength", 4.5),
-        "num_steps": body.get("num_steps", 25),
+        "negative_prompt": negative_prompt,
+        "duration": duration,
+        "cfg_strength": cfg_strength,
+        "num_steps": num_steps,
         "seed": body.get("seed"),
     }
 
@@ -1241,6 +1383,7 @@ class OpenAISpeechRequest(BaseModel):
 
 async def _openai_speech_proxy(req: OpenAISpeechRequest, description: str) -> Response:
     """Shared TTS proxy used by both /v1/audio/speech endpoints."""
+    _require_text_limit(req.input, "input")
     payload = {
         "input": req.input,
         "voice": req.voice,
@@ -1300,7 +1443,9 @@ async def openai_stt(
     get_current_user(request, allow_anonymous=True)
     loop = asyncio.get_event_loop()
 
-    raw = await file.read()
+    raw = await _read_upload_limited(
+        file, MAX_TRANSCRIBE_UPLOAD_BYTES, "Transcription upload"
+    )
     filename = file.filename or "upload.wav"
     suffix = Path(filename).suffix.lower()
 
@@ -1437,6 +1582,7 @@ async def get_active_llm_provider(request: Request):
     provider = _get_active_llm_provider(user["id"])
     if not provider:
         raise HTTPException(404, "No active LLM provider configured")
+    provider = {k: v for k, v in provider.items() if k != "api_key"}
     return provider
 
 

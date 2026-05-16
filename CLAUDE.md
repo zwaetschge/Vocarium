@@ -28,15 +28,15 @@ GPU placement is env-driven (`GPU_TTS_1`, `GPU_TTS_2`, `GPU_ASR`, `GPU_MUSIC`, `
 
 - **Single-GPU (default)**: All workers target GPU 0. `qwen3-tts` uses `IDLE_TIMEOUT=120` so sequential podcast segments reuse the loaded model without a 20s reload, while still freeing VRAM after idle so ASR/music/SFX can claim the GPU. `qwen3-asr` runs as a lazy-start proxy (`asr_proxy.py`) — spins up vLLM on first `/v1/models` request, unloads after `IDLE_TIMEOUT=300s`. ACE-Step/MMAudio are similarly lazy; they request TTS eviction before starting, mutually exclude each other, and both unload after 600s idle.
 - **Dual-GPU (opt-in via `COMPOSE_PROFILES=dual-gpu` + `TTS_URL_2=http://qwen3-tts-2:8880`)**: `qwen3-tts-2` starts on GPU 1 (`GPU_TTS_2=1`). Recommended to also set `GPU_MUSIC=1`/`GPU_SFX=1` to move music/SFX off GPU 0. `vocarium-api-2` also starts (uses `vocarium-data-2` volume) for sister-app deployments.
-- **`vocarium-api/gpu_queue.py`** is a FIFO coordinator that serializes GPU work. Before running a job it evicts conflicting models (e.g., unloads ACE-Step before starting MMAudio). Non-podcast TTS/Music/SFX calls from `main.py` go through `gpu_queue.submit(kind, description, work)`.
-- **Podcast TTS bypasses `gpu_queue` entirely** — the `AudioAssembler` calls `qwen3-tts` (and `qwen3-tts-2` as failover when configured) directly via `aiohttp`, using `asyncio.Semaphore(3)` to limit concurrency. In single-GPU mode the second URL is filtered out (`EXTRA_TTS_URLS = []` in `main.py`) and all parallel workers hit `qwen3-tts`, which queues them internally.
+- **`vocarium-api/gpu_queue.py`** is an env-aware FIFO coordinator that serializes GPU work. It reads `GPU_TTS_PRIMARY`, `GPU_TTS_EXTRA`, `GPU_ASR`, `GPU_MUSIC`, and `GPU_SFX`; before running a job it unloads services assigned to the same GPU.
+- **Podcast TTS bypasses `gpu_queue` for direct segment rendering** — the `AudioAssembler` calls `qwen3-tts` (and `qwen3-tts-2` as failover when configured) directly via `aiohttp`, using `asyncio.Semaphore(3)` to limit concurrency. Generated music/SFX assets are rendered before TTS starts, and the assembler has a process-local lock so one audio render cannot unload TTS while another render is active.
 
 ### Podcast Data Flow
 
 1. User uploads source documents (PDF/TXT) → chunks via Docling API
 2. User creates podcast → assigns hosts (preset or custom) with `voice_id` (must be `source='custom'`)
-3. `POST /api/podcasts/{id}/script/generate` → LLM generates multi-speaker script (SSE streamed). Segments have `speaker`, `text`, `type` (`speech`|`reaction`|`pause`), `voice`, and optional `notes` (steers TTS emotion via `instruct`).
-4. `POST /api/podcasts/{id}/audio/generate` → `AudioAssembler` synthesizes each segment in parallel across both TTS GPUs, stitches them with ffmpeg (concat demuxer + EBU R128 loudness normalisation).
+3. `POST /api/podcasts/{id}/script/generate` → LLM generates multi-speaker script (SSE streamed). Segments have `speaker`, `text`, `type` (`speech`|`reaction`|`pause`|`sfx`|`music`), `voice`, optional `notes` (steers TTS emotion via `instruct`), and optional timeline fields (`overlap_ms`, `prompt`, `duration_ms`, `volume_db`).
+4. `POST /api/podcasts/{id}/audio/generate` → `AudioAssembler` renders generated music/SFX first, synthesizes speech/reactions in parallel, then mixes all files on a timeline with ffmpeg `filter_complex`/`amix` plus EBU R128 loudness normalisation.
 5. Audio file is served via `/api/podcasts/{id}/audio/download` (with Content-Disposition filename) or `/audio/stream` (HTTP Range support for scrubbing).
 
 ### Multi-tenancy
@@ -59,8 +59,8 @@ Rebuild is only required when Dockerfiles, `package.json`, or `requirements.txt`
 When `:ro` mounts prevent Python from writing `.pyc`, the interpreter may **silently load stale cached bytecode** even when the source `.py` is newer. This produces "fix didn't work" symptoms that are extremely hard to debug.
 
 **Prevention in this repo:**
-- `PYTHONDONTWRITEBYTECODE=1` is set in `docker-compose.yml` for both `vocarium-api` services
-- A `tmpfs` is mounted over `/app/podcast/__pycache__` as a writable layer
+- `PYTHONDONTWRITEBYTECODE=1` is set in `docker-compose.yml` for both `vocarium-api` and `qwen3-tts` services
+- `tmpfs` mounts cover `/app/__pycache__` and `/app/podcast/__pycache__` so stale image-layer bytecode cannot shadow mounted source
 
 **How to verify your change was picked up:**
 ```bash
@@ -121,7 +121,7 @@ curl -s -X POST http://localhost:8201/v1/audio/speech/custom -H 'Content-Type: a
 - **qwen3-tts & qwen3-tts-2** — Both are the same image but on different GPUs. Expose three model checkpoints: `1.7b-base` (voice cloning via `generate_voice_clone`), `1.7b-design` (`generate_voice_design` with `instruct`), and `1.7b-custom` (`generate_custom_voice` with prebuilt speakers + optional `instruct` steering). The podcast uses `1.7b-custom`. Both use `ATTN_IMPL=eager`. The server wraps blocking inference in `run_in_executor` to keep the asyncio event loop unblocked for concurrent request queuing. `DEFAULT_MODEL` is `1.7b-base`, but podcast generation forces `1.7b-custom` via `ensure_model()`.
 - **qwen3-asr** — Uses the official `qwenllm/qwen3-asr` image with a custom `entrypoint.sh` launching `asr_proxy.py`. The proxy reads free VRAM via `nvidia-smi` and sets vLLM's `gpu_memory_utilization` dynamically so it doesn't collide with TTS.
 - **vocarium-api** — FastAPI, port 8280. Auth via `Remote-User` header (set upstream by Authelia); users auto-created. DB is SQLite in WAL mode at `/app/data/vocarium.db`. Exposes OpenAI-style `/v1/audio/speech`, `/v1/models` and ElevenLabs-style `/api/generate`, `/api/generate/stream` (SSE), `/api/voices`, `/api/voices/clone`, `/api/transcribe`, `/api/music/generate`, `/api/sfx/generate`. Text longer than 200 chars is auto-chunked with 400ms silence between chunks.
-  - **Podcast endpoints** (`/api/podcasts/*`): Full CRUD, script generation (SSE with real-time progress), audio generation (parallel TTS across two GPUs with SSE), audio download/stream with Range support.
+  - **Podcast endpoints** (`/api/podcasts/*`): Full CRUD, script generation (SSE with real-time progress), audio generation (timeline mixing with optional music/SFX overlays and TTS failover when configured), audio download/stream with Range support.
   - **Settings endpoints** (`/api/settings/llm-providers`, `/api/settings/llm-providers/{id}/active`): Per-user LLM provider configuration (API URL, model, key). Active provider resolved at request time.
 - **acestep** — Music generation via cloned ACE-Step repo, uses `uv` for deps, CUDA 12.6.
 - **mmaudio** — SFX from text, CUDA 12.6-devel + PyTorch cu124.
@@ -148,6 +148,14 @@ curl -s -X POST http://localhost:8201/v1/audio/speech/custom -H 'Content-Type: a
 <!-- webui-managed: project-context:start -->
 # Project: voxtral
 
+Vocarium
+
 ## Tech Stack
 Docker Compose
+
+## Key Directories
+scripts/
+
+Available Skills: 20min-satirist, absurdist-lens, android-build, api-design, auto-researcher, bender, book-promo-website, campaign-architect, caveman, claptrap, codebot-prompt-rewriter, codex-prompt-rewriter, comfyui-asset-gen, data-visualization, debugging-playbook, decensor-engine, deep-thought, developmental-editor, devops-deploy, documentation-writer, dr-perry-cox, dr-zoidberg, dragonball-z-design, drunk-texter, dschungel-george, eliza, epub-forge, fallacy-finder, frontend-design, funnybot, graf-zitronenbaum, heisenberg, human-voice, idea-forge, idea-to-code-plan, karen, kevingpt, literary-critique, material-3-design, mental-reflection, michael-scott-boss-mode, michael-scott-roleplay, musical-architect, musical-composer, nano-banana-prompt-engineer, nikola-tesla, panel-transcription, pentest-analyst, performance-tuning, premium-frontend-design, prison-mike, prompt-architect, prompt-expander, refactor-guide, research-prompt-architect, reverse-prompt-engineer, ricks-ship, roman-prosa-engine, schlaubi-schlumpf, schreiner-planer-kontext, screenplay-to-novel, security-review, session-handover, severus-snape, shadowheart, skill-designer, sleep-mystery, social-navigator, spock, storysmith-60, strudel-livecode, succubus-persona, suno-v5-songwriter, svg-expert, swiss-business-email, swiss-writing-conventions, testing-playbook, thaddaeus-gewerkschaftsfuehrer, thinker-frameworks, towelie, truman-burbank, tutorial-architect, vale-persona, vale-proxy, visual-prompt-architect, windows95-design
+Available Agents: api-designer, backend-dev, comfyui-asset-gen, data-engineer, database-specialist, debugging-expert, devops-engineer, documentation-writer, Explore, frontend-developer, fullstack-dev, git-operations, mobile-developer, performance-optimizer, Plan, release-manager, research-bot, security-auditor, system-architect, test-engineer, ui-designer
 <!-- webui-managed: project-context:end -->

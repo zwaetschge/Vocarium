@@ -326,6 +326,7 @@ async def health():
         "status": "ok",
         "current_model": current_model_id,
         "model_loaded": model is not None,
+        "active_requests": active_requests,
         "available_models": {k: v["path"] for k, v in AVAILABLE_MODELS.items()},
         "voices_loaded": list(voice_prompts.keys()),
         "languages": SUPPORTED_LANGUAGES,
@@ -339,6 +340,13 @@ async def health():
 async def unload():
     """Unload current model to free GPU memory for other services."""
     with model_lock:
+        if active_requests > 0:
+            return {
+                "status": "busy",
+                "was_loaded": model is not None,
+                "model_id": current_model_id,
+                "active_requests": active_requests,
+            }
         was_loaded = model is not None
         mid = current_model_id
         _do_unload_model()

@@ -54,13 +54,15 @@ def init_db(db_path: Path):
 
         CREATE TABLE IF NOT EXISTS benchmarks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
             voice_id TEXT,
             model_id TEXT,
             text TEXT,
             audio_duration REAL,
             generation_time REAL,
             rtf REAL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id)
         );
 
         CREATE TABLE IF NOT EXISTS hosts (
@@ -178,6 +180,13 @@ def init_db(db_path: Path):
         _db.execute("ALTER TABLE voices ADD COLUMN speaker TEXT DEFAULT ''")
     if "instruct" not in cols:
         _db.execute("ALTER TABLE voices ADD COLUMN instruct TEXT DEFAULT ''")
+
+    benchmark_cols = {
+        row[1] for row in _db.execute("PRAGMA table_info(benchmarks)").fetchall()
+    }
+    if "user_id" not in benchmark_cols:
+        _db.execute("ALTER TABLE benchmarks ADD COLUMN user_id INTEGER REFERENCES users(id)")
+    _db.execute("CREATE INDEX IF NOT EXISTS idx_benchmarks_user_id ON benchmarks(user_id)")
 
     # Migration: llm_providers table (added 2026-04-22)
     tables = {row[0] for row in _db.execute("SELECT name FROM sqlite_master WHERE type='table'")}

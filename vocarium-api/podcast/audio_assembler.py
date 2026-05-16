@@ -6,9 +6,10 @@ resolver / qwen3-tts client wiring in ``main.py``.
 
 The pipeline:
   1. synthesize each speech/reaction segment to an individual MP3
-  2. trim leading silence from each segment
-  3. stitch the files with context-aware pauses using ffmpeg's concat demuxer
-  4. apply EBU R128 loudness normalisation (I=-16, TP=-1.5, LRA=11)
+  2. generate optional music / prompted SFX assets
+  3. trim leading silence from each segment
+  4. mix every asset on a timeline with ffmpeg filter_complex/amix
+  5. apply EBU R128 loudness normalisation (I=-16, TP=-1.5, LRA=11)
 """
 
 from __future__ import annotations
@@ -94,6 +95,38 @@ class TTSGenerator(Protocol):
         ...
 
     async def default_voice_for_speaker(self, speaker: str, *, user_id: int | None = None) -> str:
+        ...
+
+
+class MusicGenerator(Protocol):
+    """Music dependency. Writes the generated audio to ``output_path`` and
+    returns the duration in seconds."""
+
+    async def generate_to_file(
+        self,
+        prompt: str,
+        duration_s: float,
+        output_path: Path,
+        output_format: AudioFormat,
+        *,
+        user_id: int | None = None,
+    ) -> float:
+        ...
+
+
+class SFXGenerator(Protocol):
+    """Sound-effect dependency. Same shape as MusicGenerator but typically
+    backed by MMAudio."""
+
+    async def generate_to_file(
+        self,
+        prompt: str,
+        duration_s: float,
+        output_path: Path,
+        output_format: AudioFormat,
+        *,
+        user_id: int | None = None,
+    ) -> float:
         ...
 
 
@@ -185,6 +218,12 @@ def _rand_between(a: int, b: int) -> int:
     return round(a + random.random() * (b - a))
 
 
+def _final_codec_args(output_format: AudioFormat) -> list[str]:
+    if output_format == "mp3":
+        return ["-c:a", "libmp3lame", "-b:a", "192k"]
+    return ["-c:a", "pcm_s16le", "-ar", "24000", "-ac", "1"]
+
+
 def _calculate_contextual_pause(
     prev: ScriptSegment, curr: ScriptSegment
 ) -> int:
@@ -234,8 +273,12 @@ class AudioAssembler:
         ffmpeg_path: str = "ffmpeg",
         ffprobe_path: str = "ffprobe",
         user_id: int | None = None,
+        music: MusicGenerator | None = None,
+        sfx: SFXGenerator | None = None,
     ):
         self.tts = tts
+        self.music = music
+        self.sfx = sfx
         self.output_dir = Path(
             output_dir or os.environ.get("PODCAST_AUDIO_PATH", "/app/data/podcast_audio")
         )
@@ -245,9 +288,29 @@ class AudioAssembler:
         self.ffmpeg = ffmpeg_path
         self.ffprobe = ffprobe_path
         self.user_id = user_id
+        self._assembly_lock = asyncio.Lock()
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     async def assemble_from_segments(
+        self,
+        segments: list[ScriptSegment],
+        project_id: str,
+        options: AssemblyOptions | None = None,
+        on_progress: ProgressCallback | None = None,
+        force: bool = False,
+        user_id: int | None = None,
+    ) -> AssemblyResult:
+        async with self._assembly_lock:
+            return await self._assemble_from_segments_unlocked(
+                segments=segments,
+                project_id=project_id,
+                options=options,
+                on_progress=on_progress,
+                force=force,
+                user_id=user_id,
+            )
+
+    async def _assemble_from_segments_unlocked(
         self,
         segments: list[ScriptSegment],
         project_id: str,
@@ -346,7 +409,7 @@ class AudioAssembler:
 
         async def _synthesize_one(idx: int, segment: ScriptSegment) -> None:
             nonlocal completed
-            
+
             self._progress(
                 on_progress,
                 "synthesizing",
@@ -366,8 +429,73 @@ class AudioAssembler:
                 completed += 1
                 return
 
-            # SFX
+            output_path = project_dir / f"{segment.id}.{options.output_format}"
+
+            # Music — render via ACE-Step, cache on disk.
+            if segment.type == "music":
+                if output_path.exists():
+                    results[idx] = SynthesisResult(
+                        segment=segment,
+                        file_path=output_path,
+                        duration=await self.get_audio_duration(output_path),
+                    )
+                    completed += 1
+                    return
+                if self.music is None or not segment.prompt:
+                    logger.warning(
+                        "Skipping music segment %s: %s",
+                        segment.id,
+                        "no MusicGenerator wired" if self.music is None else "no prompt",
+                    )
+                    results[idx] = SynthesisResult(segment=segment, file_path=None, duration=0.0)
+                    completed += 1
+                    return
+                try:
+                    duration = await self.music.generate_to_file(
+                        prompt=segment.prompt,
+                        duration_s=max(1.0, segment.duration_ms / 1000.0),
+                        output_path=output_path,
+                        output_format=options.output_format,
+                        user_id=resolved_user_id,
+                    )
+                    results[idx] = SynthesisResult(
+                        segment=segment, file_path=output_path, duration=duration
+                    )
+                except Exception as exc:
+                    logger.error("Music segment %s failed: %s", segment.id, exc)
+                    results[idx] = SynthesisResult(segment=segment, file_path=None, duration=0.0)
+                completed += 1
+                return
+
+            # SFX — prompted goes via MMAudio, otherwise fall back to bundled clips.
             if segment.type == "sfx":
+                if segment.prompt and self.sfx is not None:
+                    if output_path.exists():
+                        results[idx] = SynthesisResult(
+                            segment=segment,
+                            file_path=output_path,
+                            duration=await self.get_audio_duration(output_path),
+                        )
+                        completed += 1
+                        return
+                    try:
+                        duration = await self.sfx.generate_to_file(
+                            prompt=segment.prompt,
+                            duration_s=max(1.0, (segment.duration_ms or 4000) / 1000.0),
+                            output_path=output_path,
+                            output_format=options.output_format,
+                            user_id=resolved_user_id,
+                        )
+                        results[idx] = SynthesisResult(
+                            segment=segment, file_path=output_path, duration=duration
+                        )
+                    except Exception as exc:
+                        logger.error("SFX segment %s failed: %s", segment.id, exc)
+                        results[idx] = SynthesisResult(segment=segment, file_path=None, duration=0.0)
+                    completed += 1
+                    return
+
+                # Legacy bracketed-tag SFX (e.g. [lacht] → laugh.mp3)
                 sfx_file = self._resolve_sfx(segment.text)
                 if sfx_file and sfx_file.exists():
                     results[idx] = SynthesisResult(
@@ -388,8 +516,6 @@ class AudioAssembler:
                 results[idx] = SynthesisResult(segment=segment, file_path=None, duration=0.0)
                 completed += 1
                 return
-
-            output_path = project_dir / f"{segment.id}.{options.output_format}"
 
             if output_path.exists():
                 duration = await self.get_audio_duration(output_path)
@@ -438,8 +564,29 @@ class AudioAssembler:
                     )
             completed += 1
 
-        # Run all workers concurrently, limited by semaphore
-        workers = [asyncio.create_task(_synthesize_one(i, seg)) for i, seg in enumerate(segments)]
+        # Generate Music/MMAudio assets before speech TTS. On single-GPU setups
+        # those jobs may evict TTS through the GPU queue; doing them first
+        # avoids unloading a model while direct podcast TTS requests are active.
+        generated_overlay_indices = [
+            i for i, seg in enumerate(segments)
+            if seg.type == "music" or (seg.type == "sfx" and seg.prompt and self.sfx is not None)
+        ]
+        generated_overlay_set = set(generated_overlay_indices)
+        foreground_indices = [
+            i for i in range(len(segments)) if i not in generated_overlay_set
+        ]
+
+        for i in generated_overlay_indices:
+            await _synthesize_one(i, segments[i])
+
+        async def _synthesize_one_limited(idx: int, segment: ScriptSegment) -> None:
+            async with sem:
+                await _synthesize_one(idx, segment)
+
+        workers = [
+            asyncio.create_task(_synthesize_one_limited(i, segments[i]))
+            for i in foreground_indices
+        ]
         if workers:
             await asyncio.gather(*workers, return_exceptions=True)
 
@@ -504,97 +651,150 @@ class AudioAssembler:
         options: AssemblyOptions,
         on_progress: ProgressCallback | None,
     ) -> Path:
+        """Mix all segments onto a single timeline.
+
+        Foreground (speech/reaction/pause/sfx-fallback) advance the cursor;
+        overlays (music, prompted sfx) sit on top without consuming time.
+        Per-segment ``overlap_ms`` lets a foreground segment start before the
+        previous one ends (interruption) or force a fixed gap.
+        """
         output_file = self.output_dir / f"{project_id}.{options.output_format}"
 
         temp_dir = self.output_dir / "temp" / generate_id()
         temp_dir.mkdir(parents=True, exist_ok=True)
 
         try:
-            silence_cache: dict[int, Path] = {}
-            trimmed_cache: dict[Path, Path] = {}
+            trimmed_cache: dict[Path, tuple[Path, float]] = {}
 
-            async def get_silence(duration_ms: int) -> Path:
-                rounded = max(round(duration_ms / 50) * 50, 50)
-                if rounded in silence_cache:
-                    return silence_cache[rounded]
-                silence_path = temp_dir / f"silence_{rounded}ms.mp3"
-                await self._run_ffmpeg([
-                    "-f", "lavfi",
-                    "-i", "anullsrc=r=24000:cl=mono",
-                    "-t", f"{rounded / 1000:.3f}",
-                    "-c:a", "libmp3lame",
-                    "-b:a", "192k",
-                    "-y", str(silence_path),
-                ])
-                silence_cache[rounded] = silence_path
-                return silence_path
-
-            async def get_trimmed(src: Path) -> Path:
+            async def get_trimmed(src: Path) -> tuple[Path, float]:
                 if src in trimmed_cache:
                     return trimmed_cache[src]
-                trimmed_path = temp_dir / f"trimmed_{src.name}"
+                trimmed_path = temp_dir / f"trimmed_{len(trimmed_cache)}.wav"
                 try:
                     await self._run_ffmpeg([
                         "-i", str(src),
                         "-af",
                         "silenceremove=start_periods=1:start_duration=0.02:start_threshold=-45dB",
-                        "-c:a", "libmp3lame",
-                        "-b:a", "192k",
+                        "-ar", "24000",
+                        "-ac", "1",
+                        "-c:a", "pcm_s16le",
                         "-y", str(trimmed_path),
                     ])
                     if trimmed_path.exists() and trimmed_path.stat().st_size > 500:
-                        trimmed_cache[src] = trimmed_path
-                        return trimmed_path
+                        duration = await self.get_audio_duration(trimmed_path)
+                        trimmed_cache[src] = (trimmed_path, duration)
+                        return trimmed_cache[src]
                 except Exception as exc:
                     logger.debug("trim failed for %s: %s", src, exc)
-                trimmed_cache[src] = src
-                return src
+                duration = await self.get_audio_duration(src)
+                trimmed_cache[src] = (src, duration)
+                return trimmed_cache[src]
 
-            concat_lines: list[str] = []
+            # --- Build the timeline ------------------------------------------
+            # Each entry: file path, start offset (ms), volume (dB).
+            timeline: list[dict] = []
+            cursor_ms: float = 0.0
+            prev_fg: ScriptSegment | None = None
 
-            for i, item in enumerate(synthesized):
+            for item in synthesized:
                 seg = item.segment
-
-                if i > 0 and seg.type != "pause":
-                    prev = synthesized[i - 1].segment
-                    pause_ms = _calculate_contextual_pause(prev, seg)
-                    if pause_ms > 0:
-                        silence_path = await get_silence(pause_ms)
-                        concat_lines.append(
-                            f"file '{_escape_concat_path(silence_path)}'"
-                        )
+                is_overlay = seg.type == "music" or (seg.type == "sfx" and seg.prompt)
 
                 if seg.type == "pause":
-                    pause_ms = int(_extract_pause_duration(seg) * 1000)
-                    silence_path = await get_silence(pause_ms)
-                    concat_lines.append(
-                        f"file '{_escape_concat_path(silence_path)}'"
-                    )
+                    pause_s = _extract_pause_duration(seg)
+                    cursor_ms += pause_s * 1000
+                    prev_fg = seg
                     continue
 
-                if item.file_path and item.file_path.exists():
-                    trimmed = await get_trimmed(item.file_path)
-                    concat_lines.append(
-                        f"file '{_escape_concat_path(trimmed)}'"
-                    )
+                if not item.file_path or not item.file_path.exists():
+                    # Synthesis failed for this segment — log and skip.
+                    logger.warning("Skipping segment %s: no audio file", seg.id)
+                    continue
 
-            concat_list_path = temp_dir / "concat.txt"
-            concat_list_path.write_text("\n".join(concat_lines), encoding="utf-8")
+                trimmed_file, trimmed_dur_s = await get_trimmed(item.file_path)
+                dur_ms = trimmed_dur_s * 1000
 
+                if is_overlay:
+                    # Overlay: anchored at current cursor + overlap_ms (overlap can
+                    # be negative to start slightly before the cursor).
+                    start_ms = max(0.0, cursor_ms + seg.overlap_ms)
+                    timeline.append({
+                        "file": trimmed_file,
+                        "start_ms": int(round(start_ms)),
+                        "volume_db": float(seg.volume_db),
+                    })
+                    # Cursor unchanged — overlays don't consume timeline space.
+                    continue
+
+                # Foreground: advance the cursor.
+                if prev_fg is None:
+                    gap_ms = 0
+                elif seg.overlap_ms != 0:
+                    gap_ms = seg.overlap_ms
+                else:
+                    gap_ms = _calculate_contextual_pause(prev_fg, seg)
+
+                start_ms = max(0.0, cursor_ms + gap_ms)
+                timeline.append({
+                    "file": trimmed_file,
+                    "start_ms": int(round(start_ms)),
+                    "volume_db": float(seg.volume_db),
+                })
+                cursor_ms = start_ms + dur_ms
+                prev_fg = seg
+
+            if not timeline:
+                raise RuntimeError(
+                    "Audio assembly produced no usable segments — every entry "
+                    "was a pause or had a missing audio file."
+                )
+
+            # --- Build the ffmpeg command -----------------------------------
             self._progress(
-                on_progress, "assembling", 85, "Running ffmpeg..."
+                on_progress, "assembling", 85, "Mixing tracks with ffmpeg..."
             )
 
-            await self._run_ffmpeg([
-                "-f", "concat",
-                "-safe", "0",
-                "-i", str(concat_list_path),
-                "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
-                "-c:a", "libmp3lame",
-                "-b:a", "192k",
-                "-y", str(output_file),
-            ])
+            args: list[str] = []
+            for entry in timeline:
+                args += ["-i", str(entry["file"])]
 
+            filter_parts: list[str] = []
+            labels: list[str] = []
+            for idx, entry in enumerate(timeline):
+                label = f"a{idx}"
+                chain = (
+                    f"[{idx}:a]aresample=24000,aformat=channel_layouts=mono,"
+                    f"adelay={entry['start_ms']}:all=1"
+                )
+                if abs(entry["volume_db"]) > 0.001:
+                    chain += f",volume={entry['volume_db']:.2f}dB"
+                chain += f"[{label}]"
+                filter_parts.append(chain)
+                labels.append(f"[{label}]")
+
+            mix_input = "".join(labels)
+            n_inputs = len(labels)
+            if n_inputs == 1:
+                # amix on a single input is wasteful and changes gain — pass through.
+                filter_parts.append(
+                    f"{mix_input}aformat=channel_layouts=mono,"
+                    "loudnorm=I=-16:TP=-1.5:LRA=11[out]"
+                )
+            else:
+                filter_parts.append(
+                    f"{mix_input}amix=inputs={n_inputs}:normalize=0:"
+                    "dropout_transition=0[mixed]"
+                )
+                filter_parts.append("[mixed]loudnorm=I=-16:TP=-1.5:LRA=11[out]")
+
+            args += [
+                "-filter_complex", ";".join(filter_parts),
+                "-map", "[out]",
+                *_final_codec_args(options.output_format),
+                "-y", str(output_file),
+            ]
+
+            await self._run_ffmpeg(args)
             return output_file
         finally:
             try:

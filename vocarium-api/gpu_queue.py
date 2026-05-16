@@ -1,30 +1,52 @@
-"""GPU Queue — serializes GPU operations across two GPUs.
+"""GPU Queue — serializes GPU operations across configured inference services.
 
-GPU 0 (RTX 3060): TTS 1.7B + ASR — always loaded, never unloaded.
-GPU 1 (RTX 5060 Ti): Music (ACE-Step) + SFX (MMAudio) — idle-unload to share
-with image gen / ollama. Music and SFX evict each other since both need full GPU.
-Jobs are processed FIFO. Before each job, only conflicting services are unloaded.
+GPU placement is defined in Docker Compose via GPU_TTS_*, GPU_ASR, GPU_MUSIC,
+and GPU_SFX. On single-GPU deployments, idle-unload keeps large models from
+coexisting in VRAM. Music and SFX evict each other since both need a large
+chunk of GPU memory. Jobs are processed FIFO; before each job, only services
+that cannot coexist with the incoming service are unloaded.
 """
 
 import asyncio
+import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine
 
+logger = logging.getLogger(__name__)
+
 # Unload callbacks are injected at startup so this module stays decoupled.
 _unload_callbacks: dict[str, Callable[[], Coroutine]] = {}
 
-# Coexistence rules: services in the same group can share VRAM.
-# Services NOT in the incoming job's group get unloaded.
-# GPU 0 (TTS+ASR) never conflicts with GPU 1 (music+sfx).
-# Music and SFX conflict with each other on GPU 1.
-_COEXIST = {
-    "tts": {"tts", "asr", "music", "sfx"},     # GPU 0 — no conflicts
-    "asr": {"tts", "asr", "music", "sfx"},     # GPU 0 — no conflicts
-    "music": {"tts", "asr", "music"},           # GPU 1 — evicts SFX
-    "sfx": {"tts", "asr", "sfx"},              # GPU 1 — evicts Music
-}
+def _gpu_id(name: str, default: str = "0") -> str:
+    return (os.environ.get(name, default) or default).strip()
+
+
+def _service_gpus() -> dict[str, str]:
+    gpus = {
+        "tts": _gpu_id("GPU_TTS_PRIMARY", _gpu_id("GPU_TTS_1", "0")),
+        "asr": _gpu_id("GPU_ASR", "0"),
+        "music": _gpu_id("GPU_MUSIC", "0"),
+        "sfx": _gpu_id("GPU_SFX", "0"),
+    }
+    if os.environ.get("TTS_URL_2", "").strip():
+        gpus["tts_extra"] = _gpu_id("GPU_TTS_EXTRA", _gpu_id("GPU_TTS_2", "1"))
+    return gpus
+
+
+def _coexisting_services(incoming: str) -> set[str]:
+    """Services on different GPU IDs can coexist; same-GPU services conflict."""
+    gpus = _service_gpus()
+    incoming_gpu = gpus.get(incoming)
+    if incoming_gpu is None:
+        return {incoming}
+    return {
+        service
+        for service, gpu in gpus.items()
+        if service == incoming or gpu != incoming_gpu
+    }
 
 
 def register_unloaders(callbacks: dict[str, Callable[[], Coroutine]]):
@@ -180,15 +202,18 @@ class GpuQueue:
 
     async def _unload_conflicts(self, incoming: str):
         """Unload services that can't coexist with the incoming service type."""
-        keep = _COEXIST.get(incoming, {incoming})
+        keep = _coexisting_services(incoming)
         tasks = []
         for svc, fn in _unload_callbacks.items():
             if svc not in keep:
                 tasks.append(fn())
         if tasks:
             unloading = [s for s in _unload_callbacks if s not in keep]
-            print(f"Unloading {unloading} (incompatible with {incoming})", flush=True)
-            await asyncio.gather(*tasks, return_exceptions=True)
+            logger.info("Unloading %s (incompatible with %s)", unloading, incoming)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for svc, result in zip(unloading, results):
+                if isinstance(result, Exception):
+                    logger.warning("Unload callback for %s failed: %s", svc, result)
 
     def _evict_old(self):
         """Remove old completed/failed jobs to bound memory."""

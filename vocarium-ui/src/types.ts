@@ -108,6 +108,15 @@ export interface ScriptSegment {
   regenerated_from?: string | null;
   created_at: string;
   updated_at: string;
+  /** Mixing offset relative to the previous segment's end (ms).
+   *  0 = use the contextual gap; <0 = overlap (interruption); >0 = forced gap. */
+  overlap_ms?: number;
+  /** Music or prompted SFX prompt. */
+  prompt?: string | null;
+  /** Target duration for music/SFX segments. */
+  duration_ms?: number;
+  /** Per-segment volume in dB (typically negative for music ducked under speech). */
+  volume_db?: number;
 }
 
 export interface ScriptPayload {

@@ -60,12 +60,16 @@ services:
       - DEFAULT_MODEL=${DEFAULT_TTS_MODEL:-1.7b-base}
       - IDLE_TIMEOUT=${TTS_IDLE_TIMEOUT:-120}
       - ATTN_IMPL=${TTS_ATTN_IMPL:-eager}
+      - PYTHONDONTWRITEBYTECODE=1
+      - PYTHONUNBUFFERED=1
     ports:
       - "${TTS_PORT:-8201}:8880"
     volumes:
       - ./qwen3-tts/models:/app/models
       - ./qwen3-tts/server.py:/app/server.py:ro
       - ./qwen3-tts/ref_audio:/app/ref_audio:ro
+      - type: tmpfs
+        target: /app/__pycache__
       - voices-data:/app/voices
     shm_size: "4g"
     restart: unless-stopped
@@ -88,12 +92,16 @@ services:
       - DEFAULT_MODEL=${DEFAULT_TTS_MODEL:-1.7b-base}
       - IDLE_TIMEOUT=${TTS_IDLE_TIMEOUT:-120}
       - ATTN_IMPL=${TTS_ATTN_IMPL:-eager}
+      - PYTHONDONTWRITEBYTECODE=1
+      - PYTHONUNBUFFERED=1
     ports:
       - "${TTS_PORT_2:-8202}:8880"
     volumes:
       - ./qwen3-tts/models:/app/models
       - ./qwen3-tts/server.py:/app/server.py:ro
       - ./qwen3-tts/ref_audio:/app/ref_audio:ro
+      - type: tmpfs
+        target: /app/__pycache__
       - voices-data:/app/voices
     shm_size: "4g"
     restart: unless-stopped
@@ -108,7 +116,7 @@ services:
     container_name: acestep
     runtime: nvidia
     environment:
-      - NVIDIA_VISIBLE_DEVICES=${GPU_MUSIC:-1}
+      - NVIDIA_VISIBLE_DEVICES=${GPU_MUSIC:-0}
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - ACESTEP_CONFIG_PATH=acestep-v15-xl-turbo
       - ACESTEP_LM_MODEL_PATH=acestep-5Hz-lm-1.7B
@@ -133,7 +141,7 @@ services:
     container_name: mmaudio
     runtime: nvidia
     environment:
-      - NVIDIA_VISIBLE_DEVICES=${GPU_SFX:-1}
+      - NVIDIA_VISIBLE_DEVICES=${GPU_SFX:-0}
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - IDLE_TIMEOUT=${SFX_IDLE_TIMEOUT:-600}
     ports:
@@ -158,6 +166,11 @@ services:
       ASR_URL: http://qwen3-asr:8000
       MUSIC_URL: http://acestep:8003
       SFX_URL: http://mmaudio:8004
+      GPU_TTS_PRIMARY: ${GPU_TTS_1:-0}
+      GPU_TTS_EXTRA: ${GPU_TTS_2:-1}
+      GPU_ASR: ${GPU_ASR:-0}
+      GPU_MUSIC: ${GPU_MUSIC:-0}
+      GPU_SFX: ${GPU_SFX:-0}
       DATA_DIR: /app/data
       VOICES_DIR: /app/voices
       PODCAST_AUDIO_PATH: /app/data/podcast_audio
@@ -174,6 +187,8 @@ services:
       - ./vocarium-api/database.py:/app/database.py:ro
       - ./vocarium-api/gpu_queue.py:/app/gpu_queue.py:ro
       - ./vocarium-api/podcast:/app/podcast:ro
+      - type: tmpfs
+        target: /app/__pycache__
       - type: tmpfs
         target: /app/podcast/__pycache__
       - vocarium-data:/app/data
@@ -198,6 +213,11 @@ services:
       ASR_URL: http://qwen3-asr:8000
       MUSIC_URL: http://acestep:8003
       SFX_URL: http://mmaudio:8004
+      GPU_TTS_PRIMARY: ${GPU_TTS_2:-1}
+      GPU_TTS_EXTRA: ${GPU_TTS_1:-0}
+      GPU_ASR: ${GPU_ASR:-0}
+      GPU_MUSIC: ${GPU_MUSIC:-0}
+      GPU_SFX: ${GPU_SFX:-0}
       DATA_DIR: /app/data
       VOICES_DIR: /app/voices
       PODCAST_AUDIO_PATH: /app/data/podcast_audio
@@ -214,6 +234,8 @@ services:
       - ./vocarium-api/database.py:/app/database.py:ro
       - ./vocarium-api/gpu_queue.py:/app/gpu_queue.py:ro
       - ./vocarium-api/podcast:/app/podcast:ro
+      - type: tmpfs
+        target: /app/__pycache__
       - type: tmpfs
         target: /app/podcast/__pycache__
       - vocarium-data-2:/app/data

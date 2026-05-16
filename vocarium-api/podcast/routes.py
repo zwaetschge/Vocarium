@@ -33,6 +33,8 @@ from .audio_assembler import (
     AssemblyProgress,
     AudioAssembler,
     AudioFormat,
+    MusicGenerator,
+    SFXGenerator,
     TTSGenerator,
 )
 from .disfluency import ScriptSegment
@@ -267,6 +269,145 @@ class VocariumTTSGenerator:
         )
 
 
+class VocariumMusicGenerator:
+    """ACE-Step bridge for podcast background music. Goes through the GPU
+    queue so TTS gets evicted before music starts on shared hardware."""
+
+    def __init__(self, music_url: str, gpu_submit: Callable[..., Any]):
+        self._music_url = music_url
+        self._gpu_submit = gpu_submit
+
+    async def generate_to_file(
+        self,
+        prompt: str,
+        duration_s: float,
+        output_path: Path,
+        output_format: AudioFormat,
+        *,
+        user_id: int | None = None,
+    ) -> float:
+        payload = {
+            "prompt": prompt,
+            "audio_duration": float(duration_s),
+            "thinking": False,
+            "model": "acestep-v15-turbo",
+            "inference_steps": 8,
+            "batch_size": 1,
+            "audio_format": output_format,
+            "use_random_seed": True,
+        }
+        timeout = aiohttp.ClientTimeout(total=600, sock_connect=30, sock_read=600)
+
+        async def work():
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    f"{self._music_url}/release_task", json=payload
+                ) as resp:
+                    submit_body = await resp.read()
+                    if resp.status >= 400:
+                        raise RuntimeError(
+                            f"music submit failed ({resp.status}): "
+                            f"{submit_body.decode('utf-8', 'replace')[:300]}"
+                        )
+                    submit = json.loads(submit_body)
+                task_id = (submit.get("data") or {}).get("task_id")
+                if not task_id:
+                    raise RuntimeError(f"music submit returned no task_id: {submit}")
+
+                # Poll until status == 1 (success) or 2 (failure).
+                for _ in range(300):  # ~10 minutes
+                    await asyncio.sleep(2)
+                    async with session.post(
+                        f"{self._music_url}/query_result",
+                        json={"task_id_list": [task_id]},
+                    ) as poll_resp:
+                        if poll_resp.status >= 400:
+                            continue
+                        poll = json.loads(await poll_resp.read())
+                    tasks = poll.get("data") or []
+                    if not tasks:
+                        continue
+                    task = tasks[0]
+                    if task.get("status") == 1:
+                        result = task.get("result")
+                        if isinstance(result, str):
+                            try:
+                                result = json.loads(result)
+                            except json.JSONDecodeError:
+                                result = []
+                        if not result or not isinstance(result, list):
+                            raise RuntimeError(f"music returned empty result: {task}")
+                        first = result[0] or {}
+                        file_ref = first.get("file") or ""
+                        path_part = file_ref.replace("/v1/audio?path=", "")
+                        if not path_part:
+                            raise RuntimeError(
+                                f"music result missing 'file': {first}"
+                            )
+                        async with session.get(
+                            f"{self._music_url}/v1/audio", params={"path": path_part}
+                        ) as audio_resp:
+                            audio_body = await audio_resp.read()
+                            if audio_resp.status >= 400:
+                                raise RuntimeError(
+                                    f"music download failed ({audio_resp.status})"
+                                )
+                        output_path.parent.mkdir(parents=True, exist_ok=True)
+                        output_path.write_bytes(audio_body)
+                        return float(duration_s)
+                    if task.get("status") == 2:
+                        raise RuntimeError(f"music generation failed: {task}")
+                raise RuntimeError("music generation timed out after ~10 minutes")
+
+        _, future = await self._gpu_submit("music", "Podcast Music", work)
+        return await future
+
+
+class VocariumSFXGenerator:
+    """MMAudio bridge for podcast prompted sound effects. Synchronous WAV
+    response, written straight to disk."""
+
+    def __init__(self, sfx_url: str, gpu_submit: Callable[..., Any]):
+        self._sfx_url = sfx_url
+        self._gpu_submit = gpu_submit
+
+    async def generate_to_file(
+        self,
+        prompt: str,
+        duration_s: float,
+        output_path: Path,
+        output_format: AudioFormat,
+        *,
+        user_id: int | None = None,
+    ) -> float:
+        payload = {
+            "prompt": prompt,
+            "negative_prompt": "",
+            "duration": float(duration_s),
+            "cfg_strength": 4.5,
+            "num_steps": 25,
+        }
+        timeout = aiohttp.ClientTimeout(total=300, sock_connect=30, sock_read=300)
+
+        async def work():
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    f"{self._sfx_url}/generate", json=payload
+                ) as resp:
+                    body = await resp.read()
+                    if resp.status >= 400:
+                        raise RuntimeError(
+                            f"sfx failed ({resp.status}): "
+                            f"{body.decode('utf-8', 'replace')[:300]}"
+                        )
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_bytes(body)
+            return float(duration_s)
+
+        _, future = await self._gpu_submit("sfx", "Podcast SFX", work)
+        return await future
+
+
 # ---------------------------------------------------------------------------
 # Helpers — DB → dict serialisation
 # ---------------------------------------------------------------------------
@@ -356,6 +497,10 @@ def _segment_to_dict(seg: ScriptSegment) -> dict:
         "regenerated_from": seg.regenerated_from,
         "created_at": seg.created_at,
         "updated_at": seg.updated_at,
+        "overlap_ms": seg.overlap_ms,
+        "prompt": seg.prompt,
+        "duration_ms": seg.duration_ms,
+        "volume_db": seg.volume_db,
     }
 
 
@@ -374,6 +519,10 @@ def _dict_to_segment(d: dict) -> ScriptSegment:
         regenerated_from=d.get("regenerated_from"),
         created_at=d.get("created_at") or "",
         updated_at=d.get("updated_at") or "",
+        overlap_ms=int(d.get("overlap_ms") or 0),
+        prompt=d.get("prompt"),
+        duration_ms=int(d.get("duration_ms") or 0),
+        volume_db=float(d.get("volume_db") or 0.0),
     )
 
 
@@ -406,6 +555,25 @@ def _get_host_or_404(db: sqlite3.Connection, host_id: str, user_id: int) -> dict
     return _host_row_to_dict(row)
 
 
+def _get_custom_voice_or_400(
+    db: sqlite3.Connection,
+    voice_id: str,
+    user_id: int,
+) -> tuple[str, str]:
+    row = db.execute(
+        "SELECT id, source FROM voices WHERE id=? AND user_id=?",
+        (voice_id, user_id),
+    ).fetchone()
+    if not row:
+        raise HTTPException(400, f"voice_id {voice_id} not found")
+    if row[1] != "custom":
+        raise HTTPException(
+            400,
+            "Only custom voices can be assigned to podcast hosts",
+        )
+    return row[0], row[1]
+
+
 # ---------------------------------------------------------------------------
 # Router factory
 # ---------------------------------------------------------------------------
@@ -420,6 +588,8 @@ def create_podcast_router(
     extra_tts_urls: list[str] | None = None,
     assembler_output_dir: str | os.PathLike[str] | None = None,
     assembler_sfx_dir: str | os.PathLike[str] | None = None,
+    music_url: str | None = None,
+    sfx_url: str | None = None,
 ) -> tuple[APIRouter, AudioAssembler]:
     """Return (router, assembler). Caller wires the router into the app and
     uses the assembler for startup housekeeping."""
@@ -428,8 +598,16 @@ def create_podcast_router(
     tts_bridge = VocariumTTSGenerator(
         tts_url, db_getter, gpu_submit, extra_tts_urls=extra_tts_urls
     )
+    music_bridge: MusicGenerator | None = (
+        VocariumMusicGenerator(music_url, gpu_submit) if music_url else None
+    )
+    sfx_bridge: SFXGenerator | None = (
+        VocariumSFXGenerator(sfx_url, gpu_submit) if sfx_url else None
+    )
     assembler = AudioAssembler(
         tts=tts_bridge,
+        music=music_bridge,
+        sfx=sfx_bridge,
         output_dir=assembler_output_dir,
         sfx_dir=assembler_sfx_dir,
     )
@@ -468,15 +646,7 @@ def create_podcast_router(
         db = db_getter()
         # If voice_id given, verify it belongs to user and is a custom voice
         if voice_id:
-            vrow = db.execute(
-                "SELECT id, source FROM voices WHERE id=?", (voice_id,)
-            ).fetchone()
-            if not vrow:
-                raise HTTPException(400, f"voice_id {voice_id} not found")
-            if vrow[1] != "custom":
-                raise HTTPException(
-                    400, "Only custom voices can be assigned to podcast hosts"
-                )
+            _get_custom_voice_or_400(db, voice_id, user["id"])
         host_id = generate_id("host")
         now = _now_iso()
         db.execute(
@@ -509,15 +679,7 @@ def create_podcast_router(
                 if key == "role" and body[key] not in ("host", "expert"):
                     raise HTTPException(400, "role must be 'host' or 'expert'")
                 if key == "voice_id" and body[key]:
-                    vrow = db.execute(
-                        "SELECT id, source FROM voices WHERE id=?", (body[key],)
-                    ).fetchone()
-                    if not vrow:
-                        raise HTTPException(400, f"voice_id {body[key]} not found")
-                    if vrow[1] != "custom":
-                        raise HTTPException(
-                            400, "Only custom voices can be assigned to hosts"
-                        )
+                    _get_custom_voice_or_400(db, body[key], user["id"])
                 fields.append(f"{key}=?")
                 values.append(body[key])
         if not fields:
@@ -585,15 +747,7 @@ def create_podcast_router(
         # Enforce: every host with a voice_id must use a custom voice
         for h in hosts:
             if h["voice_id"]:
-                row = db.execute(
-                    "SELECT source FROM voices WHERE id=?", (h["voice_id"],)
-                ).fetchone()
-                if row and row[0] != "custom":
-                    raise HTTPException(
-                        400,
-                        f"Host {h['name']} is assigned non-custom voice {h['voice_id']!r}. "
-                        "Podcasts require custom voices only.",
-                    )
+                _get_custom_voice_or_400(db, h["voice_id"], user["id"])
 
         podcast_id = generate_id("pod")
         now = _now_iso()
@@ -647,13 +801,7 @@ def create_podcast_router(
                 hosts.append(_get_host_or_404(db, hid, user["id"]))
             for h in hosts:
                 if h["voice_id"]:
-                    row = db.execute(
-                        "SELECT source FROM voices WHERE id=?", (h["voice_id"],)
-                    ).fetchone()
-                    if row and row[0] != "custom":
-                        raise HTTPException(
-                            400, "Podcasts require custom voices only"
-                        )
+                    _get_custom_voice_or_400(db, h["voice_id"], user["id"])
             fields.append("hosts_json=?")
             values.append(json.dumps(hosts))
         if not fields:
@@ -825,10 +973,10 @@ def create_podcast_router(
                 f"Unsupported file type {suffix!r}. Allowed: {sorted(ALLOWED_SOURCE_EXTENSIONS)}",
             )
 
-        data = await file.read()
+        data = await file.read(MAX_UPLOAD_BYTES + 1)
         if len(data) > MAX_UPLOAD_BYTES:
             raise HTTPException(
-                400, f"File too large (max {MAX_UPLOAD_BYTES // (1024*1024)} MB)"
+                413, f"File too large (max {MAX_UPLOAD_BYTES // (1024*1024)} MB)"
             )
 
         source_id = generate_id("src")
@@ -836,7 +984,7 @@ def create_podcast_router(
         uploads_dir.mkdir(parents=True, exist_ok=True)
         safe_suffix = suffix if suffix else ""
         disk_path = uploads_dir / f"{source_id}{safe_suffix}"
-        disk_path.write_bytes(data)
+        await asyncio.to_thread(disk_path.write_bytes, data)
 
         db.execute(
             "INSERT INTO podcast_sources (id, podcast_id, type, title, content, status) "
@@ -993,15 +1141,7 @@ def create_podcast_router(
         # Podcasts require custom voices — verify every host with a voice
         for h in hosts:
             if h.voice_id:
-                row = db.execute(
-                    "SELECT source FROM voices WHERE id=?", (h.voice_id,)
-                ).fetchone()
-                if row and row[0] != "custom":
-                    raise HTTPException(
-                        400,
-                        f"Host {h.name!r} has a non-custom voice. "
-                        "Podcasts may only use custom voices.",
-                    )
+                _get_custom_voice_or_400(db, h.voice_id, user["id"])
 
         chunks = _load_podcast_chunks(db, podcast_id)
         sources = _load_podcast_sources(db, podcast_id)
@@ -1112,14 +1252,128 @@ def create_podcast_router(
                 break
         if not target:
             raise HTTPException(404, "Segment not found")
-        for key in ("speaker", "text", "type", "voice", "notes"):
+        for key in ("speaker", "text", "type", "voice", "notes", "prompt"):
             if key in body:
                 target[key] = body[key]
+        if "overlap_ms" in body:
+            try:
+                target["overlap_ms"] = int(body["overlap_ms"] or 0)
+            except (TypeError, ValueError):
+                target["overlap_ms"] = 0
+        if "duration_ms" in body:
+            try:
+                target["duration_ms"] = int(body["duration_ms"] or 0)
+            except (TypeError, ValueError):
+                target["duration_ms"] = 0
+        if "volume_db" in body:
+            try:
+                target["volume_db"] = float(body["volume_db"] or 0.0)
+            except (TypeError, ValueError):
+                target["volume_db"] = 0.0
+        # Cached audio for music/sfx segments must be invalidated when the
+        # prompt or duration changes — let the assembler regenerate next run.
+        if "prompt" in body or "duration_ms" in body:
+            project_dir = Path(
+                os.environ.get("PODCAST_AUDIO_PATH", "/app/data/podcast_audio")
+            ) / podcast_id
+            for ext in ("mp3", "wav"):
+                cached = project_dir / f"{segment_id}.{ext}"
+                if cached.exists():
+                    try:
+                        cached.unlink()
+                    except OSError:
+                        pass
         if "text" in body:
             text = body["text"] or ""
             target["word_count"] = count_words(text)
             target["estimated_duration"] = estimate_speaking_duration(target["word_count"])
+        # Music/SFX duration drives estimated_duration directly.
+        if target.get("type") in ("music", "sfx") and target.get("duration_ms"):
+            target["estimated_duration"] = target["duration_ms"] / 1000.0
         target["updated_at"] = _now_iso()
+        script["segments"] = segments
+        script["total_words"] = sum(s.get("word_count", 0) for s in segments)
+        script["estimated_duration"] = sum(s.get("estimated_duration", 0) for s in segments)
+
+        db.execute(
+            "UPDATE podcasts SET script_json=?, total_words=?, updated_at=? WHERE id=?",
+            (json.dumps(script), script["total_words"], _now_iso(), podcast_id),
+        )
+        db.commit()
+        return _get_podcast_or_404(db, podcast_id, user["id"])
+
+    @router.post("/podcasts/{podcast_id}/script/segments")
+    async def add_segment(podcast_id: str, body: dict, request: Request):
+        """Insert a new segment (typically music or sfx) at a given position."""
+        user = get_current_user(request)
+        db = db_getter()
+        podcast = _get_podcast_or_404(db, podcast_id, user["id"])
+        script = podcast.get("script") or {}
+        segments = script.get("segments") or []
+
+        seg_type = body.get("type") or "speech"
+        if seg_type not in ("speech", "reaction", "pause", "sfx", "music"):
+            raise HTTPException(400, f"Invalid segment type: {seg_type}")
+
+        text = body.get("text") or ""
+        prompt = body.get("prompt")
+        if seg_type in ("music", "sfx"):
+            prompt = (prompt or text or "").strip()
+            if not prompt:
+                raise HTTPException(400, "music/sfx segments require a prompt")
+
+        try:
+            duration_ms = int(body.get("duration_ms") or 0)
+        except (TypeError, ValueError):
+            duration_ms = 0
+        try:
+            overlap_ms = int(body.get("overlap_ms") or 0)
+        except (TypeError, ValueError):
+            overlap_ms = 0
+        try:
+            volume_db = float(body.get("volume_db") or 0.0)
+        except (TypeError, ValueError):
+            volume_db = 0.0
+
+        # Sensible defaults per type.
+        if seg_type == "music" and duration_ms <= 0:
+            duration_ms = 30000
+        if seg_type == "music" and volume_db == 0.0:
+            volume_db = -14.0  # ducked under speech by default
+        if seg_type == "sfx" and duration_ms <= 0 and prompt:
+            duration_ms = 4000
+
+        now = _now_iso()
+        new_seg = {
+            "id": generate_id("seg"),
+            "script_id": None,
+            "speaker": body.get("speaker") or "",
+            "text": text or (prompt or ""),
+            "type": seg_type,
+            "voice": body.get("voice"),
+            "notes": body.get("notes"),
+            "position": 0,  # set below
+            "word_count": count_words(text),
+            "estimated_duration": (duration_ms / 1000.0) if duration_ms else 0.0,
+            "regenerated_from": None,
+            "created_at": now,
+            "updated_at": now,
+            "overlap_ms": overlap_ms,
+            "prompt": prompt,
+            "duration_ms": duration_ms,
+            "volume_db": volume_db,
+        }
+
+        # Insertion index: explicit `position` (int) takes precedence, else after.
+        try:
+            insert_at = int(body["position"]) if "position" in body else len(segments)
+        except (TypeError, ValueError):
+            insert_at = len(segments)
+        insert_at = max(0, min(insert_at, len(segments)))
+        segments.insert(insert_at, new_seg)
+        for idx, seg in enumerate(segments):
+            seg["position"] = idx
+
         script["segments"] = segments
         script["total_words"] = sum(s.get("word_count", 0) for s in segments)
         script["estimated_duration"] = sum(s.get("estimated_duration", 0) for s in segments)
@@ -1163,7 +1417,8 @@ def create_podcast_router(
 
         # RE-LOAD script fresh from DB in case it was just regenerated
         row = db.execute(
-            "SELECT script_json FROM podcasts WHERE id=?", (podcast_id,)
+            "SELECT script_json FROM podcasts WHERE id=? AND user_id=?",
+            (podcast_id, user["id"]),
         ).fetchone()
         if row and row[0]:
             fresh_script = json.loads(row[0])

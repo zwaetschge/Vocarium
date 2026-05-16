@@ -89,12 +89,14 @@ docker compose up -d
 For production deployments behind a reverse proxy:
 
 ```bash
+CORS_ORIGINS=https://vocarium.example.com \
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 ```
 
-The `prod` overlay drops the host port mappings of internal services so
-only the UI (and optionally the gateway) are reachable from outside the
-`voice-network` bridge.
+The `prod` overlay drops the host port mappings of the API and internal
+GPU services, disables anonymous API fallback by default, and requires an
+explicit `CORS_ORIGINS` value. Put your auth/reverse proxy on the
+`voice-network` bridge if it needs to talk to `vocarium-api` directly.
 
 ---
 
@@ -114,6 +116,9 @@ Everything is in `.env`. Highlights:
 | `TTS_IDLE_TIMEOUT` | `120` s        | Auto-unload after this idle period. `0` = never.          |
 | `ALLOW_ANONYMOUS`  | `true`         | Single-user fallback when no `Remote-User` header.        |
 | `CORS_ORIGINS`     | `*`            | Restrict to your UI origins in production.                |
+| `MAX_VOICE_UPLOAD_BYTES` | `52428800` | Max reference-audio upload size.                         |
+| `MAX_TRANSCRIBE_UPLOAD_BYTES` | `524288000` | Max STT upload/download size.                   |
+| `MAX_TTS_TEXT_CHARS` | `20000`      | Max request text length for TTS endpoints.                |
 | `DEFAULT_TTS_MODEL`| `1.7b-base`    | One of `1.7b-base`, `1.7b-design`, `1.7b-custom`.         |
 | `LLM_API_URL` etc. | (empty)        | Required for **Podcast Studio**; see below.               |
 

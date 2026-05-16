@@ -562,10 +562,42 @@ export async function generatePodcastScript(
 export async function updateSegment(
   podcastId: string,
   segmentId: string,
-  data: { speaker?: string; text?: string; type?: string; voice?: string | null; notes?: string | null },
+  data: {
+    speaker?: string;
+    text?: string;
+    type?: string;
+    voice?: string | null;
+    notes?: string | null;
+    prompt?: string | null;
+    overlap_ms?: number;
+    duration_ms?: number;
+    volume_db?: number;
+  },
 ): Promise<Podcast> {
   return request(`/podcasts/${podcastId}/script/segments/${segmentId}`, {
     method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+}
+
+export async function addSegment(
+  podcastId: string,
+  data: {
+    type: 'speech' | 'reaction' | 'pause' | 'sfx' | 'music';
+    speaker?: string;
+    text?: string;
+    prompt?: string;
+    duration_ms?: number;
+    overlap_ms?: number;
+    volume_db?: number;
+    voice?: string | null;
+    notes?: string | null;
+    position?: number;
+  },
+): Promise<Podcast> {
+  return request(`/podcasts/${podcastId}/script/segments`, {
+    method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data),
   });

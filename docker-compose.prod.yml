@@ -4,22 +4,31 @@
 # the gateway) are reachable from outside `voice-network`.
 #
 # Usage:
+#   CORS_ORIGINS=https://vocarium.example.com \
 #   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 # ---------------------------------------------------------------------------
 
 services:
   qwen3-asr:
-    ports: []
+    ports: !reset []
   qwen3-tts:
-    ports: []
+    ports: !reset []
   qwen3-tts-2:
-    ports: []
+    ports: !reset []
   acestep:
-    ports: []
+    ports: !reset []
   mmaudio:
-    ports: []
+    ports: !reset []
   # By default, only the UI is published. If you front Vocarium with an
-  # external reverse proxy (Authelia / Traefik / nginx), drop the API port
-  # below as well and put the proxy on `voice-network`.
+  # external reverse proxy (Authelia / Traefik / nginx), put that proxy on
+  # `voice-network` instead of publishing backend ports.
+  vocarium-api:
+    ports: !reset []
+    environment:
+      ALLOW_ANONYMOUS: ${ALLOW_ANONYMOUS:-false}
+      CORS_ORIGINS: ${CORS_ORIGINS:?Set CORS_ORIGINS to your production origin, e.g. https://vocarium.example.com}
   vocarium-api-2:
-    ports: []
+    ports: !reset []
+    environment:
+      ALLOW_ANONYMOUS: ${ALLOW_ANONYMOUS:-false}
+      CORS_ORIGINS: ${CORS_ORIGINS:?Set CORS_ORIGINS to your production origin, e.g. https://vocarium.example.com}

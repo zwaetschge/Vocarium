@@ -15,6 +15,7 @@ import {
   deletePodcastSource,
   generatePodcastScript,
   updateSegment,
+  addSegment,
   deleteSegment,
   generatePodcastAudio,
   getPodcastAudioStreamUrl,
@@ -1002,11 +1003,146 @@ function ScriptCard({
               onError={onError}
             />
           ))}
+          <AddTrackBar
+            podcastId={podcast.id}
+            position={segments.length}
+            onReload={onReload}
+            onError={onError}
+          />
         </div>
       )}
     </div>
   );
 }
+
+function AddTrackBar({
+  podcastId,
+  position,
+  onReload,
+  onError,
+}: {
+  podcastId: string;
+  position: number;
+  onReload: () => void;
+  onError: (msg: string) => void;
+}) {
+  const [pickerOpen, setPickerOpen] = useState<'music' | 'sfx' | null>(null);
+  const [prompt, setPrompt] = useState('');
+  const [duration, setDuration] = useState('30');
+  const [busy, setBusy] = useState(false);
+
+  const handleAdd = async () => {
+    if (!pickerOpen || !prompt.trim()) return;
+    const durSec = parseFloat(duration) || (pickerOpen === 'music' ? 30 : 4);
+    setBusy(true);
+    try {
+      await addSegment(podcastId, {
+        type: pickerOpen,
+        prompt: prompt.trim(),
+        duration_ms: Math.round(durSec * 1000),
+        position,
+        volume_db: pickerOpen === 'music' ? -14 : 0,
+      });
+      setPickerOpen(null);
+      setPrompt('');
+      setDuration('30');
+      onReload();
+    } catch (e) {
+      onError(e instanceof Error ? e.message : 'Add failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (pickerOpen) {
+    return (
+      <div
+        style={{
+          padding: '14px 16px',
+          borderRadius: '12px',
+          background: 'rgba(123,97,255,0.06)',
+          border: '1px solid rgba(123,97,255,0.20)',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '8px',
+        }}
+      >
+        <div style={{ fontSize: '11px', color: 'var(--color-text-faint)', textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+          {pickerOpen === 'music' ? 'Background music' : 'Sound effect'}
+        </div>
+        <textarea
+          value={prompt}
+          onChange={(e) => setPrompt(e.target.value)}
+          placeholder={pickerOpen === 'music'
+            ? 'e.g. ambient lo-fi piano, soft pad, contemplative'
+            : 'e.g. rain on window, thunder distant'}
+          className="input-field"
+          style={{ minHeight: '60px', padding: '10px 12px', fontSize: '13px', lineHeight: 1.55 }}
+        />
+        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+          <label style={{ fontSize: '12px', color: 'var(--color-text-faint)' }}>Duration (s):</label>
+          <input
+            type="number"
+            value={duration}
+            onChange={(e) => setDuration(e.target.value)}
+            min="1"
+            max="300"
+            className="input-field"
+            style={{ padding: '6px 10px', width: '80px', fontSize: '12.5px' }}
+          />
+          <div style={{ flex: 1 }} />
+          <button className="btn btn-primary" onClick={handleAdd} disabled={busy || !prompt.trim()} style={{ padding: '6px 12px', fontSize: '12px', height: '32px' }}>
+            Add
+          </button>
+          <button
+            className="btn-ghost"
+            onClick={() => { setPickerOpen(null); setPrompt(''); }}
+            style={{ padding: '6px 12px', fontSize: '12px' }}
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ display: 'flex', gap: '8px', justifyContent: 'center', padding: '4px 0' }}>
+      <button
+        className="btn-ghost"
+        onClick={() => setPickerOpen('music')}
+        style={{ padding: '6px 14px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
+        title="Add a music track that plays under the dialogue"
+      >
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M9 3v8.5" />
+          <circle cx="7" cy="11.5" r="2" />
+          <path d="M9 3l5 1v3l-5-1" />
+        </svg>
+        Add music
+      </button>
+      <button
+        className="btn-ghost"
+        onClick={() => setPickerOpen('sfx')}
+        style={{ padding: '6px 14px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
+        title="Add a sound effect that overlays the dialogue"
+      >
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M2 6v4M5 4v8M8 5v6M11 3v10M14 6v4" />
+        </svg>
+        Add SFX
+      </button>
+    </div>
+  );
+}
+
+const TYPE_STYLES: Record<string, { color: string; bg: string; border: string; label: string }> = {
+  speech:   { color: 'var(--color-text-faint)',  bg: 'rgba(255,255,255,0.04)',     border: 'rgba(255,255,255,0.06)',  label: 'speech' },
+  reaction: { color: 'var(--color-text-faint)',  bg: 'rgba(255,255,255,0.04)',     border: 'rgba(255,255,255,0.06)',  label: 'reaction' },
+  pause:    { color: 'var(--color-text-faint)',  bg: 'rgba(255,255,255,0.04)',     border: 'rgba(255,255,255,0.06)',  label: 'pause' },
+  music:    { color: '#a888ff',                  bg: 'rgba(123,97,255,0.10)',      border: 'rgba(123,97,255,0.30)',  label: 'music' },
+  sfx:      { color: '#ffb15a',                  bg: 'rgba(255,148,68,0.10)',      border: 'rgba(255,148,68,0.30)',  label: 'sfx' },
+};
 
 function SegmentRow({
   podcastId,
@@ -1022,12 +1158,37 @@ function SegmentRow({
   const [editing, setEditing] = useState(false);
   const [text, setText] = useState(segment.text);
   const [speaker, setSpeaker] = useState(segment.speaker);
+  const [prompt, setPrompt] = useState(segment.prompt || '');
+  const [duration, setDuration] = useState(
+    segment.duration_ms ? String(segment.duration_ms / 1000) : '',
+  );
+  const [overlap, setOverlap] = useState(
+    segment.overlap_ms ? String(segment.overlap_ms) : '',
+  );
+  const [volume, setVolume] = useState(
+    typeof segment.volume_db === 'number' && segment.volume_db !== 0
+      ? String(segment.volume_db)
+      : '',
+  );
   const [busy, setBusy] = useState(false);
+
+  const isMedia = segment.type === 'music' || segment.type === 'sfx';
+  const styleSet = TYPE_STYLES[segment.type] || TYPE_STYLES.speech;
 
   const handleSave = async () => {
     setBusy(true);
     try {
-      await updateSegment(podcastId, segment.id, { text: text.trim(), speaker: speaker.trim() });
+      const payload: Parameters<typeof updateSegment>[2] = {
+        text: text.trim(),
+        speaker: speaker.trim(),
+      };
+      if (isMedia) {
+        payload.prompt = prompt.trim() || null;
+        payload.duration_ms = duration ? Math.round(parseFloat(duration) * 1000) : 0;
+        payload.volume_db = volume ? parseFloat(volume) : 0;
+      }
+      payload.overlap_ms = overlap ? parseInt(overlap, 10) || 0 : 0;
+      await updateSegment(podcastId, segment.id, payload);
       setEditing(false);
       onReload();
     } catch (e) {
@@ -1055,8 +1216,8 @@ function SegmentRow({
       style={{
         padding: '14px 16px',
         borderRadius: '12px',
-        background: 'rgba(255,255,255,0.02)',
-        border: '1px solid rgba(255,255,255,0.06)',
+        background: isMedia ? styleSet.bg : 'rgba(255,255,255,0.02)',
+        border: `1px solid ${isMedia ? styleSet.border : 'rgba(255,255,255,0.06)'}`,
         display: 'flex',
         gap: '14px',
         alignItems: 'flex-start',
@@ -1078,19 +1239,80 @@ function SegmentRow({
       <div style={{ flex: 1, minWidth: 0 }}>
         {editing ? (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-            <input
-              type="text"
-              value={speaker}
-              onChange={(e) => setSpeaker(e.target.value)}
-              className="input-field"
-              style={{ padding: '8px 12px', fontSize: '12.5px' }}
-            />
-            <textarea
-              value={text}
-              onChange={(e) => setText(e.target.value)}
-              className="input-field"
-              style={{ minHeight: '80px', padding: '10px 12px', fontSize: '13px', lineHeight: 1.55 }}
-            />
+            {!isMedia && (
+              <input
+                type="text"
+                value={speaker}
+                onChange={(e) => setSpeaker(e.target.value)}
+                className="input-field"
+                style={{ padding: '8px 12px', fontSize: '12.5px' }}
+              />
+            )}
+            {isMedia ? (
+              <>
+                <textarea
+                  value={prompt}
+                  onChange={(e) => setPrompt(e.target.value)}
+                  placeholder={segment.type === 'music'
+                    ? 'Music prompt (e.g. ambient lo-fi piano, contemplative)'
+                    : 'SFX prompt (e.g. distant thunder, rain on glass)'}
+                  className="input-field"
+                  style={{ minHeight: '60px', padding: '10px 12px', fontSize: '13px', lineHeight: 1.55 }}
+                />
+                <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
+                  <label style={{ fontSize: '11px', color: 'var(--color-text-faint)' }}>Dur (s):</label>
+                  <input
+                    type="number"
+                    value={duration}
+                    onChange={(e) => setDuration(e.target.value)}
+                    min="1"
+                    max="300"
+                    className="input-field"
+                    style={{ padding: '4px 8px', width: '70px', fontSize: '12px' }}
+                  />
+                  <label style={{ fontSize: '11px', color: 'var(--color-text-faint)' }}>Vol (dB):</label>
+                  <input
+                    type="number"
+                    value={volume}
+                    onChange={(e) => setVolume(e.target.value)}
+                    min="-40"
+                    max="6"
+                    step="0.5"
+                    className="input-field"
+                    style={{ padding: '4px 8px', width: '70px', fontSize: '12px' }}
+                  />
+                  <label style={{ fontSize: '11px', color: 'var(--color-text-faint)' }}>Offset (ms):</label>
+                  <input
+                    type="number"
+                    value={overlap}
+                    onChange={(e) => setOverlap(e.target.value)}
+                    step="100"
+                    className="input-field"
+                    style={{ padding: '4px 8px', width: '80px', fontSize: '12px' }}
+                  />
+                </div>
+              </>
+            ) : (
+              <>
+                <textarea
+                  value={text}
+                  onChange={(e) => setText(e.target.value)}
+                  className="input-field"
+                  style={{ minHeight: '80px', padding: '10px 12px', fontSize: '13px', lineHeight: 1.55 }}
+                />
+                <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                  <label style={{ fontSize: '11px', color: 'var(--color-text-faint)' }}>Offset (ms, &lt;0 to interrupt):</label>
+                  <input
+                    type="number"
+                    value={overlap}
+                    onChange={(e) => setOverlap(e.target.value)}
+                    step="50"
+                    className="input-field"
+                    style={{ padding: '4px 8px', width: '90px', fontSize: '12px' }}
+                  />
+                </div>
+              </>
+            )}
             <div style={{ display: 'flex', gap: '6px' }}>
               <button className="btn btn-primary" onClick={handleSave} disabled={busy} style={{ padding: '6px 12px', fontSize: '12px', height: '32px' }}>
                 Save
@@ -1101,6 +1323,10 @@ function SegmentRow({
                   setEditing(false);
                   setText(segment.text);
                   setSpeaker(segment.speaker);
+                  setPrompt(segment.prompt || '');
+                  setDuration(segment.duration_ms ? String(segment.duration_ms / 1000) : '');
+                  setOverlap(segment.overlap_ms ? String(segment.overlap_ms) : '');
+                  setVolume(typeof segment.volume_db === 'number' && segment.volume_db !== 0 ? String(segment.volume_db) : '');
                 }}
                 style={{ padding: '6px 12px', fontSize: '12px' }}
               >
@@ -1110,37 +1336,70 @@ function SegmentRow({
           </div>
         ) : (
           <>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '6px' }}>
-              <span
-                style={{
-                  fontSize: '11px',
-                  fontWeight: 600,
-                  color: 'var(--color-accent-hover)',
-                  textTransform: 'uppercase',
-                  letterSpacing: '0.08em',
-                }}
-              >
-                {segment.speaker}
-              </span>
-              {segment.type !== 'dialogue' && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '6px', flexWrap: 'wrap' }}>
+              {!isMedia && (
+                <span
+                  style={{
+                    fontSize: '11px',
+                    fontWeight: 600,
+                    color: 'var(--color-accent-hover)',
+                    textTransform: 'uppercase',
+                    letterSpacing: '0.08em',
+                  }}
+                >
+                  {segment.speaker}
+                </span>
+              )}
+              {segment.type !== 'speech' && (
                 <span
                   style={{
                     fontSize: '9.5px',
-                    color: 'var(--color-text-faint)',
+                    color: styleSet.color,
                     fontFamily: 'var(--font-mono)',
                     padding: '1px 6px',
                     borderRadius: '4px',
-                    background: 'rgba(255,255,255,0.04)',
+                    background: styleSet.bg,
+                    border: `1px solid ${styleSet.border}`,
+                    textTransform: 'uppercase',
+                    letterSpacing: '0.06em',
                   }}
                 >
-                  {segment.type}
+                  {styleSet.label}
+                </span>
+              )}
+              {!!segment.overlap_ms && segment.overlap_ms !== 0 && (
+                <span
+                  style={{
+                    fontSize: '9.5px',
+                    color: segment.overlap_ms < 0 ? '#ff7a8a' : '#7adfff',
+                    fontFamily: 'var(--font-mono)',
+                    padding: '1px 6px',
+                    borderRadius: '4px',
+                    background: segment.overlap_ms < 0 ? 'rgba(255,90,101,0.10)' : 'rgba(122,223,255,0.10)',
+                    border: `1px solid ${segment.overlap_ms < 0 ? 'rgba(255,90,101,0.25)' : 'rgba(122,223,255,0.25)'}`,
+                  }}
+                  title={segment.overlap_ms < 0 ? 'Starts before previous segment ends' : 'Forced gap before this segment'}
+                >
+                  {segment.overlap_ms > 0 ? `+${segment.overlap_ms}ms` : `${segment.overlap_ms}ms`}
                 </span>
               )}
               <span style={{ fontSize: '10px', color: 'var(--color-text-faint)', fontFamily: 'var(--font-mono)', marginLeft: 'auto' }}>
-                ~{segment.estimated_duration.toFixed(1)}s · {segment.word_count}w
+                {isMedia
+                  ? `~${(segment.duration_ms ? segment.duration_ms / 1000 : segment.estimated_duration).toFixed(1)}s${typeof segment.volume_db === 'number' && segment.volume_db !== 0 ? ` · ${segment.volume_db}dB` : ''}`
+                  : `~${segment.estimated_duration.toFixed(1)}s · ${segment.word_count}w`}
               </span>
             </div>
-            <p style={{ fontSize: '13.5px', color: 'var(--color-text)', lineHeight: 1.6, margin: 0 }}>{segment.text}</p>
+            <p
+              style={{
+                fontSize: isMedia ? '12.5px' : '13.5px',
+                color: isMedia ? 'var(--color-text-faint)' : 'var(--color-text)',
+                fontStyle: isMedia ? 'italic' : 'normal',
+                lineHeight: 1.6,
+                margin: 0,
+              }}
+            >
+              {isMedia ? (segment.prompt || segment.text || '(no prompt)') : segment.text}
+            </p>
           </>
         )}
       </div>
