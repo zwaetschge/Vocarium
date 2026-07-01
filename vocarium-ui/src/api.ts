@@ -16,6 +16,7 @@ import type {
   PodcastProgressEvent,
   PodcastAudioResult,
   LLMProvider,
+  QueueJob,
 } from './types';
 
 const BASE = '/api';
@@ -37,6 +38,54 @@ async function requestBlob(path: string, init?: RequestInit): Promise<{ blob: Bl
   }
   const blob = await res.blob();
   return { blob, headers: res.headers };
+}
+
+async function readSSE(
+  res: Response,
+  onEvent: (eventType: string, eventData: string) => void,
+): Promise<void> {
+  const reader = res.body?.getReader();
+  if (!reader) throw new Error('No readable stream');
+
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let eventType = '';
+  let eventDataLines: string[] = [];
+
+  const dispatch = () => {
+    if (!eventType && eventDataLines.length === 0) return;
+    onEvent(eventType || 'message', eventDataLines.join('\n'));
+    eventType = '';
+    eventDataLines = [];
+  };
+
+  const processLine = (rawLine: string) => {
+    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+    if (line === '') {
+      dispatch();
+    } else if (line.startsWith('event:')) {
+      eventType = line.slice(6).trim();
+    } else if (line.startsWith('data:')) {
+      eventDataLines.push(line.slice(5).replace(/^ /, ''));
+    }
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    let newlineIndex = buffer.indexOf('\n');
+    while (newlineIndex >= 0) {
+      processLine(buffer.slice(0, newlineIndex));
+      buffer = buffer.slice(newlineIndex + 1);
+      newlineIndex = buffer.indexOf('\n');
+    }
+  }
+
+  buffer += decoder.decode();
+  if (buffer) processLine(buffer);
+  dispatch();
 }
 
 // Auth
@@ -177,55 +226,42 @@ export async function generateStream(
   onDone: (meta: StreamDone) => void,
   onError: (error: string) => void,
 ): Promise<void> {
-  const res = await fetch(`${BASE}/generate/stream`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(data),
-  });
+  let completed = false;
+  try {
+    const res = await fetch(`${BASE}/generate/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
 
-  if (!res.ok) {
-    const body = await res.text();
-    onError(body || `Stream failed: ${res.status}`);
+    if (!res.ok) {
+      const body = await res.text();
+      onError(body || `Stream failed: ${res.status}`);
+      return;
+    }
+
+    await readSSE(res, (eventType, eventData) => {
+      try {
+        const parsed = JSON.parse(eventData);
+        if (eventType === 'chunk') onChunk(parsed as StreamChunk);
+        else if (eventType === 'done') {
+          completed = true;
+          onDone(parsed as StreamDone);
+        } else if (eventType === 'error') {
+          completed = true;
+          onError(parsed.error || 'Unknown error');
+        }
+      } catch {
+        completed = true;
+        onError(`Parse error: ${eventData}`);
+      }
+    });
+  } catch (err) {
+    onError(err instanceof Error ? err.message : 'Stream failed');
     return;
   }
 
-  const reader = res.body?.getReader();
-  if (!reader) { onError('No readable stream'); return; }
-
-  const decoder = new TextDecoder();
-  let buffer = '';
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-
-    // Parse SSE events from buffer
-    const lines = buffer.split('\n');
-    buffer = lines.pop() || ''; // keep incomplete line
-
-    let eventType = '';
-    let eventData = '';
-
-    for (const line of lines) {
-      if (line.startsWith('event: ')) {
-        eventType = line.slice(7).trim();
-      } else if (line.startsWith('data: ')) {
-        eventData = line.slice(6);
-      } else if (line === '' && eventType && eventData) {
-        try {
-          const parsed = JSON.parse(eventData);
-          if (eventType === 'chunk') onChunk(parsed as StreamChunk);
-          else if (eventType === 'done') onDone(parsed as StreamDone);
-          else if (eventType === 'error') onError(parsed.error || 'Unknown error');
-        } catch (e) {
-          onError(`Parse error: ${eventData}`);
-        }
-        eventType = '';
-        eventData = '';
-      }
-    }
-  }
+  if (!completed) onError('Stream ended before completion');
 }
 
 // Models
@@ -291,6 +327,13 @@ export interface MusicResult {
   result?: string; // JSON string with file URLs
 }
 
+export interface MusicGenerateResponse {
+  submit?: { data?: MusicTask; code?: number };
+  result?: { data?: MusicResult[]; code?: number };
+  data?: MusicTask;
+  code?: number;
+}
+
 export async function generateMusic(data: {
   prompt: string;
   lyrics?: string;
@@ -301,7 +344,7 @@ export async function generateMusic(data: {
   thinking?: boolean;
   audio_format?: string;
   seed?: number;
-}): Promise<{ data: MusicTask; code: number }> {
+}): Promise<MusicGenerateResponse> {
   return request('/music/generate', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -336,11 +379,20 @@ export async function getMusicHealth(): Promise<{ status: string; backend_runnin
 
 // GPU Queue
 export async function getQueueStatus(): Promise<{
-  current: { job_id: string; service_type: string; description: string; started_at: number } | null;
-  queue: Array<{ job_id: string; position: number; service_type: string; description: string; created_at: number }>;
+  current: QueueJob | null;
+  queue: QueueJob[];
   queue_length: number;
 }> {
   return request('/queue/status');
+}
+
+export async function getQueueJobs(limit = 50): Promise<QueueJob[]> {
+  const data = await request<{ jobs: QueueJob[] }>(`/queue/jobs?limit=${encodeURIComponent(String(limit))}`);
+  return data.jobs;
+}
+
+export async function cancelQueueJob(jobId: string): Promise<QueueJob> {
+  return request(`/queue/jobs/${jobId}/cancel`, { method: 'POST' });
 }
 
 // Sound Effects (MMAudio)
@@ -497,51 +549,48 @@ async function streamPodcastSSE(
   onComplete: (payload: ScriptPayload | PodcastAudioResult) => void,
   onError: (error: string) => void,
   method: 'POST' = 'POST',
+  signal?: AbortSignal,
 ): Promise<void> {
-  const res = await fetch(`${BASE}${path}`, {
-    method,
-    headers: { 'Content-Type': 'application/json' },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  if (!res.ok) {
-    const txt = await res.text();
-    onError(txt || `Stream failed: ${res.status}`);
-    return;
-  }
-  const reader = res.body?.getReader();
-  if (!reader) {
-    onError('No readable stream');
-    return;
-  }
-  const decoder = new TextDecoder();
-  let buffer = '';
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop() || '';
-    let eventType = '';
-    let eventData = '';
-    for (const line of lines) {
-      if (line.startsWith('event: ')) {
-        eventType = line.slice(7).trim();
-      } else if (line.startsWith('data: ')) {
-        eventData = line.slice(6);
-      } else if (line === '' && eventType && eventData) {
-        try {
-          const parsed = JSON.parse(eventData);
-          if (eventType === 'progress') onProgress(parsed as PodcastProgressEvent);
-          else if (eventType === 'complete') onComplete(parsed);
-          else if (eventType === 'error') onError(parsed.error || 'Unknown error');
-        } catch {
-          onError(`Parse error: ${eventData}`);
-        }
-        eventType = '';
-        eventData = '';
-      }
+  let completed = false;
+  try {
+    const res = await fetch(`${BASE}${path}`, {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      body: body ? JSON.stringify(body) : undefined,
+      signal,
+    });
+    if (!res.ok) {
+      const txt = await res.text();
+      onError(txt || `Stream failed: ${res.status}`);
+      return;
     }
+
+    await readSSE(res, (eventType, eventData) => {
+      try {
+        const parsed = JSON.parse(eventData);
+        if (eventType === 'progress') onProgress(parsed as PodcastProgressEvent);
+        else if (eventType === 'complete') {
+          completed = true;
+          onComplete(parsed);
+        } else if (eventType === 'error') {
+          completed = true;
+          onError(parsed.error || 'Unknown error');
+        }
+      } catch {
+        completed = true;
+        onError(`Parse error: ${eventData}`);
+      }
+    });
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      onError('cancelled');
+      return;
+    }
+    onError(err instanceof Error ? err.message : 'Stream failed');
+    return;
   }
+
+  if (!completed) onError('Stream ended before completion');
 }
 
 export async function generatePodcastScript(
@@ -613,6 +662,7 @@ export async function generatePodcastAudio(
   onComplete: (result: PodcastAudioResult) => void,
   onError: (error: string) => void,
   force = false,
+  signal?: AbortSignal,
 ): Promise<void> {
   const suffix = force ? '?force=true' : '';
   await streamPodcastSSE(
@@ -621,6 +671,8 @@ export async function generatePodcastAudio(
     onProgress,
     (payload) => onComplete(payload as PodcastAudioResult),
     onError,
+    'POST',
+    signal,
   );
 }
 

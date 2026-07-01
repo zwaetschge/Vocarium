@@ -224,7 +224,7 @@ export default function PodcastPage() {
       </AnimatePresence>
 
       {/* Two-pane layout */}
-      <div style={{ display: 'grid', gridTemplateColumns: '300px 1fr', gap: '18px', alignItems: 'start' }}>
+      <div className="podcast-grid">
         {/* Podcast list */}
         <PodcastList
           podcasts={podcasts}
@@ -335,7 +335,7 @@ function PodcastList({
                     fontSize: '13.5px',
                     fontWeight: 500,
                     color: 'var(--color-text)',
-                    letterSpacing: '-0.01em',
+                    letterSpacing: 0,
                     overflow: 'hidden',
                     textOverflow: 'ellipsis',
                     whiteSpace: 'nowrap',
@@ -396,6 +396,7 @@ function StatusPill({ status }: { status: Podcast['status'] }) {
     script_ready: { label: 'script ready', color: 'var(--color-accent-hover)', bg: 'var(--color-accent-dim)' },
     generating_audio: { label: 'audio…', color: 'var(--color-warning)', bg: 'var(--color-warning-dim)' },
     ready: { label: 'ready', color: 'var(--color-success)', bg: 'var(--color-success-dim)' },
+    cancelled: { label: 'cancelled', color: 'var(--color-text-dim)', bg: 'rgba(255,255,255,0.05)' },
     error: { label: 'error', color: 'var(--color-danger)', bg: 'var(--color-danger-dim)' },
   };
   const s = styles[status];
@@ -408,7 +409,7 @@ function StatusPill({ status }: { status: Podcast['status'] }) {
         borderRadius: '4px',
         fontSize: '9px',
         textTransform: 'uppercase',
-        letterSpacing: '0.08em',
+        letterSpacing: 0,
         color: s.color,
         background: s.bg,
         fontWeight: 500,
@@ -450,7 +451,7 @@ function EmptyPane({ onNew, canCreate }: { onNew: () => void; canCreate: boolean
           <path d="M5 9a5 5 0 0010 0M10 14v3M7 17h6" />
         </svg>
       </div>
-      <div style={{ fontSize: '15px', fontWeight: 500, color: 'var(--color-text)', letterSpacing: '-0.01em' }}>
+      <div style={{ fontSize: '15px', fontWeight: 500, color: 'var(--color-text)', letterSpacing: 0 }}>
         No podcast selected
       </div>
       <div style={{ fontSize: '13px', color: 'var(--color-text-dim)', maxWidth: '360px', lineHeight: 1.5 }}>
@@ -973,12 +974,12 @@ function ScriptCard({
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '12.5px' }}>
                 <span style={{ color: 'var(--color-text)' }}>{progress.message}</span>
                 <span style={{ color: 'var(--color-accent-hover)', fontFamily: 'var(--font-mono)', fontSize: '11px' }}>
-                  {Math.round(progress.progress * 100)}%
+                  {Math.round(progressPercent(progress.progress))}%
                 </span>
               </div>
               <div style={{ height: '3px', borderRadius: '999px', background: 'rgba(255,255,255,0.08)', overflow: 'hidden' }}>
                 <motion.div
-                  animate={{ width: `${progress.progress * 100}%` }}
+                  animate={{ width: `${progressPercent(progress.progress)}%` }}
                   transition={{ duration: 0.25, ease: 'easeOut' }}
                   style={{
                     height: '100%',
@@ -1067,7 +1068,7 @@ function AddTrackBar({
           gap: '8px',
         }}
       >
-        <div style={{ fontSize: '11px', color: 'var(--color-text-faint)', textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+        <div style={{ fontSize: '11px', color: 'var(--color-text-faint)', textTransform: 'uppercase', letterSpacing: 0 }}>
           {pickerOpen === 'music' ? 'Background music' : 'Sound effect'}
         </div>
         <textarea
@@ -1143,6 +1144,11 @@ const TYPE_STYLES: Record<string, { color: string; bg: string; border: string; l
   music:    { color: '#a888ff',                  bg: 'rgba(123,97,255,0.10)',      border: 'rgba(123,97,255,0.30)',  label: 'music' },
   sfx:      { color: '#ffb15a',                  bg: 'rgba(255,148,68,0.10)',      border: 'rgba(255,148,68,0.30)',  label: 'sfx' },
 };
+
+function progressPercent(value: number): number {
+  const normalized = value <= 1 ? value * 100 : value;
+  return Math.max(0, Math.min(100, normalized));
+}
 
 function SegmentRow({
   podcastId,
@@ -1229,7 +1235,7 @@ function SegmentRow({
             fontFamily: 'var(--font-mono)',
             fontSize: '10px',
             color: 'var(--color-text-faint)',
-            letterSpacing: '0.06em',
+            letterSpacing: 0,
             textTransform: 'uppercase',
           }}
         >
@@ -1344,7 +1350,7 @@ function SegmentRow({
                     fontWeight: 600,
                     color: 'var(--color-accent-hover)',
                     textTransform: 'uppercase',
-                    letterSpacing: '0.08em',
+                    letterSpacing: 0,
                   }}
                 >
                   {segment.speaker}
@@ -1361,7 +1367,7 @@ function SegmentRow({
                     background: styleSet.bg,
                     border: `1px solid ${styleSet.border}`,
                     textTransform: 'uppercase',
-                    letterSpacing: '0.06em',
+                    letterSpacing: 0,
                   }}
                 >
                   {styleSet.label}
@@ -1450,10 +1456,13 @@ function AudioCard({
   const [generating, setGenerating] = useState(false);
   const [progress, setProgress] = useState<PodcastProgressEvent | null>(null);
   const hasAudio = podcast.status === 'ready' && !!podcast.audio_path;
-  const canGenerate = podcast.status === 'script_ready' || podcast.status === 'ready' || podcast.status === 'error';
+  const canGenerate = podcast.status === 'script_ready' || podcast.status === 'ready' || podcast.status === 'error' || podcast.status === 'cancelled';
   const audioRef = useRef<HTMLAudioElement>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
   const handleGenerate = async (force = false) => {
+    const controller = new AbortController();
+    abortRef.current = controller;
     setGenerating(true);
     setProgress(null);
     try {
@@ -1469,17 +1478,28 @@ function AudioCard({
         (err) => {
           setGenerating(false);
           setProgress(null);
-          onError(err);
+          if (err !== 'cancelled') onError(err);
           onReload();
           onReloadList();
         },
         force,
+        controller.signal,
       );
     } catch (e) {
       setGenerating(false);
       setProgress(null);
       onError(e instanceof Error ? e.message : 'Audio generation failed');
+    } finally {
+      if (abortRef.current === controller) abortRef.current = null;
     }
+  };
+
+  const handleCancel = () => {
+    abortRef.current?.abort();
+    setGenerating(false);
+    setProgress(null);
+    onReload();
+    onReloadList();
   };
 
   const handleDownload = async () => {
@@ -1513,6 +1533,11 @@ function AudioCard({
                   <path d="M8 2v9M4 8l4 4 4-4M2 14h12" />
                 </svg>
                 Download
+              </button>
+            )}
+            {generating && (
+              <button className="btn btn-ghost" onClick={handleCancel} style={{ height: '36px', fontSize: '12.5px' }}>
+                Cancel
               </button>
             )}
             <button
@@ -1565,13 +1590,13 @@ function AudioCard({
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '12.5px' }}>
                 <span style={{ color: 'var(--color-text)' }}>{progress.message}</span>
                 <span style={{ color: 'var(--color-accent-hover)', fontFamily: 'var(--font-mono)', fontSize: '11px' }}>
-                  {Math.round(progress.progress * 100)}%
+                  {Math.round(progressPercent(progress.progress))}%
                   {progress.segment_position != null && <> · seg {progress.segment_position + 1}</>}
                 </span>
               </div>
               <div style={{ height: '3px', borderRadius: '999px', background: 'rgba(255,255,255,0.08)', overflow: 'hidden' }}>
                 <motion.div
-                  animate={{ width: `${progress.progress * 100}%` }}
+                  animate={{ width: `${progressPercent(progress.progress)}%` }}
                   transition={{ duration: 0.25, ease: 'easeOut' }}
                   style={{
                     height: '100%',
@@ -1900,7 +1925,7 @@ function HostManagerModal({
                         style={{
                           fontSize: '9.5px',
                           textTransform: 'uppercase',
-                          letterSpacing: '0.08em',
+                          letterSpacing: 0,
                           color: 'var(--color-accent-hover)',
                           background: 'var(--color-accent-dim)',
                           padding: '1px 6px',
@@ -2077,7 +2102,7 @@ function Modal({
           maxWidth: wide ? '640px' : '480px',
           maxHeight: '88vh',
           overflowY: 'auto',
-          borderRadius: '18px',
+          borderRadius: 'var(--radius-panel)',
           padding: '22px 24px',
         }}
       >
@@ -2126,7 +2151,7 @@ function SectionHeader({
             fontSize: '15px',
             fontWeight: 500,
             color: 'var(--color-text)',
-            letterSpacing: '-0.015em',
+            letterSpacing: 0,
             overflow: 'hidden',
             textOverflow: 'ellipsis',
             whiteSpace: 'nowrap',
@@ -2158,7 +2183,7 @@ function MetaChip({ label, value, emphasis }: { label: string; value: string; em
         style={{
           color: emphasis ? 'var(--color-accent-hover)' : 'var(--color-text-dim)',
           textTransform: 'uppercase',
-          letterSpacing: '0.08em',
+          letterSpacing: 0,
           fontWeight: 500,
         }}
       >

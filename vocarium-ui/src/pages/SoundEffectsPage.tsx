@@ -200,7 +200,7 @@ export default function SoundEffectsPage() {
     <div style={{ display: 'flex', flexDirection: 'column', gap: '28px', maxWidth: '1200px' }}>
       {/* Header */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-        <h1 style={{ fontSize: '32px', fontWeight: 600, fontFamily: 'var(--font-display)', letterSpacing: '-0.035em', lineHeight: 1.05, color: 'var(--color-text)' }}>
+        <h1 style={{ fontSize: '32px', fontWeight: 600, fontFamily: 'var(--font-display)', letterSpacing: 0, lineHeight: 1.05, color: 'var(--color-text)' }}>
           Sound Effects
         </h1>
         <p style={{ fontSize: '14px', color: 'var(--color-text-secondary)', lineHeight: 1.55, maxWidth: '640px' }}>
@@ -233,7 +233,7 @@ export default function SoundEffectsPage() {
             border: sfxOnline === false ? '1px solid rgba(255,90,101,0.28)' : '1px solid rgba(123,97,255,0.22)',
             fontSize: '11px',
             color: sfxOnline === false ? 'var(--color-danger)' : 'var(--color-text-secondary)',
-            letterSpacing: '0.02em',
+            letterSpacing: 0,
             fontFamily: 'var(--font-mono)',
           }}
         >
@@ -254,7 +254,7 @@ export default function SoundEffectsPage() {
             MMAudio · {sfxOnline === null ? 'checking…' : sfxOnline ? 'lazy-start · 600s idle unload' : 'proxy offline'}
           </span>
         </div>
-        <span style={{ fontSize: '11px', color: 'var(--color-text-dim)', letterSpacing: '0.04em', textTransform: 'uppercase', fontWeight: 500 }}>
+        <span style={{ fontSize: '11px', color: 'var(--color-text-dim)', letterSpacing: 0, textTransform: 'uppercase', fontWeight: 500 }}>
           Shared GPU with Music
         </span>
       </motion.div>
@@ -313,7 +313,7 @@ export default function SoundEffectsPage() {
                   {ex.icon}
                 </span>
                 <div style={{ minWidth: 0, flex: 1 }}>
-                  <div style={{ fontSize: '12.5px', fontWeight: 500, color: 'var(--color-text)', letterSpacing: '-0.005em' }}>
+                  <div style={{ fontSize: '12.5px', fontWeight: 500, color: 'var(--color-text)', letterSpacing: 0 }}>
                     {ex.title}
                   </div>
                   <div
@@ -496,7 +496,7 @@ export default function SoundEffectsPage() {
           padding: '16px 28px',
           fontSize: '15px',
           fontWeight: 600,
-          letterSpacing: '-0.01em',
+          letterSpacing: 0,
           cursor: generating ? 'not-allowed' : !prompt.trim() ? 'not-allowed' : 'pointer',
           opacity: !prompt.trim() && !generating ? 0.5 : 1,
           display: 'flex',
@@ -509,7 +509,7 @@ export default function SoundEffectsPage() {
           <>
             <WaveformBars active size="sm" bars={5} color="text" />
             <span>Rendering sound</span>
-            <span style={{ fontFamily: 'var(--font-mono)', fontSize: '12px', opacity: 0.8, letterSpacing: '0.02em' }}>
+            <span style={{ fontFamily: 'var(--font-mono)', fontSize: '12px', opacity: 0.8, letterSpacing: 0 }}>
               {formatElapsed(elapsed)}
             </span>
           </>
@@ -588,10 +588,10 @@ export default function SoundEffectsPage() {
                   </svg>
                 </div>
                 <div style={{ minWidth: 0 }}>
-                  <div style={{ fontSize: '14px', fontWeight: 500, color: 'var(--color-text)', letterSpacing: '-0.005em' }}>
+                  <div style={{ fontSize: '14px', fontWeight: 500, color: 'var(--color-text)', letterSpacing: 0 }}>
                     Sound effect ready
                   </div>
-                  <div style={{ fontSize: '11px', color: 'var(--color-text-dim)', marginTop: '2px', fontFamily: 'var(--font-mono)', letterSpacing: '0.02em' }}>
+                  <div style={{ fontSize: '11px', color: 'var(--color-text-dim)', marginTop: '2px', fontFamily: 'var(--font-mono)', letterSpacing: 0 }}>
                     Rendered in {formatElapsed(elapsed)} · {duration.toFixed(1)}s audio
                   </div>
                 </div>
@@ -605,7 +605,7 @@ export default function SoundEffectsPage() {
                   padding: '8px 14px',
                   fontSize: '12px',
                   fontWeight: 500,
-                  letterSpacing: '-0.005em',
+                  letterSpacing: 0,
                   display: 'inline-flex',
                   alignItems: 'center',
                   gap: '7px',

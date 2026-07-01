@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react';
 import { Outlet, useLocation } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import Aurora from './Aurora';
@@ -76,6 +77,27 @@ const pageConfig: Record<string, PageMeta> = {
       </svg>
     ),
   },
+  '/podcast': {
+    eyebrow: 'Produce',
+    title: 'Episode Lab',
+    icon: (
+      <svg width="18" height="18" viewBox="0 0 22 22" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+        <rect x="8" y="2" width="6" height="11" rx="3" />
+        <path d="M5 10v1a6 6 0 0012 0v-1" />
+        <path d="M11 17v3M8 20h6" />
+      </svg>
+    ),
+  },
+  '/custom': {
+    eyebrow: 'Craft',
+    title: 'Custom Voices',
+    icon: (
+      <svg width="18" height="18" viewBox="0 0 22 22" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+        <circle cx="11" cy="11" r="7" />
+        <path d="M11 7v8M7 11h8" />
+      </svg>
+    ),
+  },
   '/benchmark': {
     eyebrow: 'Measure',
     title: 'Benchmark',
@@ -85,110 +107,106 @@ const pageConfig: Record<string, PageMeta> = {
       </svg>
     ),
   },
+  '/settings': {
+    eyebrow: 'System',
+    title: 'Provider Config',
+    icon: (
+      <svg width="18" height="18" viewBox="0 0 22 22" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+        <circle cx="11" cy="11" r="3" />
+        <path d="M11 2v3M11 17v3M3.2 6.5l2.6 1.5M16.2 14l2.6 1.5M3.2 15.5l2.6-1.5M16.2 8l2.6-1.5" />
+      </svg>
+    ),
+  },
 };
 
 export default function Layout() {
   const location = useLocation();
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const page = pageConfig[location.pathname] ?? { eyebrow: 'Vocarium', title: 'Studio', icon: <></> };
+
+  useEffect(() => {
+    setSidebarOpen(false);
+  }, [location.pathname]);
+
+  useEffect(() => {
+    if (!sidebarOpen) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setSidebarOpen(false);
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [sidebarOpen]);
 
   return (
     <>
       <Aurora />
-      <div
-        style={{
-          position: 'relative',
-          zIndex: 3,
-          display: 'flex',
-          height: '100vh',
-          overflow: 'hidden',
-        }}
-      >
-        <Sidebar />
+      <div className="app-shell">
+        <button
+          className={`sidebar-overlay ${sidebarOpen ? 'sidebar-overlay-open' : ''}`}
+          aria-label="Close navigation"
+          onClick={() => setSidebarOpen(false)}
+        />
+        <Sidebar open={sidebarOpen} onNavigate={() => setSidebarOpen(false)} />
 
-        <div
-          style={{
-            flex: 1,
-            marginLeft: '260px',
-            display: 'flex',
-            flexDirection: 'column',
-            overflow: 'hidden',
-            minWidth: 0,
-          }}
-        >
+        <div className="app-content">
           {/* Header — glass over aurora */}
-          <header
-            className="glass"
-            style={{
-              flexShrink: 0,
-              height: '68px',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'space-between',
-              padding: '0 36px',
-              borderLeft: 'none',
-              borderRight: 'none',
-              borderTop: 'none',
-              borderRadius: 0,
-              zIndex: 20,
-            }}
-          >
-            <motion.div
-              key={location.pathname}
-              initial={{ opacity: 0, x: -10 }}
-              animate={{ opacity: 1, x: 0 }}
-              transition={{ duration: 0.28, ease: [0.25, 0.46, 0.45, 0.94] }}
-              style={{ display: 'flex', alignItems: 'center', gap: '14px' }}
-            >
-              <div
-                style={{
-                  width: '36px',
-                  height: '36px',
-                  borderRadius: '10px',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  background: 'rgba(123, 97, 255, 0.12)',
-                  border: '1px solid rgba(123, 97, 255, 0.22)',
-                  color: 'var(--color-accent)',
-                  boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.08)',
-                }}
+          <header className="glass app-header">
+            <div className="app-header-left">
+              <button
+                className="icon-button header-menu-button"
+                type="button"
+                aria-label="Open navigation"
+                aria-expanded={sidebarOpen}
+                onClick={() => setSidebarOpen(true)}
               >
-                {page.icon}
-              </div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
-                <span className="label-eyebrow" style={{ fontSize: '10px' }}>
-                  {page.eyebrow}
-                </span>
-                <h2
-                  style={{
-                    fontSize: '18px',
-                    fontWeight: 600,
-                    fontFamily: 'var(--font-display)',
-                    color: 'var(--color-text)',
-                    letterSpacing: '-0.025em',
-                    lineHeight: 1,
-                  }}
-                >
-                  {page.title}
-                </h2>
-              </div>
-            </motion.div>
+                <svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round">
+                  <path d="M3 5h14M3 10h14M3 15h14" />
+                </svg>
+              </button>
 
-            <ModelSelector />
+              <motion.div
+                key={location.pathname}
+                initial={{ opacity: 0, x: -10 }}
+                animate={{ opacity: 1, x: 0 }}
+                transition={{ duration: 0.28, ease: [0.25, 0.46, 0.45, 0.94] }}
+                className="page-heading"
+              >
+                <div className="page-heading-icon">
+                  {page.icon}
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+                  <span className="label-eyebrow" style={{ fontSize: '10px' }}>
+                    {page.eyebrow}
+                  </span>
+                  <h2
+                    style={{
+                      fontSize: '18px',
+                      fontWeight: 600,
+                      fontFamily: 'var(--font-display)',
+                      color: 'var(--color-text)',
+                      letterSpacing: 0,
+                      lineHeight: 1,
+                    }}
+                  >
+                    {page.title}
+                  </h2>
+                </div>
+              </motion.div>
+            </div>
+
+            <div className="app-header-actions">
+              <ModelSelector />
+            </div>
           </header>
 
           {/* Main scroll area */}
-          <main style={{ flex: 1, overflowY: 'auto', position: 'relative' }}>
+          <main className="app-main">
             <motion.div
               key={location.pathname}
               initial={{ opacity: 0, y: 14 }}
               animate={{ opacity: 1, y: 0 }}
               transition={{ duration: 0.26, ease: [0.25, 0.46, 0.45, 0.94] }}
-              style={{
-                padding: '40px 36px 72px',
-                maxWidth: '1400px',
-                margin: '0 auto',
-              }}
+              className="app-main-inner"
             >
               <Outlet />
             </motion.div>

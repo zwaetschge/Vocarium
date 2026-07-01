@@ -207,7 +207,7 @@ export default function SettingsPage() {
   return (
     <div style={{ maxWidth: '720px', margin: '0 auto', padding: '32px 24px' }}>
       <header style={{ marginBottom: 28 }}>
-        <h1 style={{ fontSize: '24px', fontWeight: 600, letterSpacing: '-0.03em', marginBottom: 6 }}>
+        <h1 style={{ fontSize: '24px', fontWeight: 600, letterSpacing: 0, marginBottom: 6 }}>
           Settings
         </h1>
         <p style={{ fontSize: '14px', color: 'var(--color-text-dim)', maxWidth: 480, lineHeight: '1.5' }}>
@@ -320,7 +320,7 @@ export default function SettingsPage() {
                             fontSize: '10px',
                             fontWeight: 600,
                             textTransform: 'uppercase',
-                            letterSpacing: '0.04em',
+                            letterSpacing: 0,
                             padding: '2px 6px',
                             borderRadius: '100px',
                             background: 'rgba(34,197,94,0.15)',
@@ -367,9 +367,9 @@ export default function SettingsPage() {
             exit={{ opacity: 0, y: 12 }}
             transition={{ duration: 0.18 }}
             className="glass"
-            style={{ borderRadius: '18px', padding: '22px 24px', border: '1px solid rgba(123,97,255,0.22)' }}
+            style={{ borderRadius: 'var(--radius-panel)', padding: '22px 24px', border: '1px solid rgba(123,97,255,0.22)' }}
           >
-            <h3 style={{ fontSize: '16px', fontWeight: 600, marginBottom: 16, letterSpacing: '-0.01em' }}>
+            <h3 style={{ fontSize: '16px', fontWeight: 600, marginBottom: 16, letterSpacing: 0 }}>
               {editingId === 'NEW' ? 'New LLM Provider' : 'Edit Provider'}
             </h3>
 

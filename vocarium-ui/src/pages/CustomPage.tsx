@@ -132,7 +132,7 @@ export default function CustomPage() {
             fontSize: '10.5px',
             fontFamily: 'var(--font-mono)',
             color: 'var(--color-accent)',
-            letterSpacing: '0.04em',
+            letterSpacing: 0,
             textTransform: 'uppercase',
             flexShrink: 0,
           }}
@@ -159,7 +159,7 @@ export default function CustomPage() {
               fontSize: '10.5px',
               fontFamily: 'var(--font-mono)',
               color: 'var(--color-text-dim)',
-              letterSpacing: '0.02em',
+              letterSpacing: 0,
             }}
           >
             {speakers.length} available
@@ -235,7 +235,7 @@ export default function CustomPage() {
                           fontSize: '13px',
                           fontWeight: 500,
                           color: 'var(--color-text)',
-                          letterSpacing: '-0.005em',
+                          letterSpacing: 0,
                           overflow: 'hidden',
                           textOverflow: 'ellipsis',
                           whiteSpace: 'nowrap',
@@ -248,7 +248,7 @@ export default function CustomPage() {
                           fontSize: '10.5px',
                           fontFamily: 'var(--font-mono)',
                           color: 'var(--color-text-dim)',
-                          letterSpacing: '0.02em',
+                          letterSpacing: 0,
                           textTransform: 'uppercase',
                         }}
                       >
@@ -273,7 +273,7 @@ export default function CustomPage() {
               fontFamily: 'var(--font-mono)',
               color: 'var(--color-text-dim)',
               fontVariantNumeric: 'tabular-nums',
-              letterSpacing: '0.02em',
+              letterSpacing: 0,
             }}
           >
             {instruct.length} chars
@@ -356,7 +356,7 @@ export default function CustomPage() {
             gap: '10px',
             cursor: previewing || !canPreview ? 'not-allowed' : 'pointer',
             opacity: previewing || !canPreview ? 0.45 : 1,
-            letterSpacing: '-0.005em',
+            letterSpacing: 0,
           }}
         >
           {previewing ? (
@@ -404,7 +404,7 @@ export default function CustomPage() {
                 display: 'inline-flex',
                 alignItems: 'center',
                 gap: '8px',
-                letterSpacing: '-0.005em',
+                letterSpacing: 0,
                 backdropFilter: 'blur(14px)',
                 WebkitBackdropFilter: 'blur(14px)',
                 transition: 'background 0.15s, border-color 0.15s',
@@ -468,7 +468,7 @@ export default function CustomPage() {
                     fontSize: '11.5px',
                     fontWeight: 500,
                     color: 'var(--color-text-secondary)',
-                    letterSpacing: '0.01em',
+                    letterSpacing: 0,
                   }}
                 >
                   Voice name
@@ -496,7 +496,7 @@ export default function CustomPage() {
                   cursor: saving || !voiceName.trim() ? 'not-allowed' : 'pointer',
                   opacity: saving || !voiceName.trim() ? 0.45 : 1,
                   whiteSpace: 'nowrap',
-                  letterSpacing: '-0.005em',
+                  letterSpacing: 0,
                 }}
               >
                 {saving ? (

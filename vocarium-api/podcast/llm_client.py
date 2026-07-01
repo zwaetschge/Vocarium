@@ -13,13 +13,34 @@ import json
 import logging
 import os
 import re
+import time
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from typing import Any, cast
 
 import httpx
+from metrics import inc, observe
+from url_security import normalize_http_base_url
 
 logger = logging.getLogger(__name__)
+_http_client: httpx.AsyncClient | None = None
+
+
+def _client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(
+            limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
+            timeout=None,
+        )
+    return _http_client
+
+
+async def close_llm_clients() -> None:
+    global _http_client
+    if _http_client is not None and not _http_client.is_closed:
+        await _http_client.aclose()
+    _http_client = None
 
 
 @dataclass
@@ -41,8 +62,9 @@ class LLMMessage:
 
 
 def _default_config() -> LLMConfig:
+    base_url = os.environ.get("LLM_API_URL", "")
     return LLMConfig(
-        base_url=os.environ.get("LLM_API_URL", ""),
+        base_url=_normalize_llm_base_url(base_url) if base_url.strip() else "",
         api_key=os.environ.get("LLM_API_KEY", ""),
         model=os.environ.get("LLM_MODEL", ""),
         temperature=float(os.environ.get("LLM_TEMPERATURE", "0.8")),
@@ -54,12 +76,23 @@ def _config_from_provider(provider: dict | None) -> LLMConfig:
     """Build LLMConfig from a provider row dict (from DB) or fall back to env."""
     if not provider:
         return _default_config()
+    base_url = provider.get("base_url", "")
     return LLMConfig(
-        base_url=provider.get("base_url", ""),
+        base_url=_normalize_llm_base_url(base_url) if str(base_url or "").strip() else "",
         api_key=provider.get("api_key", ""),
         model=provider.get("model", "default"),
         temperature=provider.get("temperature", 0.8),
         max_tokens=provider.get("max_tokens", 16384),
+    )
+
+
+def _normalize_llm_base_url(raw_url: str) -> str:
+    return normalize_http_base_url(
+        raw_url,
+        field="base_url",
+        allow_private_env="LLM_ALLOW_PRIVATE_BASE_URLS",
+        allowed_hosts_env="LLM_ALLOWED_PRIVATE_HOSTS",
+        validate_dns_env="LLM_VALIDATE_BASE_URL_DNS",
     )
 
 
@@ -114,16 +147,19 @@ class LLMClient:
         return headers
 
     async def health_check(self) -> dict[str, Any]:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            try:
-                resp = await client.get(
-                    f"{self.config.base_url}/models", headers=self._headers()
-                )
-                if resp.status_code == 200:
-                    return {"healthy": True}
-                return {"healthy": False, "error": f"HTTP {resp.status_code}"}
-            except Exception as exc:
-                return {"healthy": False, "error": str(exc)}
+        if not self.config.base_url:
+            return {"healthy": False, "error": "LLM base_url is not configured"}
+        try:
+            resp = await _client().get(
+                f"{self.config.base_url}/models",
+                headers=self._headers(),
+                timeout=10.0,
+            )
+            if resp.status_code == 200:
+                return {"healthy": True}
+            return {"healthy": False, "error": f"HTTP {resp.status_code}"}
+        except Exception as exc:
+            return {"healthy": False, "error": str(exc)}
 
     async def complete(
         self,
@@ -133,6 +169,8 @@ class LLMClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> str:
+        if not self.config.base_url:
+            raise RuntimeError("LLM base_url is not configured")
         payload_messages = [
             m.to_dict() if isinstance(m, LLMMessage) else m for m in messages
         ]
@@ -146,34 +184,44 @@ class LLMClient:
 
         last_err: Exception | None = None
         for attempt in range(3):
+            start = time.perf_counter()
+            status = "error"
+            retry_delay: float | None = None
             try:
-                async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
-                    resp = await client.post(
-                        f"{self.config.base_url}/chat/completions",
-                        headers=self._headers(),
-                        json=payload,
+                resp = await _client().post(
+                    f"{self.config.base_url}/chat/completions",
+                    headers=self._headers(),
+                    json=payload,
+                    timeout=httpx.Timeout(300.0),
+                )
+                status = str(resp.status_code)
+                if resp.status_code != 200:
+                    raise RuntimeError(
+                        f"LLM request failed: {resp.status_code} {resp.text}"
                     )
-                    if resp.status_code != 200:
-                        raise RuntimeError(
-                            f"LLM request failed: {resp.status_code} {resp.text}"
-                        )
-                    data = resp.json()
-                    choices = data.get("choices") or []
-                    if not choices:
-                        raise RuntimeError("No choices returned from LLM")
+                data = resp.json()
+                choices = data.get("choices") or []
+                if not choices:
+                    raise RuntimeError("No choices returned from LLM")
 
-                    message = choices[0].get("message", {})
-                    content = message.get("content") or ""
-                    if not content and message.get("reasoning_content"):
-                        logger.warning(
-                            "LLM returned empty content with reasoning_content — model in thinking mode"
-                        )
-                        return cast(str, message["reasoning_content"])
-                    return cast(str, content)
+                message = choices[0].get("message", {})
+                content = message.get("content") or ""
+                if not content and message.get("reasoning_content"):
+                    logger.warning(
+                        "LLM returned empty content with reasoning_content — model in thinking mode"
+                    )
+                    return cast(str, message["reasoning_content"])
+                return cast(str, content)
             except Exception as exc:
                 last_err = exc
                 if attempt < 2:
-                    await asyncio.sleep(1.0 * (2**attempt))
+                    retry_delay = 1.0 * (2**attempt)
+            finally:
+                labels = {"status": status, "stream": "false"}
+                inc("vocarium_llm_requests_total", labels=labels)
+                observe("vocarium_llm_seconds", time.perf_counter() - start, labels)
+            if retry_delay is not None:
+                await asyncio.sleep(retry_delay)
         assert last_err is not None
         raise last_err
 
@@ -185,6 +233,8 @@ class LLMClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> AsyncGenerator[str, None]:
+        if not self.config.base_url:
+            raise RuntimeError("LLM base_url is not configured")
         payload_messages = [
             m.to_dict() if isinstance(m, LLMMessage) else m for m in messages
         ]
@@ -196,13 +246,17 @@ class LLMClient:
             "stream": True,
         }
 
-        async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as client:
-            async with client.stream(
+        start = time.perf_counter()
+        status = "error"
+        try:
+            async with _client().stream(
                 "POST",
                 f"{self.config.base_url}/chat/completions",
                 headers=self._headers(),
                 json=payload,
+                timeout=httpx.Timeout(600.0),
             ) as resp:
+                status = str(resp.status_code)
                 if resp.status_code != 200:
                     body = await resp.aread()
                     raise RuntimeError(
@@ -230,6 +284,10 @@ class LLMClient:
                     content = delta.get("content")
                     if content:
                         yield content
+        finally:
+            labels = {"status": status, "stream": "true"}
+            inc("vocarium_llm_requests_total", labels=labels)
+            observe("vocarium_llm_seconds", time.perf_counter() - start, labels)
 
     async def complete_json(
         self,

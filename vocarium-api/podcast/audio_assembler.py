@@ -1,8 +1,8 @@
 """Audio assembler — combines TTS segments into a single podcast audio file.
 
-Ported from PodForge's audioAssembler.ts. The TTS producer is injected via
-``TTSGenerator`` so this module stays decoupled from the Vocarium voice
-resolver / qwen3-tts client wiring in ``main.py``.
+The TTS producer is injected via ``TTSGenerator`` so this module stays
+decoupled from the Vocarium voice resolver / qwen3-tts client wiring in
+``main.py``.
 
 The pipeline:
   1. synthesize each speech/reaction segment to an individual MP3
@@ -15,11 +15,14 @@ The pipeline:
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import random
 import re
 import shutil
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Literal, Protocol
@@ -207,6 +210,8 @@ _ENTHUSIASTIC_START = re.compile(
 
 def _extract_pause_duration(segment: ScriptSegment) -> float:
     """Read the pause length (seconds) from a pause segment's notes."""
+    if segment.duration_ms and segment.duration_ms > 0:
+        return max(0.05, segment.duration_ms / 1000.0)
     if segment.notes:
         m = _PAUSE_NOTE_RE.search(segment.notes)
         if m:
@@ -289,7 +294,9 @@ class AudioAssembler:
         self.ffprobe = ffprobe_path
         self.user_id = user_id
         self._assembly_lock = asyncio.Lock()
+        self.tts_cache_dir = self.output_dir / "tts_cache"
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.tts_cache_dir.mkdir(parents=True, exist_ok=True)
 
     async def assemble_from_segments(
         self,
@@ -309,6 +316,12 @@ class AudioAssembler:
                 force=force,
                 user_id=user_id,
             )
+
+    async def aclose(self) -> None:
+        for dependency in (self.tts, self.music, self.sfx):
+            close = getattr(dependency, "aclose", None)
+            if close is not None:
+                await close()
 
     async def _assemble_from_segments_unlocked(
         self,
@@ -339,7 +352,7 @@ class AudioAssembler:
         )
 
         synthesized = await self._synthesize_segments(
-            segments, project_id, options, on_progress, user_id=user_id
+            segments, project_id, options, on_progress, user_id=user_id, force=force
         )
 
         self._progress(
@@ -375,6 +388,7 @@ class AudioAssembler:
         options: AssemblyOptions,
         on_progress: ProgressCallback | None,
         user_id: int | None = None,
+        force: bool = False,
     ) -> list[SynthesisResult]:
         resolved_user_id = user_id or self.user_id
         logger.info(
@@ -433,7 +447,15 @@ class AudioAssembler:
 
             # Music — render via ACE-Step, cache on disk.
             if segment.type == "music":
-                if output_path.exists():
+                fingerprint = self._segment_fingerprint(
+                    segment=segment,
+                    options=options,
+                    user_id=resolved_user_id,
+                    kind="music",
+                    text=segment.prompt or segment.text,
+                    voice=None,
+                )
+                if self._segment_output_is_current(output_path, fingerprint):
                     results[idx] = SynthesisResult(
                         segment=segment,
                         file_path=output_path,
@@ -441,6 +463,11 @@ class AudioAssembler:
                     )
                     completed += 1
                     return
+                if output_path.exists():
+                    try:
+                        output_path.unlink()
+                    except OSError:
+                        pass
                 if self.music is None or not segment.prompt:
                     logger.warning(
                         "Skipping music segment %s: %s",
@@ -461,6 +488,7 @@ class AudioAssembler:
                     results[idx] = SynthesisResult(
                         segment=segment, file_path=output_path, duration=duration
                     )
+                    await self._write_segment_manifest(output_path, fingerprint)
                 except Exception as exc:
                     logger.error("Music segment %s failed: %s", segment.id, exc)
                     results[idx] = SynthesisResult(segment=segment, file_path=None, duration=0.0)
@@ -470,7 +498,15 @@ class AudioAssembler:
             # SFX — prompted goes via MMAudio, otherwise fall back to bundled clips.
             if segment.type == "sfx":
                 if segment.prompt and self.sfx is not None:
-                    if output_path.exists():
+                    fingerprint = self._segment_fingerprint(
+                        segment=segment,
+                        options=options,
+                        user_id=resolved_user_id,
+                        kind="sfx",
+                        text=segment.prompt,
+                        voice=None,
+                    )
+                    if self._segment_output_is_current(output_path, fingerprint):
                         results[idx] = SynthesisResult(
                             segment=segment,
                             file_path=output_path,
@@ -478,6 +514,11 @@ class AudioAssembler:
                         )
                         completed += 1
                         return
+                    if output_path.exists():
+                        try:
+                            output_path.unlink()
+                        except OSError:
+                            pass
                     try:
                         duration = await self.sfx.generate_to_file(
                             prompt=segment.prompt,
@@ -489,6 +530,7 @@ class AudioAssembler:
                         results[idx] = SynthesisResult(
                             segment=segment, file_path=output_path, duration=duration
                         )
+                        await self._write_segment_manifest(output_path, fingerprint)
                     except Exception as exc:
                         logger.error("SFX segment %s failed: %s", segment.id, exc)
                         results[idx] = SynthesisResult(segment=segment, file_path=None, duration=0.0)
@@ -517,14 +559,6 @@ class AudioAssembler:
                 completed += 1
                 return
 
-            if output_path.exists():
-                duration = await self.get_audio_duration(output_path)
-                results[idx] = SynthesisResult(
-                    segment=segment, file_path=output_path, duration=duration
-                )
-                completed += 1
-                return
-
             cleaned = clean_text_for_tts(segment.text)
             if cleaned != segment.text:
                 logger.info(
@@ -540,6 +574,58 @@ class AudioAssembler:
                 completed += 1
                 return
 
+            fingerprint = self._segment_fingerprint(
+                segment=segment,
+                options=options,
+                user_id=resolved_user_id,
+                kind="tts",
+                text=cleaned,
+                voice=voice,
+            )
+            if self._segment_output_is_current(output_path, fingerprint):
+                duration = await self.get_audio_duration(output_path)
+                results[idx] = SynthesisResult(
+                    segment=segment, file_path=output_path, duration=duration
+                )
+                completed += 1
+                return
+            if output_path.exists():
+                logger.info("Discarding stale segment audio for %s", segment.id)
+                try:
+                    output_path.unlink()
+                except OSError:
+                    pass
+
+            cache_path = self._tts_cache_path(
+                text=cleaned,
+                voice=voice,
+                output_format=options.output_format,
+                user_id=resolved_user_id,
+                notes=segment.notes,
+            )
+            if not force and cache_path.exists():
+                try:
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    await asyncio.to_thread(shutil.copy2, cache_path, output_path)
+                    duration = await self.get_audio_duration(output_path)
+                    results[idx] = SynthesisResult(
+                        segment=segment, file_path=output_path, duration=duration
+                    )
+                    await self._write_segment_manifest(output_path, fingerprint)
+                    logger.info(
+                        "Reused TTS cache for segment %s -> %s",
+                        segment.id,
+                        cache_path.name,
+                    )
+                    completed += 1
+                    return
+                except Exception as exc:
+                    logger.warning("Ignoring unusable TTS cache %s: %s", cache_path, exc)
+                    try:
+                        cache_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+
             try:
                 duration = await self._retry_synthesize(
                     text=cleaned,
@@ -553,6 +639,13 @@ class AudioAssembler:
                 results[idx] = SynthesisResult(
                     segment=segment, file_path=output_path, duration=duration
                 )
+                try:
+                    if output_path.exists():
+                        await self._write_segment_manifest(output_path, fingerprint)
+                        cache_path.parent.mkdir(parents=True, exist_ok=True)
+                        await asyncio.to_thread(shutil.copy2, output_path, cache_path)
+                except Exception as exc:
+                    logger.debug("Failed to update TTS cache %s: %s", cache_path, exc)
             except Exception as exc:
                 logger.error("Segment %s synthesis failed: %s", segment.id, exc)
                 results[idx] = SynthesisResult(segment=segment, file_path=None, duration=0.0)
@@ -583,14 +676,105 @@ class AudioAssembler:
             async with sem:
                 await _synthesize_one(idx, segment)
 
-        workers = [
-            asyncio.create_task(_synthesize_one_limited(i, segments[i]))
-            for i in foreground_indices
-        ]
-        if workers:
-            await asyncio.gather(*workers, return_exceptions=True)
+        async def _run_foreground_tts() -> None:
+            workers = [
+                asyncio.create_task(_synthesize_one_limited(i, segments[i]))
+                for i in foreground_indices
+            ]
+            if workers:
+                await asyncio.gather(*workers, return_exceptions=True)
+
+        batch_runner = getattr(self.tts, "run_batch", None)
+        if batch_runner is not None and foreground_indices:
+            await batch_runner(f"Podcast TTS {project_id}", _run_foreground_tts)
+        else:
+            await _run_foreground_tts()
 
         return [r for r in results if r is not None]
+
+    def _segment_fingerprint(
+        self,
+        *,
+        segment: ScriptSegment,
+        options: AssemblyOptions,
+        user_id: int | None,
+        kind: str,
+        text: str | None,
+        voice: str | None,
+    ) -> str:
+        payload = json.dumps(
+            {
+                "v": 1,
+                "kind": kind,
+                "id": segment.id,
+                "type": segment.type,
+                "speaker": segment.speaker,
+                "text": text or "",
+                "voice": voice or segment.voice or "",
+                "notes": segment.notes or "",
+                "prompt": segment.prompt or "",
+                "duration_ms": int(segment.duration_ms or 0),
+                "volume_db": float(segment.volume_db or 0.0),
+                "overlap_ms": int(segment.overlap_ms or 0),
+                "format": options.output_format,
+                "user_id": user_id,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _segment_manifest_path(self, output_path: Path) -> Path:
+        return output_path.with_suffix(output_path.suffix + ".json")
+
+    def _segment_output_is_current(self, output_path: Path, fingerprint: str) -> bool:
+        if not output_path.exists():
+            return False
+        manifest = self._segment_manifest_path(output_path)
+        if not manifest.exists():
+            return False
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        return data.get("fingerprint") == fingerprint
+
+    async def _write_segment_manifest(self, output_path: Path, fingerprint: str) -> None:
+        manifest = self._segment_manifest_path(output_path)
+        payload = {
+            "fingerprint": fingerprint,
+            "file": output_path.name,
+            "size": output_path.stat().st_size if output_path.exists() else 0,
+        }
+        await asyncio.to_thread(
+            manifest.write_text,
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            "utf-8",
+        )
+
+    def _tts_cache_path(
+        self,
+        *,
+        text: str,
+        voice: str,
+        output_format: AudioFormat,
+        user_id: int | None,
+        notes: str | None,
+    ) -> Path:
+        payload = json.dumps(
+            {
+                "v": 1,
+                "text": text,
+                "voice": voice,
+                "format": output_format,
+                "user_id": user_id,
+                "notes": notes or "",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        return self.tts_cache_dir / f"{digest}.{output_format}"
 
 
     async def _retry_synthesize(
@@ -846,6 +1030,11 @@ class AudioAssembler:
 
     async def get_audio_duration(self, file_path: str | os.PathLike[str]) -> float:
         path = Path(file_path)
+        if path.suffix.lower() == ".wav":
+            wav_duration = await asyncio.to_thread(_read_wav_duration, path)
+            if wav_duration > 0:
+                return wav_duration
+
         try:
             proc = await asyncio.create_subprocess_exec(
                 self.ffprobe,
@@ -921,3 +1110,14 @@ def _escape_concat_path(path: Path) -> str:
     """ffmpeg concat demuxer requires single-quoted paths with embedded ``'``
     escaped as ``'\\''``."""
     return str(path).replace("'", "'\\''")
+
+
+def _read_wav_duration(path: Path) -> float:
+    try:
+        with wave.open(str(path), "rb") as wav:
+            rate = wav.getframerate()
+            if rate <= 0:
+                return 0.0
+            return wav.getnframes() / float(rate)
+    except Exception:
+        return 0.0

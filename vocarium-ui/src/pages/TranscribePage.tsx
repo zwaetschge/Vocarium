@@ -158,7 +158,7 @@ export default function TranscribePage() {
             fontFamily: 'var(--font-mono)',
             color: 'var(--color-accent)',
             textTransform: 'uppercase',
-            letterSpacing: '0.05em',
+            letterSpacing: 0,
           }}
         >
           <span
@@ -268,7 +268,7 @@ export default function TranscribePage() {
                         fontSize: '14px',
                         fontWeight: 600,
                         fontFamily: 'var(--font-display)',
-                        letterSpacing: '-0.01em',
+                        letterSpacing: 0,
                         color: 'var(--color-text)',
                         overflow: 'hidden',
                         textOverflow: 'ellipsis',
@@ -285,7 +285,7 @@ export default function TranscribePage() {
                         fontFamily: 'var(--font-mono)',
                         color: 'var(--color-text-dim)',
                         marginTop: '4px',
-                        letterSpacing: '0.03em',
+                        letterSpacing: 0,
                       }}
                     >
                       {(file.size / (1024 * 1024)).toFixed(1)} MB
@@ -309,7 +309,7 @@ export default function TranscribePage() {
                       border: 'none',
                       cursor: 'pointer',
                       transition: 'color 0.2s',
-                      letterSpacing: '0.02em',
+                      letterSpacing: 0,
                     }}
                     onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--color-danger)'; }}
                     onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--color-text-dim)'; }}
@@ -334,14 +334,14 @@ export default function TranscribePage() {
                       fontSize: '14.5px',
                       fontWeight: 600,
                       fontFamily: 'var(--font-display)',
-                      letterSpacing: '-0.015em',
+                      letterSpacing: 0,
                       color: 'var(--color-text)',
                       marginBottom: '6px',
                     }}
                   >
                     Drop audio or video here
                   </p>
-                  <p style={{ fontSize: '12px', color: 'var(--color-text-dim)', letterSpacing: '0.01em' }}>
+                  <p style={{ fontSize: '12px', color: 'var(--color-text-dim)', letterSpacing: 0 }}>
                     WAV · MP3 · FLAC · MP4 · MKV · WEBM · and more
                   </p>
                 </>
@@ -367,11 +367,11 @@ export default function TranscribePage() {
                 padding: '14px 16px',
                 fontSize: '14px',
                 fontFamily: 'var(--font-mono)',
-                letterSpacing: '-0.005em',
+                letterSpacing: 0,
               }}
               placeholder="https://www.youtube.com/watch?v=..."
             />
-            <p style={{ fontSize: '11px', color: 'var(--color-text-dim)', letterSpacing: '0.01em' }}>
+            <p style={{ fontSize: '11px', color: 'var(--color-text-dim)', letterSpacing: 0 }}>
               Supports YouTube, Vimeo, and most streams via yt-dlp.
             </p>
           </motion.div>
@@ -449,7 +449,7 @@ export default function TranscribePage() {
                 fontSize: '13.5px',
                 color: recording ? 'var(--color-danger)' : 'var(--color-text-secondary)',
                 fontFamily: 'var(--font-mono)',
-                letterSpacing: '0.02em',
+                letterSpacing: 0,
                 margin: 0,
               }}
             >
@@ -463,7 +463,7 @@ export default function TranscribePage() {
                 style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px', width: '100%', maxWidth: '440px' }}
               >
                 <WaveformBars active={audio.playing} size="sm" bars={12} color="accent" />
-                <p style={{ fontSize: '12px', color: 'var(--color-accent)', fontFamily: 'var(--font-mono)', letterSpacing: '0.02em' }}>
+                <p style={{ fontSize: '12px', color: 'var(--color-accent)', fontFamily: 'var(--font-mono)', letterSpacing: 0 }}>
                   Recording ready
                 </p>
                 <AudioPlayer
@@ -521,7 +521,7 @@ export default function TranscribePage() {
           padding: '14px 0',
           fontSize: '14px',
           fontWeight: 600,
-          letterSpacing: '-0.005em',
+          letterSpacing: 0,
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'center',
@@ -595,7 +595,7 @@ export default function TranscribePage() {
                     fontSize: '10.5px',
                     fontFamily: 'var(--font-mono)',
                     color: 'var(--color-text-dim)',
-                    letterSpacing: '0.04em',
+                    letterSpacing: 0,
                   }}
                 >
                   {result.length} chars
@@ -650,7 +650,7 @@ export default function TranscribePage() {
                 maxHeight: '440px',
                 overflowY: 'auto',
                 fontFamily: 'var(--font-body)',
-                letterSpacing: '-0.003em',
+                letterSpacing: 0,
               }}
             >
               {result || (

@@ -106,10 +106,7 @@ export default function MusicPage() {
         thinking,
       });
 
-      const resultData = (res as Record<string, unknown>).result as
-        | { data?: Array<{ status: number; result?: string }> }
-        | undefined;
-      const tasks = resultData?.data || [];
+      const tasks = res.result?.data || [];
       const task = tasks[0];
       if (task?.status === 1 && task.result) {
         setStatusText('Downloading audio…');
@@ -191,7 +188,7 @@ export default function MusicPage() {
             fontFamily: 'var(--font-mono)',
             color: musicOnline === false ? 'var(--color-danger)' : 'var(--color-accent)',
             textTransform: 'uppercase',
-            letterSpacing: '0.05em',
+            letterSpacing: 0,
           }}
         >
           <span
@@ -282,7 +279,7 @@ export default function MusicPage() {
                     fontFamily: 'var(--font-mono)',
                     color: 'var(--color-text-dim)',
                     textTransform: 'uppercase',
-                    letterSpacing: '0.08em',
+                    letterSpacing: 0,
                   }}
                 >
                   {ex.badge}
@@ -293,7 +290,7 @@ export default function MusicPage() {
                   fontSize: '13.5px',
                   fontWeight: 600,
                   fontFamily: 'var(--font-display)',
-                  letterSpacing: '-0.015em',
+                  letterSpacing: 0,
                   color: 'var(--color-text)',
                 }}
               >
@@ -380,7 +377,7 @@ export default function MusicPage() {
                   fontWeight: 600,
                   fontFamily: 'var(--font-mono)',
                   color: 'var(--color-accent)',
-                  letterSpacing: '-0.01em',
+                  letterSpacing: 0,
                 }}
               >
                 {duration}s
@@ -406,7 +403,7 @@ export default function MusicPage() {
                 fontSize: '10px',
                 fontFamily: 'var(--font-mono)',
                 color: 'var(--color-text-dim)',
-                letterSpacing: '0.04em',
+                letterSpacing: 0,
               }}
             >
               <span>10s</span>
@@ -526,7 +523,7 @@ export default function MusicPage() {
                   fontSize: '13px',
                   fontWeight: 500,
                   color: thinking ? 'var(--color-text)' : 'var(--color-text-secondary)',
-                  letterSpacing: '-0.005em',
+                  letterSpacing: 0,
                 }}
               >
                 Smart prompt enhancement
@@ -552,7 +549,7 @@ export default function MusicPage() {
           padding: '16px',
           fontSize: '14.5px',
           fontWeight: 600,
-          letterSpacing: '-0.005em',
+          letterSpacing: 0,
           opacity: !canGenerate && !generating ? 0.5 : 1,
           cursor: canGenerate ? 'pointer' : 'not-allowed',
           gap: '12px',
@@ -650,7 +647,7 @@ export default function MusicPage() {
                       fontSize: '14.5px',
                       fontWeight: 600,
                       fontFamily: 'var(--font-display)',
-                      letterSpacing: '-0.015em',
+                      letterSpacing: 0,
                       color: 'var(--color-text)',
                     }}
                   >
@@ -662,7 +659,7 @@ export default function MusicPage() {
                         fontSize: '11px',
                         fontFamily: 'var(--font-mono)',
                         color: 'var(--color-text-dim)',
-                        letterSpacing: '0.02em',
+                        letterSpacing: 0,
                         marginTop: '2px',
                       }}
                     >

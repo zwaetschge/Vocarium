@@ -1,8 +1,4 @@
-"""Disfluency engine — natural speech patterns (German/English).
-
-Ported from PodForge's disfluencyEngine.ts. Preserves all dictionaries and
-signal regexes verbatim so output parity with the TypeScript version holds.
-"""
+"""Disfluency engine — natural speech patterns for German and English."""
 
 from __future__ import annotations
 

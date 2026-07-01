@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { getVoices, generate, generateStream, getLanguages } from '../api';
 import type { StreamChunk, StreamDone } from '../api';
@@ -7,11 +7,12 @@ import AudioPlayer from '../components/AudioPlayer';
 import WaveformBars from '../components/WaveformBars';
 import type { Voice, GenerationMeta } from '../types';
 import { getRandomSample } from '../sampleTexts';
+import { voiceSourceLabel, withDefaultVoice } from '../voiceUtils';
 
 export default function SpeechPage() {
   const [voices, setVoices] = useState<Voice[]>([]);
   const [languages, setLanguages] = useState<string[]>([]);
-  const [selectedVoice, setSelectedVoice] = useState('');
+  const [selectedVoice, setSelectedVoice] = useState('default');
   const [selectedLang, setSelectedLang] = useState('');
   const [selectedModel] = useState('1.7b-base');
   const [text, setText] = useState('');
@@ -24,8 +25,9 @@ export default function SpeechPage() {
   const [streaming, setStreaming] = useState(false);
   const [streamChunks, setStreamChunks] = useState<{ index: number; total: number; duration: number }[]>([]);
   const [streamTotal, setStreamTotal] = useState(0);
-  const audioChunksRef = useRef<Blob[]>([]);
+  const audioChunksRef = useRef<Uint8Array[]>([]);
   const audio = useAudio();
+  const generationVoices = useMemo(() => withDefaultVoice(voices), [voices]);
 
   useEffect(() => {
     if (!generating) return;
@@ -36,19 +38,93 @@ export default function SpeechPage() {
   useEffect(() => {
     getVoices().then((v) => {
       setVoices(v);
-      if (v.length > 0 && !selectedVoice) {
-        const def = v.find((x) => x.id === 'default');
-        setSelectedVoice(def ? def.id : v[0].id);
-      }
     }).catch(() => {});
     getLanguages().then(setLanguages).catch(() => setLanguages(['English', 'Chinese', 'German']));
   }, []);
 
-  const base64ToBlob = useCallback((b64: string): Blob => {
+  const base64ToBytes = useCallback((b64: string): Uint8Array => {
     const binary = atob(b64);
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    return new Blob([bytes], { type: 'audio/wav' });
+    return bytes;
+  }, []);
+
+  const combineWavChunks = useCallback((chunks: Uint8Array[]): Blob => {
+    if (chunks.length === 0) return new Blob([], { type: 'audio/wav' });
+    if (chunks.length === 1) return new Blob([chunks[0]], { type: 'audio/wav' });
+
+    const text = (bytes: Uint8Array, start: number, len: number) =>
+      String.fromCharCode(...bytes.slice(start, start + len));
+    const writeText = (view: DataView, offset: number, value: string) => {
+      for (let i = 0; i < value.length; i++) view.setUint8(offset + i, value.charCodeAt(i));
+    };
+
+    const parse = (bytes: Uint8Array) => {
+      if (text(bytes, 0, 4) !== 'RIFF' || text(bytes, 8, 4) !== 'WAVE') {
+        throw new Error('Invalid WAV chunk');
+      }
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      let offset = 12;
+      let fmt: { format: number; channels: number; sampleRate: number; byteRate: number; blockAlign: number; bitsPerSample: number } | null = null;
+      let data: Uint8Array | null = null;
+      while (offset + 8 <= bytes.byteLength) {
+        const id = text(bytes, offset, 4);
+        const size = view.getUint32(offset + 4, true);
+        const start = offset + 8;
+        if (id === 'fmt ') {
+          fmt = {
+            format: view.getUint16(start, true),
+            channels: view.getUint16(start + 2, true),
+            sampleRate: view.getUint32(start + 4, true),
+            byteRate: view.getUint32(start + 8, true),
+            blockAlign: view.getUint16(start + 12, true),
+            bitsPerSample: view.getUint16(start + 14, true),
+          };
+        } else if (id === 'data') {
+          data = bytes.slice(start, start + size);
+        }
+        offset = start + size + (size % 2);
+      }
+      if (!fmt || !data) throw new Error('Incomplete WAV chunk');
+      return { fmt, data };
+    };
+
+    const parsed = chunks.map(parse);
+    const first = parsed[0].fmt;
+    for (const item of parsed.slice(1)) {
+      if (
+        item.fmt.format !== first.format ||
+        item.fmt.channels !== first.channels ||
+        item.fmt.sampleRate !== first.sampleRate ||
+        item.fmt.bitsPerSample !== first.bitsPerSample
+      ) {
+        throw new Error('Streaming WAV chunks use incompatible formats');
+      }
+    }
+
+    const dataSize = parsed.reduce((sum, item) => sum + item.data.byteLength, 0);
+    const output = new Uint8Array(44 + dataSize);
+    const view = new DataView(output.buffer);
+    writeText(view, 0, 'RIFF');
+    view.setUint32(4, 36 + dataSize, true);
+    writeText(view, 8, 'WAVE');
+    writeText(view, 12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, first.format, true);
+    view.setUint16(22, first.channels, true);
+    view.setUint32(24, first.sampleRate, true);
+    view.setUint32(28, first.byteRate, true);
+    view.setUint16(32, first.blockAlign, true);
+    view.setUint16(34, first.bitsPerSample, true);
+    writeText(view, 36, 'data');
+    view.setUint32(40, dataSize, true);
+
+    let cursor = 44;
+    for (const item of parsed) {
+      output.set(item.data, cursor);
+      cursor += item.data.byteLength;
+    }
+    return new Blob([output], { type: 'audio/wav' });
   }, []);
 
   const handleGenerate = async () => {
@@ -92,41 +168,51 @@ export default function SpeechPage() {
 
     let firstChunkPlayed = false;
 
-    await generateStream(
-      {
-        text: text.trim(),
-        voice_id: selectedVoice,
-        model_id: selectedModel,
-        language: selectedLang || undefined,
-      },
-      (chunk: StreamChunk) => {
-        const blob = base64ToBlob(chunk.audio);
-        audioChunksRef.current.push(blob);
-        setStreamChunks((prev) => [...prev, { index: chunk.index, total: chunk.total, duration: chunk.duration }]);
-        setStreamTotal(chunk.total);
-        if (!firstChunkPlayed) {
-          firstChunkPlayed = true;
-          audio.play(blob, 'speech-result');
-        }
-      },
-      (done: StreamDone) => {
-        const combined = new Blob(audioChunksRef.current, { type: 'audio/wav' });
-        setLastBlob(combined);
-        setMeta({
-          audioDuration: String(done.total_duration),
-          generationTime: String(done.generation_time),
-          rtf: String(done.rtf),
-          model: done.model,
-          voice: done.voice,
-        });
-        audio.play(combined, 'speech-result');
-        setGenerating(false);
-      },
-      (errMsg: string) => {
-        setError(errMsg);
-        setGenerating(false);
-      },
-    );
+    try {
+      await generateStream(
+        {
+          text: text.trim(),
+          voice_id: selectedVoice,
+          model_id: selectedModel,
+          language: selectedLang || undefined,
+        },
+        (chunk: StreamChunk) => {
+          const bytes = base64ToBytes(chunk.audio);
+          const blob = new Blob([bytes], { type: 'audio/wav' });
+          audioChunksRef.current.push(bytes);
+          setStreamChunks((prev) => [...prev, { index: chunk.index, total: chunk.total, duration: chunk.duration }]);
+          setStreamTotal(chunk.total);
+          if (!firstChunkPlayed) {
+            firstChunkPlayed = true;
+            audio.play(blob, 'speech-result');
+          }
+        },
+        (done: StreamDone) => {
+          try {
+            const combined = combineWavChunks(audioChunksRef.current);
+            setLastBlob(combined);
+            setMeta({
+              audioDuration: String(done.total_duration),
+              generationTime: String(done.generation_time),
+              rtf: String(done.rtf),
+              model: done.model,
+              voice: done.voice,
+            });
+            audio.play(combined, 'speech-result');
+          } catch (err) {
+            setError(err instanceof Error ? err.message : 'Failed to combine stream audio');
+          }
+          setGenerating(false);
+        },
+        (errMsg: string) => {
+          setError(errMsg);
+          setGenerating(false);
+        },
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Stream failed');
+      setGenerating(false);
+    }
   };
 
   const handleSampleText = () => {
@@ -134,7 +220,7 @@ export default function SpeechPage() {
   };
 
   const canGenerate = text.trim() && selectedVoice && !generating;
-  const selectedVoiceObj = voices.find((v) => v.id === selectedVoice);
+  const selectedVoiceObj = generationVoices.find((v) => v.id === selectedVoice);
 
   return (
     <motion.div
@@ -205,7 +291,7 @@ export default function SpeechPage() {
                 fontVariantNumeric: 'tabular-nums',
                 fontFamily: 'var(--font-mono)',
                 color: 'var(--color-text-dim)',
-                letterSpacing: '0.03em',
+                letterSpacing: 0,
               }}
             >
               {text.length.toLocaleString()} chars
@@ -216,14 +302,9 @@ export default function SpeechPage() {
 
       {/* Control bar */}
       <div
-        className="glass"
+        className="glass speech-control-grid"
         style={{
-          display: 'grid',
-          gridTemplateColumns: '1.4fr 1fr auto auto',
-          gap: '14px',
-          alignItems: 'end',
-          padding: '16px 18px',
-          borderRadius: '18px',
+          borderRadius: 'var(--radius-panel)',
         }}
       >
         <Field label="Voice">
@@ -233,10 +314,9 @@ export default function SpeechPage() {
             className="input-field"
             style={selectStyle}
           >
-            {voices.length === 0 && <option value="">No voices available</option>}
-            {voices.map((v) => (
+            {generationVoices.map((v) => (
               <option key={v.id} value={v.id}>
-                {v.name} · {v.source === 'design' ? 'Designed' : 'Cloned'}
+                {v.name} · {voiceSourceLabel(v)}
               </option>
             ))}
           </select>
@@ -288,7 +368,7 @@ export default function SpeechPage() {
           whileTap={{ scale: 0.97 }}
           onClick={handleGenerate}
           disabled={!canGenerate}
-          className="btn btn-primary"
+          className="btn btn-primary speech-generate-button"
           style={{
             height: '42px',
             padding: '0 28px',
@@ -413,7 +493,7 @@ export default function SpeechPage() {
               className="glass-strong"
               style={{
                 padding: '36px',
-                borderRadius: '20px',
+                borderRadius: 'var(--radius-panel)',
                 display: 'flex',
                 flexDirection: 'column',
                 alignItems: 'center',
@@ -439,7 +519,7 @@ export default function SpeechPage() {
                     fontSize: '15px',
                     fontFamily: 'var(--font-display)',
                     fontWeight: 600,
-                    letterSpacing: '-0.015em',
+                    letterSpacing: 0,
                     color: 'var(--color-text)',
                   }}
                 >
@@ -503,7 +583,7 @@ export default function SpeechPage() {
 
       {/* Empty state hints */}
       {!meta && !generating && !error && !audio.playing && (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '14px' }}>
+        <div className="speech-hint-grid">
           <Hint
             step="01"
             title="Pick a voice"
@@ -584,7 +664,7 @@ function MetaChip({ label, value, emphasis }: { label: string; value: string; em
         style={{
           color: emphasis ? 'var(--color-accent-hover)' : 'var(--color-text-dim)',
           textTransform: 'uppercase',
-          letterSpacing: '0.08em',
+          letterSpacing: 0,
           fontWeight: 500,
         }}
       >
@@ -630,7 +710,7 @@ function Hint({ step, title, desc, icon }: { step: string; title: string; desc: 
             fontFamily: 'var(--font-mono)',
             fontSize: '10px',
             color: 'var(--color-text-faint)',
-            letterSpacing: '0.1em',
+            letterSpacing: 0,
           }}
         >
           {step}
@@ -642,7 +722,7 @@ function Hint({ step, title, desc, icon }: { step: string; title: string; desc: 
             fontSize: '14px',
             fontWeight: 500,
             color: 'var(--color-text)',
-            letterSpacing: '-0.01em',
+            letterSpacing: 0,
             marginBottom: '4px',
           }}
         >

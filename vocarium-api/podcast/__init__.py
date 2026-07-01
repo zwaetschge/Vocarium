@@ -1,1 +1,1 @@
-"""Vocarium podcast generation (ported from PodForge)."""
+"""Vocarium podcast generation."""

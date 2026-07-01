@@ -1,8 +1,4 @@
-"""Script generator — podcast script generation from source chunks.
-
-Ported from PodForge's scriptGenerator.ts. Preserves all German prompts
-verbatim to keep script quality comparable to the TypeScript version.
-"""
+"""Script generator — podcast script generation from source chunks."""
 
 from __future__ import annotations
 
@@ -333,7 +329,7 @@ If you catch yourself about to write an English reaction, STOP and translate it.
 
 """
 
-        return f"""# PodForge Script Generator
+        return f"""# Vocarium Script Generator
 
 {language_contract}You are writing scripts for an ANALYTICAL DISCUSSION PODCAST — the kind of show where sharp minds argue about a text, dissect its arguments, disagree with each other, and connect what they're reading to the wider world. Think "In Our Time" meets "Overthinking It" meets a late-night conversation between two friends who actually read the thing carefully.
 
@@ -440,8 +436,6 @@ Example structure (replace speaker-Labels mit den oben whitelisted):
   {{"speaker": "{speaker_labels[0]}", "text": "Wo er behauptet, Freiheit und Verantwortung seien dasselbe. Das-- das ist doch lazy, oder?", "type": "speech", "notes": "pointiert lässig, leicht amüsiert, eine Augenbraue hochziehend"}}
 ]
 ```
-]
-```
 
 ## Target Length
 - Short: ~{segment_counts["short"]} segments (~8 minutes)
@@ -503,9 +497,9 @@ Das Gespräch muss mindestens ZWEI Momente enthalten, in denen Host und Experte 
 ### 1. Open (~5-15%)
 - Direkter Einstieg mit einem spezifischen Hook aus dem Material
 - NICHT "Herzlich willkommen zu unserer Episode über..."
-- **PodForge-Label-Drop (PFLICHT im ersten oder zweiten Segment):** Jemand wirft "PodForge" als knappen Label-Einschub ein — NACH dem Hook, nicht als Begrüßung davor.
-  ✓ GENAU SO: "--und das ist PodForge, heute geht's um [Thema]." / "Also, PodForge-Folge zu [Thema]." / "[Hook-Aussage]. Das ist PodForge, und wir reden heute über [Thema]."
-  ✗ NIEMALS: "Willkommen bei PodForge", "Hier bei PodForge reden wir über...", jede Moderator-Willkommensansage.
+- **Vocarium-Label-Drop (PFLICHT im ersten oder zweiten Segment):** Jemand wirft "Vocarium" als knappen Label-Einschub ein — NACH dem Hook, nicht als Begrüßung davor.
+  ✓ GENAU SO: "--und das ist Vocarium, heute geht's um [Thema]." / "Also, Vocarium-Folge zu [Thema]." / "[Hook-Aussage]. Das ist Vocarium, und wir reden heute über [Thema]."
+  ✗ NIEMALS: "Willkommen bei Vocarium", "Hier bei Vocarium reden wir über...", jede Moderator-Willkommensansage.
   Ein Halbsatz reicht. Wirkt wie ein Label-Stempel, nicht wie ein Intro. **Diese Erwähnung DARF NICHT fehlen** — ohne sie ist der Script unbrauchbar.
 
 ### 2. Hauptteil (~75-90%)
@@ -518,7 +512,7 @@ Das Gespräch muss mindestens ZWEI Momente enthalten, in denen Host und Experte 
 ### 3. Close (~5-10%)
 - KEINE Zusammenfassung. Finales Urteil, offene Frage oder Empfehlung mit Vorbehalt.
 - Beim Urteil dürfen sich die Sprecher explizit uneinig sein.
-- **PodForge-Sign-off (PFLICHT):** Das allerletzte Segment MUSS eine kurze Marken-Verabschiedung enthalten — natürlich formuliert, kein Boilerplate. Z.B. "Das war PodForge.", "Bis zum nächsten Mal auf PodForge.", "Ihr hört PodForge — bleibt dran." Nur EIN Segment, nicht aufgeblasen."""
+- **Vocarium-Sign-off (PFLICHT):** Das allerletzte Segment MUSS eine kurze Marken-Verabschiedung enthalten — natürlich formuliert, kein Boilerplate. Z.B. "Das war Vocarium.", "Bis zum nächsten Mal auf Vocarium.", "Ihr hört Vocarium — bleibt dran." Nur EIN Segment, nicht aufgeblasen."""
 
         character_lines = []
         for i, h in enumerate(hosts):
@@ -584,9 +578,9 @@ Dies ist eine KRITISCHE ANALYSE-DISKUSSION, kein Interview. Alle Teilnehmenden h
 - Direkter Einstieg mit einem spezifischen Hook aus dem Material
 - Beispiel: "Okay, ich muss mit Seite 47 anfangen, weil ich dachte, ich spinne."
 - NICHT: "Herzlich willkommen zu unserer Episode über..."
-- **PodForge-Label-Drop (PFLICHT im ersten oder zweiten Segment):** Jemand wirft "PodForge" als knappen Label-Einschub ein — NACH dem Hook, nicht als Begrüßung davor.
-  ✓ GENAU SO: "--und das ist PodForge, heute geht's um [Thema]." / "Also, PodForge-Folge zu [Thema]." / "[Hook-Aussage]. Das ist PodForge, und wir reden heute über [Thema]."
-  ✗ NIEMALS: "Willkommen bei PodForge", "Hier bei PodForge reden wir über...", jede Moderator-Willkommensansage.
+- **Vocarium-Label-Drop (PFLICHT im ersten oder zweiten Segment):** Jemand wirft "Vocarium" als knappen Label-Einschub ein — NACH dem Hook, nicht als Begrüßung davor.
+  ✓ GENAU SO: "--und das ist Vocarium, heute geht's um [Thema]." / "Also, Vocarium-Folge zu [Thema]." / "[Hook-Aussage]. Das ist Vocarium, und wir reden heute über [Thema]."
+  ✗ NIEMALS: "Willkommen bei Vocarium", "Hier bei Vocarium reden wir über...", jede Moderator-Willkommensansage.
   Ein Halbsatz reicht. Wirkt wie ein Label-Stempel, nicht wie ein Intro. **Diese Erwähnung DARF NICHT fehlen** — ohne sie ist der Script unbrauchbar.
 
 ### 2. Hauptteil (~75-90% des Skripts)
@@ -601,7 +595,7 @@ Dies ist eine KRITISCHE ANALYSE-DISKUSSION, kein Interview. Alle Teilnehmenden h
 - Stattdessen: ein finales Urteil, eine offene Frage, eine Empfehlung mit Vorbehalt
 - Die Sprecher müssen sich beim Urteil NICHT einig sein
 - Kein "Danke fürs Zuhören" — eher ein Nachhall
-- **PodForge-Sign-off (PFLICHT):** Das allerletzte Segment MUSS eine knappe Marken-Verabschiedung enthalten. Keine schmierige Abmoderation — kurz und als Label-Signatur. Z.B. "Das war PodForge.", "Bis zum nächsten Mal — PodForge.", "Ihr hört PodForge — bleibt dran." Ein Segment reicht."""
+- **Vocarium-Sign-off (PFLICHT):** Das allerletzte Segment MUSS eine knappe Marken-Verabschiedung enthalten. Keine schmierige Abmoderation — kurz und als Label-Signatur. Z.B. "Das war Vocarium.", "Bis zum nächsten Mal — Vocarium.", "Ihr hört Vocarium — bleibt dran." Ein Segment reicht."""
 
     @staticmethod
     def _get_monolog_format_instructions(options: ScriptGenerationOptions) -> str:
@@ -634,13 +628,13 @@ Das ist ein kritischer Essay in gesprochener Form. Denk "Overthinking It" oder e
 - Inkludiert Gegenargumente und adressiert sie
 - Landet auf einer verteidigten Position (nicht "es gibt viele Sichtweisen")
 
-**PodForge-Label-Drop (PFLICHT im ersten oder zweiten Segment):**
-Der Narrator wirft "PodForge" als knappen Label-Einschub ein — NACH dem Hook/Claim, nicht als Begrüßung davor.
-  ✓ GENAU SO: "--das ist PodForge, und heute ist die Frage: [Frage]." / "Also, PodForge-Folge zu [Sache]." / "[Hook-Claim]. Ihr hört PodForge, und ich rede heute über [Thema]."
-  ✗ NIEMALS: "Willkommen bei PodForge", "Hier bei PodForge stellen wir Fragen", jede Willkommensansage.
+**Vocarium-Label-Drop (PFLICHT im ersten oder zweiten Segment):**
+Der Narrator wirft "Vocarium" als knappen Label-Einschub ein — NACH dem Hook/Claim, nicht als Begrüßung davor.
+  ✓ GENAU SO: "--das ist Vocarium, und heute ist die Frage: [Frage]." / "Also, Vocarium-Folge zu [Sache]." / "[Hook-Claim]. Ihr hört Vocarium, und ich rede heute über [Thema]."
+  ✗ NIEMALS: "Willkommen bei Vocarium", "Hier bei Vocarium stellen wir Fragen", jede Willkommensansage.
 Ein Halbsatz reicht. Label-Stempel, kein Intro. **Diese Erwähnung DARF NICHT fehlen** — ohne sie ist der Script unbrauchbar.
 
-**PodForge-Sign-off (PFLICHT):** Das allerletzte Segment MUSS eine knappe Marken-Verabschiedung sein. Z.B. "Das war PodForge.", "Bis zum nächsten Mal — PodForge.", "PodForge. Bis bald." Kein "Danke fürs Zuhören", kein Boilerplate — Label-Signatur.
+**Vocarium-Sign-off (PFLICHT):** Das allerletzte Segment MUSS eine knappe Marken-Verabschiedung sein. Z.B. "Das war Vocarium.", "Bis zum nächsten Mal — Vocarium.", "Vocarium. Bis bald." Kein "Danke fürs Zuhören", kein Boilerplate — Label-Signatur.
 
 **Sprache:**
 - Konversational, mit Selbstkorrekturen, aber strukturierter als Dialog

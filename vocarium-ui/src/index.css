@@ -24,7 +24,7 @@
   --color-accent-dim: rgba(123, 97, 255, 0.14);
   --color-accent-ring: rgba(123, 97, 255, 0.35);
 
-  /* ─── Aurora palette (only for orbs, gradients, highlights) ─── */
+  /* ─── Signal palette (ambient wavefield, meters, highlights) ─── */
   --color-aurora-1: #6B4BFF; /* electric indigo */
   --color-aurora-2: #FF4DD2; /* hot pink */
   --color-aurora-3: #32B5FF; /* sky */
@@ -42,6 +42,10 @@
   --font-display: "Bricolage Grotesque", Georgia, serif;
   --font-body: "Geist", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
   --font-mono: "Geist Mono", ui-monospace, "SF Mono", monospace;
+
+  --sidebar-width: 260px;
+  --header-height: 68px;
+  --radius-panel: 8px;
 }
 
 /* ═════════════════════════════════════════════════════════════════════
@@ -65,12 +69,12 @@ body {
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   overflow: hidden;
-  height: 100vh;
+  height: 100dvh;
   letter-spacing: 0;
 }
 
 #root {
-  height: 100vh;
+  height: 100dvh;
   overflow: hidden;
   position: relative;
   isolation: isolate;
@@ -93,29 +97,29 @@ body {
 h1, .h1 {
   font-family: var(--font-display);
   font-weight: 600;
-  letter-spacing: -0.035em;
+  letter-spacing: 0;
   line-height: 1.08;
 }
 
 h2, .h2 {
   font-family: var(--font-display);
   font-weight: 600;
-  letter-spacing: -0.03em;
+  letter-spacing: 0;
   line-height: 1.1;
 }
 
 h3, .h3 {
   font-weight: 600;
-  letter-spacing: -0.02em;
+  letter-spacing: 0;
   line-height: 1.2;
 }
 
 .tracking-hero {
-  letter-spacing: -0.045em;
+  letter-spacing: 0;
 }
 
 /* ═════════════════════════════════════════════════════════════════════
-   Aurora background — fixed, animated orbs drifting behind everything
+   Ambient background — acoustic wavefield behind the studio
    ═════════════════════════════════════════════════════════════════════ */
 
 .aurora-stage {
@@ -124,77 +128,94 @@ h3, .h3 {
   pointer-events: none;
   z-index: 0;
   overflow: hidden;
-  background: var(--color-bg);
+  background:
+    linear-gradient(135deg, rgba(10, 10, 15, 0.98) 0%, rgba(13, 18, 20, 0.96) 48%, rgba(18, 12, 18, 0.98) 100%),
+    linear-gradient(90deg, rgba(50, 181, 255, 0.08), transparent 34%, rgba(255, 184, 77, 0.07) 70%, transparent);
 }
 
-.aurora-orb {
+.aurora-stage::before {
+  content: "";
   position: absolute;
-  border-radius: 50%;
-  filter: blur(90px);
-  will-change: transform, opacity;
-  mix-blend-mode: screen;
+  inset: -20%;
+  background:
+    conic-gradient(from 210deg at 58% 42%, transparent 0deg, rgba(123, 97, 255, 0.14) 80deg, transparent 145deg, rgba(255, 77, 210, 0.09) 220deg, transparent 300deg),
+    linear-gradient(120deg, transparent 0%, rgba(255, 255, 255, 0.035) 42%, transparent 62%);
+  opacity: 0.8;
+  transform: rotate(-4deg);
 }
 
-.aurora-orb-1 {
-  width: 680px;
-  height: 680px;
-  top: -180px;
-  left: -120px;
-  background: radial-gradient(circle, var(--color-aurora-1) 0%, transparent 70%);
-  opacity: 0.42;
-  animation: drift-1 32s ease-in-out infinite;
+.aurora-grid,
+.aurora-wavefield,
+.aurora-spectrum,
+.aurora-scanlines {
+  position: absolute;
+  inset: 0;
 }
 
-.aurora-orb-2 {
-  width: 580px;
-  height: 580px;
-  top: -80px;
-  right: -140px;
-  background: radial-gradient(circle, var(--color-aurora-2) 0%, transparent 70%);
-  opacity: 0.32;
-  animation: drift-2 38s ease-in-out infinite;
+.aurora-grid {
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px);
+  background-size: 48px 48px;
+  mask-image: linear-gradient(to bottom, rgba(0, 0, 0, 0.85), transparent 82%);
+  opacity: 0.55;
 }
 
-.aurora-orb-3 {
-  width: 720px;
-  height: 720px;
-  bottom: -240px;
-  right: -120px;
-  background: radial-gradient(circle, var(--color-aurora-3) 0%, transparent 70%);
-  opacity: 0.34;
-  animation: drift-3 42s ease-in-out infinite;
+.aurora-wavefield {
+  background:
+    repeating-linear-gradient(
+      112deg,
+      transparent 0 54px,
+      rgba(50, 181, 255, 0.07) 54px 56px,
+      transparent 56px 112px
+    ),
+    repeating-linear-gradient(
+      67deg,
+      transparent 0 68px,
+      rgba(255, 184, 77, 0.045) 68px 70px,
+      transparent 70px 138px
+    );
+  opacity: 0.72;
+  animation: wavefield-pan 34s linear infinite;
 }
 
-.aurora-orb-4 {
-  width: 440px;
-  height: 440px;
-  bottom: -100px;
-  left: 40%;
-  background: radial-gradient(circle, var(--color-aurora-4) 0%, transparent 70%);
-  opacity: 0.15;
-  animation: drift-4 46s ease-in-out infinite;
+.aurora-spectrum {
+  top: auto;
+  height: 54%;
+  background:
+    linear-gradient(180deg, transparent 0%, rgba(123, 97, 255, 0.08) 38%, rgba(50, 181, 255, 0.08) 72%, transparent 100%),
+    repeating-linear-gradient(
+      90deg,
+      transparent 0 20px,
+      rgba(123, 97, 255, 0.17) 20px 22px,
+      transparent 22px 34px,
+      rgba(255, 184, 77, 0.1) 34px 35px,
+      transparent 35px 48px
+    );
+  clip-path: polygon(0 32%, 11% 24%, 22% 38%, 34% 18%, 48% 44%, 61% 26%, 74% 36%, 88% 16%, 100% 30%, 100% 100%, 0 100%);
+  filter: blur(0.4px);
+  opacity: 0.46;
+  transform: translateY(14%) skewY(-4deg);
+  animation: spectrum-drift 28s ease-in-out infinite;
 }
 
-@keyframes drift-1 {
-  0%, 100% { transform: translate(0, 0) scale(1); }
-  33% { transform: translate(120px, 60px) scale(1.1); }
-  66% { transform: translate(60px, 140px) scale(0.95); }
+.aurora-scanlines {
+  background: repeating-linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.018) 0 1px,
+    transparent 1px 8px
+  );
+  opacity: 0.35;
 }
 
-@keyframes drift-2 {
-  0%, 100% { transform: translate(0, 0) scale(1); }
-  50% { transform: translate(-80px, 100px) scale(1.08); }
+@keyframes wavefield-pan {
+  0% { background-position: 0 0, 0 0; }
+  100% { background-position: 180px 96px, -140px 120px; }
 }
 
-@keyframes drift-3 {
-  0%, 100% { transform: translate(0, 0) scale(1); }
-  33% { transform: translate(-100px, -80px) scale(1.06); }
-  66% { transform: translate(60px, -40px) scale(0.92); }
-}
-
-@keyframes drift-4 {
-  0%, 100% { transform: translate(0, 0) scale(1); }
-  50% { transform: translate(-60px, -120px) scale(1.12); }
+@keyframes spectrum-drift {
+  0%, 100% { transform: translateY(14%) skewY(-4deg); opacity: 0.42; }
+  50% { transform: translateY(9%) skewY(-4deg); opacity: 0.56; }
 }
 
 /* Film grain overlay — layered above aurora, below content */
@@ -259,6 +280,132 @@ h3, .h3 {
 @supports not (backdrop-filter: blur(1px)) {
   .glass, .glass-strong { background: rgba(20, 20, 28, 0.92); }
   .glass-subtle, .glass-input { background: rgba(20, 20, 28, 0.85); }
+}
+
+/* ═════════════════════════════════════════════════════════════════════
+   App shell
+   ═════════════════════════════════════════════════════════════════════ */
+
+.app-shell {
+  position: relative;
+  z-index: 3;
+  display: flex;
+  height: 100dvh;
+  overflow: hidden;
+}
+
+.app-content {
+  flex: 1;
+  margin-left: var(--sidebar-width);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-width: 0;
+}
+
+.app-header {
+  flex-shrink: 0;
+  height: var(--header-height);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 0 36px;
+  border-left: none;
+  border-right: none;
+  border-top: none;
+  border-radius: 0;
+  z-index: 20;
+}
+
+.app-header-left,
+.app-header-actions,
+.page-heading {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.app-header-left {
+  gap: 12px;
+}
+
+.app-header-actions {
+  justify-content: flex-end;
+  flex-shrink: 0;
+}
+
+.page-heading {
+  gap: 14px;
+}
+
+.page-heading-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(123, 97, 255, 0.12);
+  border: 1px solid rgba(123, 97, 255, 0.22);
+  color: var(--color-accent);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.08);
+  flex-shrink: 0;
+}
+
+.icon-button {
+  width: 38px;
+  height: 38px;
+  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-text-secondary);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.045);
+  transition: color 0.16s ease, background 0.16s ease, border-color 0.16s ease;
+  flex-shrink: 0;
+}
+
+.icon-button:hover {
+  color: var(--color-text);
+  background: rgba(255, 255, 255, 0.075);
+  border-color: rgba(255, 255, 255, 0.18);
+}
+
+.header-menu-button {
+  display: none;
+}
+
+.app-main {
+  flex: 1;
+  overflow-y: auto;
+  position: relative;
+}
+
+.app-main-inner {
+  padding: 40px 36px 72px;
+  max-width: 1400px;
+  margin: 0 auto;
+}
+
+.app-sidebar {
+  position: fixed;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: var(--sidebar-width);
+  display: flex;
+  flex-direction: column;
+  z-index: 30;
+  border-top: none;
+  border-left: none;
+  border-bottom: none;
+  border-radius: 0;
+}
+
+.sidebar-overlay {
+  display: none;
 }
 
 /* ═════════════════════════════════════════════════════════════════════
@@ -339,7 +486,7 @@ input::placeholder, textarea::placeholder {
 
 button {
   font-family: var(--font-body);
-  letter-spacing: -0.005em;
+  letter-spacing: 0;
   cursor: pointer;
   border: none;
   background: transparent;
@@ -351,7 +498,7 @@ button {
   padding: 12px 16px;
   background: rgba(255, 255, 255, 0.03);
   border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 10px;
+  border-radius: var(--radius-panel);
   color: var(--color-text);
   font-size: 14px;
   transition: border-color 0.18s ease, background 0.18s ease, box-shadow 0.18s ease;
@@ -388,10 +535,10 @@ textarea.input-field {
   justify-content: center;
   gap: 8px;
   padding: 11px 18px;
-  border-radius: 10px;
+  border-radius: var(--radius-panel);
   font-size: 14px;
   font-weight: 500;
-  letter-spacing: -0.005em;
+  letter-spacing: 0;
   transition: transform 0.16s ease, background 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
   white-space: nowrap;
   user-select: none;
@@ -462,7 +609,7 @@ textarea.input-field {
 .btn-sm {
   padding: 6px 12px;
   font-size: 12px;
-  border-radius: 8px;
+  border-radius: var(--radius-panel);
 }
 
 .btn-outline {
@@ -484,7 +631,7 @@ textarea.input-field {
 .text-input {
   width: 100%;
   padding: 10px 14px;
-  border-radius: 10px;
+  border-radius: var(--radius-panel);
   border: 1px solid rgba(255, 255, 255, 0.1);
   background: rgba(255, 255, 255, 0.04);
   color: var(--color-text);
@@ -509,7 +656,7 @@ textarea.input-field {
   font-weight: 500;
   color: var(--color-text-secondary);
   margin-bottom: 6px;
-  letter-spacing: -0.005em;
+  letter-spacing: 0;
 }
 
 /* ═════════════════════════════════════════════════════════════════════
@@ -521,7 +668,7 @@ textarea.input-field {
   backdrop-filter: blur(22px) saturate(180%);
   -webkit-backdrop-filter: blur(22px) saturate(180%);
   border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 18px;
+  border-radius: var(--radius-panel);
   box-shadow:
     0 8px 32px rgba(0, 0, 0, 0.35),
     inset 0 1px 0 rgba(255, 255, 255, 0.08);
@@ -530,7 +677,7 @@ textarea.input-field {
 .card-subtle {
   background: rgba(255, 255, 255, 0.02);
   border: 1px solid rgba(255, 255, 255, 0.06);
-  border-radius: 14px;
+  border-radius: var(--radius-panel);
 }
 
 @supports not (backdrop-filter: blur(1px)) {
@@ -544,7 +691,7 @@ textarea.input-field {
 .label-eyebrow {
   font-size: 11px;
   font-weight: 500;
-  letter-spacing: 0.14em;
+  letter-spacing: 0;
   text-transform: uppercase;
   color: var(--color-text-dim);
 }
@@ -593,6 +740,138 @@ textarea.input-field {
 }
 
 /* ═════════════════════════════════════════════════════════════════════
+   Responsive page primitives
+   ═════════════════════════════════════════════════════════════════════ */
+
+.speech-control-grid {
+  display: grid;
+  grid-template-columns: minmax(220px, 1.4fr) minmax(170px, 1fr) auto auto;
+  gap: 14px;
+  align-items: end;
+  padding: 16px 18px;
+  border-radius: var(--radius-panel);
+}
+
+.speech-hint-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.podcast-grid {
+  display: grid;
+  grid-template-columns: 300px minmax(0, 1fr);
+  gap: 18px;
+  align-items: start;
+}
+
+@media (max-width: 1080px) {
+  .podcast-grid {
+    grid-template-columns: 260px minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 920px) {
+  :root {
+    --header-height: 64px;
+  }
+
+  .app-content {
+    margin-left: 0;
+  }
+
+  .app-header {
+    padding: 0 16px;
+  }
+
+  .header-menu-button {
+    display: inline-flex;
+  }
+
+  .app-main-inner {
+    padding: 28px 16px 56px;
+    width: 100%;
+  }
+
+  .app-sidebar {
+    width: min(86vw, 296px);
+    transform: translateX(-104%);
+    transition: transform 0.24s ease;
+    box-shadow: 24px 0 70px rgba(0, 0, 0, 0.5);
+  }
+
+  .app-sidebar-open {
+    transform: translateX(0);
+  }
+
+  .sidebar-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 25;
+    display: block;
+    opacity: 0;
+    pointer-events: none;
+    background: rgba(0, 0, 0, 0.55);
+    backdrop-filter: blur(3px);
+    -webkit-backdrop-filter: blur(3px);
+    transition: opacity 0.2s ease;
+  }
+
+  .sidebar-overlay-open {
+    opacity: 1;
+    pointer-events: auto;
+  }
+}
+
+@media (max-width: 760px) {
+  .app-header {
+    gap: 10px;
+  }
+
+  .page-heading {
+    gap: 10px;
+  }
+
+  .page-heading-icon {
+    width: 34px;
+    height: 34px;
+  }
+
+  .app-header-actions {
+    max-width: 46%;
+  }
+
+  .speech-control-grid,
+  .speech-hint-grid,
+  .podcast-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .speech-generate-button {
+    width: 100%;
+    margin-top: 0 !important;
+  }
+}
+
+@media (max-width: 520px) {
+  .app-header {
+    padding: 0 12px;
+  }
+
+  .app-main-inner {
+    padding: 22px 12px 48px;
+  }
+
+  .page-heading-icon {
+    display: none;
+  }
+
+  .app-header-actions {
+    display: none;
+  }
+}
+
+/* ═════════════════════════════════════════════════════════════════════
    Reduced motion — non-negotiable
    ═════════════════════════════════════════════════════════════════════ */
 
@@ -604,7 +883,8 @@ textarea.input-field {
     scroll-behavior: auto !important;
   }
 
-  .aurora-orb {
+  .aurora-wavefield,
+  .aurora-spectrum {
     animation: none !important;
   }
 }

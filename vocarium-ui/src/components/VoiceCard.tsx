@@ -5,6 +5,7 @@ import { getVoiceAudio, generate, deleteVoice } from '../api';
 import AudioPlayer from './AudioPlayer';
 import { useAudio } from '../hooks/useAudio';
 import WaveformBars from './WaveformBars';
+import { voiceSourceLabel } from '../voiceUtils';
 
 interface VoiceCardProps {
   voice: Voice;
@@ -18,21 +19,26 @@ export default function VoiceCard({ voice, index, onDeleted }: VoiceCardProps) {
   const [expanded, setExpanded] = useState(false);
   const [testText, setTestText] = useState('Hello, this is a test of voice synthesis.');
   const [generating, setGenerating] = useState(false);
+  const [error, setError] = useState('');
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [loadingPreview, setLoadingPreview] = useState(false);
+  const canPlayReference = voice.has_audio && voice.id !== 'default';
 
   const handlePlay = async (e: React.MouseEvent) => {
     e.stopPropagation();
+    if (!canPlayReference) return;
     if (audio.playing && audio.currentId === voice.id) {
       audio.toggle();
       return;
     }
     setLoadingPreview(true);
+    setError('');
     try {
       const blob = await getVoiceAudio(voice.id);
       audio.play(blob, voice.id);
-    } catch {
-      // ignore
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Preview unavailable');
+      setExpanded(true);
     }
     setLoadingPreview(false);
   };
@@ -40,11 +46,12 @@ export default function VoiceCard({ voice, index, onDeleted }: VoiceCardProps) {
   const handleGenerate = async () => {
     if (!testText.trim()) return;
     setGenerating(true);
+    setError('');
     try {
       const { blob } = await generate({ text: testText, voice_id: voice.id });
       genAudio.play(blob, 'gen-' + voice.id);
-    } catch {
-      // ignore
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Generation failed');
     }
     setGenerating(false);
   };
@@ -59,13 +66,13 @@ export default function VoiceCard({ voice, index, onDeleted }: VoiceCardProps) {
     try {
       await deleteVoice(voice.id);
       onDeleted();
-    } catch {
-      // ignore
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Delete failed');
     }
   };
 
   const isPlaying = audio.playing && audio.currentId === voice.id;
-  const isCloned = voice.source === 'clone';
+  const isCloned = voice.source === 'clone' || voice.id === 'default';
   const initial = voice.name.trim().charAt(0).toUpperCase() || '?';
   const accentTint = isCloned
     ? 'linear-gradient(135deg, rgba(123,97,255,0.45), rgba(50,181,255,0.3))'
@@ -112,7 +119,7 @@ export default function VoiceCard({ voice, index, onDeleted }: VoiceCardProps) {
               border: '1px solid rgba(255,255,255,0.14)',
               boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.2)',
               flexShrink: 0,
-              letterSpacing: '-0.02em',
+              letterSpacing: 0,
             }}
           >
             {initial}
@@ -129,7 +136,7 @@ export default function VoiceCard({ voice, index, onDeleted }: VoiceCardProps) {
                 textOverflow: 'ellipsis',
                 whiteSpace: 'nowrap',
                 fontFamily: 'var(--font-display)',
-                letterSpacing: '-0.02em',
+                letterSpacing: 0,
                 color: 'var(--color-text)',
                 lineHeight: 1.2,
               }}
@@ -143,7 +150,7 @@ export default function VoiceCard({ voice, index, onDeleted }: VoiceCardProps) {
                 margin: '4px 0 0',
                 fontFamily: 'var(--font-mono)',
                 color: 'var(--color-text-dim)',
-                letterSpacing: '0.02em',
+                letterSpacing: 0,
               }}
             >
               {new Date(voice.created_at).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })}
@@ -157,8 +164,9 @@ export default function VoiceCard({ voice, index, onDeleted }: VoiceCardProps) {
               whileHover={{ scale: 1.06 }}
               transition={{ type: 'spring', stiffness: 300, damping: 22 }}
               onClick={handlePlay}
-              disabled={loadingPreview}
+              disabled={loadingPreview || !canPlayReference}
               aria-label={isPlaying ? 'Pause preview' : 'Play preview'}
+              title={canPlayReference ? 'Play reference audio' : 'No reference audio for this voice'}
               style={{
                 width: '36px',
                 height: '36px',
@@ -167,11 +175,12 @@ export default function VoiceCard({ voice, index, onDeleted }: VoiceCardProps) {
                 alignItems: 'center',
                 justifyContent: 'center',
                 border: '1px solid rgba(255,255,255,0.14)',
-                cursor: loadingPreview ? 'wait' : 'pointer',
+                cursor: loadingPreview ? 'wait' : canPlayReference ? 'pointer' : 'not-allowed',
                 background: isPlaying
                   ? 'linear-gradient(135deg, rgba(123,97,255,0.95), rgba(255,77,210,0.85))'
                   : 'rgba(255,255,255,0.05)',
-                color: isPlaying ? '#fff' : 'var(--color-accent)',
+                color: canPlayReference ? (isPlaying ? '#fff' : 'var(--color-accent)') : 'var(--color-text-faint)',
+                opacity: canPlayReference ? 1 : 0.55,
                 boxShadow: isPlaying
                   ? '0 6px 18px rgba(123,97,255,0.35), inset 0 1px 0 rgba(255,255,255,0.22)'
                   : 'inset 0 1px 0 rgba(255,255,255,0.05)',
@@ -239,7 +248,7 @@ export default function VoiceCard({ voice, index, onDeleted }: VoiceCardProps) {
 
         {/* Badges */}
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-          <SourceBadge isCloned={isCloned} />
+          <SourceBadge voice={voice} />
           <LanguageBadge lang={voice.language} />
         </div>
 
@@ -289,6 +298,19 @@ export default function VoiceCard({ voice, index, onDeleted }: VoiceCardProps) {
               <div className="label-eyebrow" style={{ fontSize: '10px' }}>
                 Quick test
               </div>
+              {error && (
+                <div
+                  style={{
+                    padding: '8px 10px',
+                    borderRadius: '8px',
+                    background: 'var(--color-danger-dim)',
+                    color: 'var(--color-danger)',
+                    fontSize: '12px',
+                  }}
+                >
+                  {error}
+                </div>
+              )}
               <textarea
                 value={testText}
                 onChange={(e) => setTestText(e.target.value)}
@@ -316,7 +338,7 @@ export default function VoiceCard({ voice, index, onDeleted }: VoiceCardProps) {
                   height: '40px',
                   fontSize: '13.5px',
                   fontWeight: 600,
-                  letterSpacing: '-0.005em',
+                  letterSpacing: 0,
                   gap: '8px',
                 }}
               >
@@ -365,7 +387,26 @@ export default function VoiceCard({ voice, index, onDeleted }: VoiceCardProps) {
   );
 }
 
-function SourceBadge({ isCloned }: { isCloned: boolean }) {
+function SourceBadge({ voice }: { voice: Voice }) {
+  const label = voiceSourceLabel(voice);
+  const isCloneLike = voice.source === 'clone' || voice.id === 'default';
+  const isCustom = voice.source === 'custom';
+  const color = isCloneLike
+    ? 'var(--color-accent)'
+    : isCustom
+      ? 'var(--color-aurora-3)'
+      : 'var(--color-aurora-2)';
+  const background = isCloneLike
+    ? 'rgba(123,97,255,0.14)'
+    : isCustom
+      ? 'rgba(50,181,255,0.14)'
+      : 'rgba(255,77,210,0.14)';
+  const border = isCloneLike
+    ? 'rgba(123,97,255,0.25)'
+    : isCustom
+      ? 'rgba(50,181,255,0.25)'
+      : 'rgba(255,77,210,0.25)';
+
   return (
     <span
       style={{
@@ -375,12 +416,12 @@ function SourceBadge({ isCloned }: { isCloned: boolean }) {
         padding: '3px 10px',
         fontSize: '10.5px',
         fontWeight: 600,
-        letterSpacing: '0.04em',
+        letterSpacing: 0,
         textTransform: 'uppercase',
         borderRadius: '999px',
-        background: isCloned ? 'rgba(123,97,255,0.14)' : 'rgba(255,77,210,0.14)',
-        color: isCloned ? 'var(--color-accent)' : 'var(--color-aurora-2)',
-        border: `1px solid ${isCloned ? 'rgba(123,97,255,0.25)' : 'rgba(255,77,210,0.25)'}`,
+        background,
+        color,
+        border: `1px solid ${border}`,
         fontFamily: 'var(--font-mono)',
       }}
     >
@@ -393,7 +434,7 @@ function SourceBadge({ isCloned }: { isCloned: boolean }) {
           boxShadow: '0 0 6px currentColor',
         }}
       />
-      {isCloned ? 'Cloned' : 'Designed'}
+      {label}
     </span>
   );
 }
@@ -407,7 +448,7 @@ function LanguageBadge({ lang }: { lang: string }) {
         padding: '3px 10px',
         fontSize: '10.5px',
         fontWeight: 500,
-        letterSpacing: '0.04em',
+        letterSpacing: 0,
         textTransform: 'uppercase',
         borderRadius: '999px',
         background: 'rgba(255,255,255,0.05)',

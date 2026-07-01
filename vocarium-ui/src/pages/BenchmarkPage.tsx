@@ -3,6 +3,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { getModels, getVoices, runBenchmark, getBenchmarkResults } from '../api';
 import type { Model, Voice, BenchmarkResult } from '../types';
 import WaveformBars from '../components/WaveformBars';
+import { benchmarkVoices } from '../voiceUtils';
 
 function rtfToken(rtf: number) {
   if (rtf < 1) return { color: 'var(--color-success)', raw: '#4ADE80', label: 'faster than realtime' };
@@ -35,8 +36,9 @@ export default function BenchmarkPage() {
       .catch(() => {});
     getVoices()
       .then((v) => {
-        setVoices(v);
-        if (v.length > 0) setSelectedVoices([v[0].id]);
+        const available = benchmarkVoices(v);
+        setVoices(available);
+        if (available.length > 0) setSelectedVoices([available[0].id]);
       })
       .catch(() => {});
     getBenchmarkResults()
@@ -98,7 +100,7 @@ export default function BenchmarkPage() {
     <div style={{ display: 'flex', flexDirection: 'column', gap: '28px', maxWidth: '1200px' }}>
       {/* Header */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-        <h1 style={{ fontSize: '32px', fontWeight: 600, fontFamily: 'var(--font-display)', letterSpacing: '-0.035em', lineHeight: 1.05, color: 'var(--color-text)' }}>
+        <h1 style={{ fontSize: '32px', fontWeight: 600, fontFamily: 'var(--font-display)', letterSpacing: 0, lineHeight: 1.05, color: 'var(--color-text)' }}>
           Benchmark
         </h1>
         <p style={{ fontSize: '14px', color: 'var(--color-text-secondary)', lineHeight: 1.55, maxWidth: '640px' }}>
@@ -126,7 +128,7 @@ export default function BenchmarkPage() {
             fontSize: '11px',
             color: 'var(--color-text-secondary)',
             fontFamily: 'var(--font-mono)',
-            letterSpacing: '0.02em',
+            letterSpacing: 0,
           }}
         >
           <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
@@ -134,7 +136,7 @@ export default function BenchmarkPage() {
           </svg>
           <span>RTF · generation seconds per audio second</span>
         </div>
-        <span style={{ fontSize: '11px', color: 'var(--color-text-dim)', letterSpacing: '0.04em', textTransform: 'uppercase', fontWeight: 500 }}>
+        <span style={{ fontSize: '11px', color: 'var(--color-text-dim)', letterSpacing: 0, textTransform: 'uppercase', fontWeight: 500 }}>
           Lower is faster · &lt;1 beats realtime
         </span>
         <div style={{ marginLeft: 'auto', fontSize: '11px', color: 'var(--color-text-dim)', fontFamily: 'var(--font-mono)' }}>
@@ -193,7 +195,7 @@ export default function BenchmarkPage() {
                       color: selected ? 'var(--color-accent)' : 'var(--color-text-secondary)',
                       boxShadow: selected ? '0 2px 10px rgba(123,97,255,0.15)' : 'none',
                       transition: 'background 0.2s, border-color 0.2s, color 0.2s',
-                      letterSpacing: '0.01em',
+                      letterSpacing: 0,
                     }}
                   >
                     {m.id}
@@ -238,7 +240,7 @@ export default function BenchmarkPage() {
                       color: selected ? '#8DD4FF' : 'var(--color-text-secondary)',
                       boxShadow: selected ? '0 2px 10px rgba(50,181,255,0.12)' : 'none',
                       transition: 'background 0.2s, border-color 0.2s, color 0.2s',
-                      letterSpacing: '-0.005em',
+                      letterSpacing: 0,
                     }}
                   >
                     {v.name}
@@ -276,7 +278,7 @@ export default function BenchmarkPage() {
               value={runsPerCombo}
               onChange={(e) => setRunsPerCombo(Math.max(1, Math.min(10, parseInt(e.target.value) || 1)))}
               className="input-field"
-              style={{ fontFamily: 'var(--font-mono)', letterSpacing: '0.02em' }}
+              style={{ fontFamily: 'var(--font-mono)', letterSpacing: 0 }}
             />
             <span style={{ fontSize: '11px', color: 'var(--color-text-dim)', lineHeight: 1.5 }}>
               Median of 3+ runs smooths startup jitter.
@@ -297,7 +299,7 @@ export default function BenchmarkPage() {
             padding: '15px 28px',
             fontSize: '14.5px',
             fontWeight: 600,
-            letterSpacing: '-0.01em',
+            letterSpacing: 0,
             cursor: canRun ? 'pointer' : 'not-allowed',
             opacity: canRun ? 1 : 0.5,
             display: 'flex',
@@ -317,7 +319,7 @@ export default function BenchmarkPage() {
                 <path d="M5 3l8 5-8 5V3z" fill="currentColor" />
               </svg>
               <span>Run benchmark</span>
-              <span style={{ fontSize: '11px', opacity: 0.75, fontFamily: 'var(--font-mono)', letterSpacing: '0.04em' }}>
+              <span style={{ fontSize: '11px', opacity: 0.75, fontFamily: 'var(--font-mono)', letterSpacing: 0 }}>
                 {totalCombos} run{totalCombos === 1 ? '' : 's'}
               </span>
             </>
@@ -402,7 +404,7 @@ export default function BenchmarkPage() {
             <div className="card" style={{ padding: '24px', display: 'flex', flexDirection: 'column', gap: '18px' }}>
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                 <span className="label-eyebrow" style={{ fontSize: '10px' }}>RTF comparison</span>
-                <div style={{ display: 'flex', gap: '14px', fontSize: '10px', color: 'var(--color-text-dim)', fontFamily: 'var(--font-mono)', letterSpacing: '0.02em' }}>
+                <div style={{ display: 'flex', gap: '14px', fontSize: '10px', color: 'var(--color-text-dim)', fontFamily: 'var(--font-mono)', letterSpacing: 0 }}>
                   <LegendDot color="var(--color-success)" label="< 1x" />
                   <LegendDot color="var(--color-warning)" label="1-2x" />
                   <LegendDot color="var(--color-danger)" label="> 2x" />
@@ -430,7 +432,7 @@ export default function BenchmarkPage() {
                           whiteSpace: 'nowrap',
                           fontFamily: 'var(--font-mono)',
                           color: 'var(--color-text-secondary)',
-                          letterSpacing: '0.01em',
+                          letterSpacing: 0,
                         }}
                       >
                         {r.model_id}
@@ -443,7 +445,7 @@ export default function BenchmarkPage() {
                           textOverflow: 'ellipsis',
                           whiteSpace: 'nowrap',
                           color: 'var(--color-text)',
-                          letterSpacing: '-0.005em',
+                          letterSpacing: 0,
                         }}
                       >
                         {voiceName}
@@ -493,7 +495,7 @@ export default function BenchmarkPage() {
                           fontVariantNumeric: 'tabular-nums',
                           fontFamily: 'var(--font-mono)',
                           color: token.color,
-                          letterSpacing: '0.01em',
+                          letterSpacing: 0,
                         }}
                       >
                         {r.rtf.toFixed(2)}x
@@ -604,7 +606,7 @@ function SummaryStat({
           fontFamily: 'var(--font-mono)',
           fontWeight: 600,
           color: accent,
-          letterSpacing: '0.01em',
+          letterSpacing: 0,
           lineHeight: 1.1,
           paddingLeft: '8px',
         }}
@@ -612,7 +614,7 @@ function SummaryStat({
         {value}
       </span>
       {hint && (
-        <span style={{ fontSize: '10.5px', color: 'var(--color-text-dim)', paddingLeft: '8px', letterSpacing: '0.02em' }}>
+        <span style={{ fontSize: '10.5px', color: 'var(--color-text-dim)', paddingLeft: '8px', letterSpacing: 0 }}>
           {hint}
         </span>
       )}
@@ -654,7 +656,7 @@ function ResultsTable({
                   fontSize: '10px',
                   fontWeight: 600,
                   textTransform: 'uppercase',
-                  letterSpacing: '0.06em',
+                  letterSpacing: 0,
                   color: 'var(--color-text-dim)',
                   fontFamily: 'var(--font-body)',
                 }}
@@ -690,7 +692,7 @@ function ResultsTable({
                     fontFamily: 'var(--font-mono)',
                     fontSize: '11px',
                     color: 'var(--color-text-secondary)',
-                    letterSpacing: '0.01em',
+                    letterSpacing: 0,
                   }}
                 >
                   {r.model_id}
@@ -700,7 +702,7 @@ function ResultsTable({
                     padding: compact ? '10px 18px' : '12px 20px',
                     fontSize: '12.5px',
                     color: 'var(--color-text)',
-                    letterSpacing: '-0.005em',
+                    letterSpacing: 0,
                   }}
                 >
                   {r.displayName}
@@ -744,7 +746,7 @@ function ResultsTable({
                     fontSize: '11.5px',
                     fontWeight: 600,
                     color: token.color,
-                    letterSpacing: '0.01em',
+                    letterSpacing: 0,
                   }}
                 >
                   {r.rtf.toFixed(3)}x

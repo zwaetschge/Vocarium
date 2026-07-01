@@ -1,4 +1,4 @@
-"""Shared helpers — ported from PodForge's helpers.ts."""
+"""Shared helpers for podcast generation."""
 
 from __future__ import annotations
 
@@ -88,9 +88,13 @@ def chunk_text(text: str, max_chars: int = 2000, overlap: int = 200) -> list[str
             if break_point > start + max_chars // 2:
                 chunk_end = break_point + 1
         chunks.append(text[start:chunk_end].strip())
-        start = max(chunk_end - overlap, chunk_end) if chunk_end > start else chunk_end + 1
         if chunk_end >= len(text):
             break
+        if chunk_end <= start:
+            start = chunk_end + 1
+            continue
+        effective_overlap = min(max(overlap, 0), chunk_end - start - 1)
+        start = chunk_end - effective_overlap
     return [c for c in chunks if c]
 
 

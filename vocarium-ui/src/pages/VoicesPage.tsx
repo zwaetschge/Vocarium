@@ -6,8 +6,9 @@ import type { Voice } from '../types';
 import VoiceCard from '../components/VoiceCard';
 import SkeletonCard from '../components/SkeletonCard';
 import WaveformBars from '../components/WaveformBars';
+import { voiceSourceLabel } from '../voiceUtils';
 
-type SourceFilter = 'all' | 'clone' | 'design';
+type SourceFilter = 'all' | 'clone' | 'design' | 'custom';
 
 export default function VoicesPage() {
   const [voices, setVoices] = useState<Voice[]>([]);
@@ -36,8 +37,13 @@ export default function VoicesPage() {
     return voices.filter((v) => {
       if (filter === 'clone' && v.source !== 'clone') return false;
       if (filter === 'design' && v.source !== 'design') return false;
+      if (filter === 'custom' && v.source !== 'custom') return false;
       if (!q) return true;
-      return v.name.toLowerCase().includes(q) || v.language.toLowerCase().includes(q);
+      return (
+        v.name.toLowerCase().includes(q)
+        || v.language.toLowerCase().includes(q)
+        || voiceSourceLabel(v).toLowerCase().includes(q)
+      );
     });
   }, [voices, search, filter]);
 
@@ -46,6 +52,7 @@ export default function VoicesPage() {
       all: voices.length,
       clone: voices.filter((v) => v.source === 'clone').length,
       design: voices.filter((v) => v.source === 'design').length,
+      custom: voices.filter((v) => v.source === 'custom').length,
     }),
     [voices]
   );
@@ -109,7 +116,7 @@ export default function VoicesPage() {
               color: 'var(--color-accent)',
               fontFamily: 'var(--font-mono)',
               border: '1px solid rgba(123,97,255,0.28)',
-              letterSpacing: '0.02em',
+              letterSpacing: 0,
             }}
           >
             {filtered.length}
@@ -118,7 +125,7 @@ export default function VoicesPage() {
             style={{
               fontSize: '13px',
               color: 'var(--color-text-secondary)',
-              letterSpacing: '-0.005em',
+              letterSpacing: 0,
             }}
           >
             {filtered.length === 1 ? 'voice' : 'voices'}
@@ -182,7 +189,7 @@ export default function VoicesPage() {
             border: '1px solid rgba(255,255,255,0.06)',
           }}
         >
-          {(['all', 'clone', 'design'] as SourceFilter[]).map((f) => {
+          {(['all', 'clone', 'design', 'custom'] as SourceFilter[]).map((f) => {
             const active = filter === f;
             return (
               <button
@@ -195,7 +202,7 @@ export default function VoicesPage() {
                   padding: '6px 12px',
                   fontSize: '12px',
                   fontWeight: 500,
-                  letterSpacing: '0.01em',
+                  letterSpacing: 0,
                   textTransform: 'capitalize',
                   color: active ? 'var(--color-text)' : 'var(--color-text-secondary)',
                   background: 'transparent',
@@ -229,7 +236,7 @@ export default function VoicesPage() {
                     fontSize: '10.5px',
                     fontFamily: 'var(--font-mono)',
                     color: 'var(--color-text-dim)',
-                    letterSpacing: '0.02em',
+                    letterSpacing: 0,
                   }}
                 >
                   {counts[f]}
@@ -277,7 +284,7 @@ export default function VoicesPage() {
               fontFamily: 'var(--font-display)',
               color: 'var(--color-text)',
               margin: '0 0 6px',
-              letterSpacing: '-0.02em',
+              letterSpacing: 0,
             }}
           >
             No matches
@@ -346,7 +353,7 @@ function ErrorState({ message, onRetry }: { message: string; onRetry: () => void
           fontFamily: 'var(--font-display)',
           color: 'var(--color-text)',
           margin: '0 0 8px',
-          letterSpacing: '-0.02em',
+          letterSpacing: 0,
         }}
       >
         Couldn't load voices
@@ -404,7 +411,7 @@ function EmptyState() {
           fontWeight: 600,
           fontFamily: 'var(--font-display)',
           margin: '0 0 12px',
-          letterSpacing: '-0.035em',
+          letterSpacing: 0,
           color: 'var(--color-text)',
         }}
       >

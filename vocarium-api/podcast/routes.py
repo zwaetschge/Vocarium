@@ -12,21 +12,27 @@ optional ``instruct`` steering — and always target the custom TTS endpoint.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import ipaddress
 import json
 import logging
 import os
 import re
 import shutil
+import socket
 import sqlite3
+import struct
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 import aiohttp
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
+from metrics import inc, observe
 
 from .audio_assembler import (
     AssemblyOptions,
@@ -66,6 +72,19 @@ ALLOWED_SOURCE_EXTENSIONS = {
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
 MAX_TEXT_CHARS = 100_000
 MIN_TEXT_CHARS = 10
+MAX_SOURCE_URL_CHARS = 2048
+MAX_TITLE_CHARS = 240
+MAX_HOST_NAME_CHARS = 120
+MAX_HOST_PROFILE_CHARS = 2_000
+MAX_TOPIC_CHARS = 500
+MAX_LANGUAGE_CHARS = 32
+MAX_SEGMENT_TEXT_CHARS = 20_000
+MAX_SEGMENT_PROMPT_CHARS = 2_000
+MAX_MEDIA_DURATION_MS = 10 * 60 * 1000
+ALLOWED_PODCAST_FORMATS = {"dialog", "monolog", "custom"}
+ALLOWED_PODCAST_DURATIONS = {"short", "medium", "long"}
+ALLOWED_AUDIO_FORMATS = {"mp3", "wav"}
+ALLOWED_SEGMENT_TYPES = {"speech", "reaction", "pause", "sfx", "music"}
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +100,7 @@ class _VoiceRow:
 
 
 class VocariumTTSGenerator:
-    """Concrete TTSGenerator that calls qwen3-tts through the GPU queue.
+    """Concrete TTSGenerator that calls qwen3-tts through a TTS URL pool.
 
     Podcast TTS must only use custom voices — this is enforced in
     :meth:`_resolve_voice` and :meth:`default_voice_for_speaker`.
@@ -103,7 +122,10 @@ class VocariumTTSGenerator:
         self._extra_tts_urls = [u for u in (extra_tts_urls or []) if u]
         self._db_getter = db_getter
         self._gpu_submit = gpu_submit
-        self._max_parallel_workers = max_parallel_workers
+        self._tts_urls = [self.tts_url, *self._extra_tts_urls]
+        self._url_semaphores = {url: asyncio.Semaphore(1) for url in self._tts_urls}
+        self._next_url = 0
+        self._url_lock = asyncio.Lock()
         self._aiosession: aiohttp.ClientSession | None = None
 
     @property
@@ -114,6 +136,29 @@ class VocariumTTSGenerator:
                 connector=TCPConnector(limit=20, ttl_dns_cache=300),
             )
         return self._aiosession
+
+    async def aclose(self) -> None:
+        if self._aiosession is not None and not self._aiosession.closed:
+            await self._aiosession.close()
+        self._aiosession = None
+
+    async def _ordered_tts_urls(self) -> list[str]:
+        async with self._url_lock:
+            if not self._tts_urls:
+                return []
+            start = self._next_url % len(self._tts_urls)
+            self._next_url += 1
+            return self._tts_urls[start:] + self._tts_urls[:start]
+
+    async def run_batch(self, description: str, work: Callable[[], Any]) -> Any:
+        async def queued_work():
+            result = work()
+            if asyncio.iscoroutine(result):
+                return await result
+            return result
+
+        _, future = await self._gpu_submit("tts", description, queued_work)
+        return await future
 
     def _custom_voices(self, user_id: int | None = None) -> list[_VoiceRow]:
         rows = self._db_getter().execute(
@@ -209,12 +254,11 @@ class VocariumTTSGenerator:
         if segment_instruct:
             payload["instruct"] = segment_instruct
 
-        urls = [self.tts_url, *self._extra_tts_urls]
-        url_idx = 0
+        urls = await self._ordered_tts_urls()
         last_err: Exception | None = None
 
         for attempt, url in enumerate(urls):
-            try:
+            async def work(url: str = url, attempt: int = attempt):
                 logger.info(
                     "TTS request attempt %d/%d -> %s (speaker=%s, len=%d)",
                     attempt + 1, len(urls), url, preset["speaker"], len(text),
@@ -222,24 +266,40 @@ class VocariumTTSGenerator:
                 timeout = aiohttp.ClientTimeout(
                     total=3600, sock_connect=15, sock_read=3600
                 )
-                async with self._session.post(
-                    f"{url}/v1/audio/speech/custom",
-                    json=payload,
-                    timeout=timeout,
-                ) as resp:
-                    body = await resp.read()
-                    if resp.status >= 400:
-                        raise RuntimeError(
-                            f"TTS failed ({resp.status}): "
-                            f"{body.decode('utf-8', 'replace')[:300]}"
-                        )
-                    headers = {k.lower(): v for k, v in resp.headers.items()}
-                    duration = float(headers.get("x-audio-duration", "0") or 0)
-                    output_path.parent.mkdir(parents=True, exist_ok=True)
-                    output_path.write_bytes(body)
-                    if duration <= 0:
-                        duration = max(1.0, len(text.split()) / 2.3)
-                    return duration
+                start = time.perf_counter()
+                status: int | str = "error"
+                try:
+                    async with self._session.post(
+                        f"{url}/v1/audio/speech/custom",
+                        json=payload,
+                        timeout=timeout,
+                    ) as resp:
+                        status = resp.status
+                        body = await resp.read()
+                        if resp.status >= 400:
+                            raise RuntimeError(
+                                f"TTS failed ({resp.status}): "
+                                f"{body.decode('utf-8', 'replace')[:300]}"
+                            )
+                        headers = {k.lower(): v for k, v in resp.headers.items()}
+                        duration = float(headers.get("x-audio-duration", "0") or 0)
+                        output_path.parent.mkdir(parents=True, exist_ok=True)
+                        await asyncio.to_thread(output_path.write_bytes, body)
+                        if duration <= 0:
+                            duration = max(1.0, len(text.split()) / 2.3)
+                        return duration
+                finally:
+                    labels = {"path": "/v1/audio/speech/custom", "status": status}
+                    inc("vocarium_tts_requests_total", labels=labels)
+                    observe(
+                        "vocarium_tts_inference_seconds",
+                        time.perf_counter() - start,
+                        labels,
+                    )
+
+            try:
+                async with self._url_semaphores[url]:
+                    return await work()
             except Exception as exc:
                 last_err = exc
                 logger.warning(
@@ -276,6 +336,20 @@ class VocariumMusicGenerator:
     def __init__(self, music_url: str, gpu_submit: Callable[..., Any]):
         self._music_url = music_url
         self._gpu_submit = gpu_submit
+        self._aiosession: aiohttp.ClientSession | None = None
+
+    @property
+    def _session(self) -> aiohttp.ClientSession:
+        if self._aiosession is None or self._aiosession.closed:
+            self._aiosession = aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(limit=10, ttl_dns_cache=300),
+            )
+        return self._aiosession
+
+    async def aclose(self) -> None:
+        if self._aiosession is not None and not self._aiosession.closed:
+            await self._aiosession.close()
+        self._aiosession = None
 
     async def generate_to_file(
         self,
@@ -299,65 +373,67 @@ class VocariumMusicGenerator:
         timeout = aiohttp.ClientTimeout(total=600, sock_connect=30, sock_read=600)
 
         async def work():
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(
-                    f"{self._music_url}/release_task", json=payload
-                ) as resp:
-                    submit_body = await resp.read()
-                    if resp.status >= 400:
-                        raise RuntimeError(
-                            f"music submit failed ({resp.status}): "
-                            f"{submit_body.decode('utf-8', 'replace')[:300]}"
-                        )
-                    submit = json.loads(submit_body)
-                task_id = (submit.get("data") or {}).get("task_id")
-                if not task_id:
-                    raise RuntimeError(f"music submit returned no task_id: {submit}")
+            async with self._session.post(
+                f"{self._music_url}/release_task", json=payload, timeout=timeout
+            ) as resp:
+                submit_body = await resp.read()
+                if resp.status >= 400:
+                    raise RuntimeError(
+                        f"music submit failed ({resp.status}): "
+                        f"{submit_body.decode('utf-8', 'replace')[:300]}"
+                    )
+                submit = json.loads(submit_body)
+            task_id = (submit.get("data") or {}).get("task_id")
+            if not task_id:
+                raise RuntimeError(f"music submit returned no task_id: {submit}")
 
-                # Poll until status == 1 (success) or 2 (failure).
-                for _ in range(300):  # ~10 minutes
-                    await asyncio.sleep(2)
-                    async with session.post(
-                        f"{self._music_url}/query_result",
-                        json={"task_id_list": [task_id]},
-                    ) as poll_resp:
-                        if poll_resp.status >= 400:
-                            continue
-                        poll = json.loads(await poll_resp.read())
-                    tasks = poll.get("data") or []
-                    if not tasks:
+            # Poll until status == 1 (success) or 2 (failure).
+            for _ in range(300):  # ~10 minutes
+                await asyncio.sleep(2)
+                async with self._session.post(
+                    f"{self._music_url}/query_result",
+                    json={"task_id_list": [task_id]},
+                    timeout=timeout,
+                ) as poll_resp:
+                    if poll_resp.status >= 400:
                         continue
-                    task = tasks[0]
-                    if task.get("status") == 1:
-                        result = task.get("result")
-                        if isinstance(result, str):
-                            try:
-                                result = json.loads(result)
-                            except json.JSONDecodeError:
-                                result = []
-                        if not result or not isinstance(result, list):
-                            raise RuntimeError(f"music returned empty result: {task}")
-                        first = result[0] or {}
-                        file_ref = first.get("file") or ""
-                        path_part = file_ref.replace("/v1/audio?path=", "")
-                        if not path_part:
+                    poll = json.loads(await poll_resp.read())
+                tasks = poll.get("data") or []
+                if not tasks:
+                    continue
+                task = tasks[0]
+                if task.get("status") == 1:
+                    result = task.get("result")
+                    if isinstance(result, str):
+                        try:
+                            result = json.loads(result)
+                        except json.JSONDecodeError:
+                            result = []
+                    if not result or not isinstance(result, list):
+                        raise RuntimeError(f"music returned empty result: {task}")
+                    first = result[0] or {}
+                    file_ref = first.get("file") or ""
+                    path_part = file_ref.replace("/v1/audio?path=", "")
+                    if not path_part:
+                        raise RuntimeError(
+                            f"music result missing 'file': {first}"
+                        )
+                    async with self._session.get(
+                        f"{self._music_url}/v1/audio",
+                        params={"path": path_part},
+                        timeout=timeout,
+                    ) as audio_resp:
+                        audio_body = await audio_resp.read()
+                        if audio_resp.status >= 400:
                             raise RuntimeError(
-                                f"music result missing 'file': {first}"
+                                f"music download failed ({audio_resp.status})"
                             )
-                        async with session.get(
-                            f"{self._music_url}/v1/audio", params={"path": path_part}
-                        ) as audio_resp:
-                            audio_body = await audio_resp.read()
-                            if audio_resp.status >= 400:
-                                raise RuntimeError(
-                                    f"music download failed ({audio_resp.status})"
-                                )
-                        output_path.parent.mkdir(parents=True, exist_ok=True)
-                        output_path.write_bytes(audio_body)
-                        return float(duration_s)
-                    if task.get("status") == 2:
-                        raise RuntimeError(f"music generation failed: {task}")
-                raise RuntimeError("music generation timed out after ~10 minutes")
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    await asyncio.to_thread(output_path.write_bytes, audio_body)
+                    return float(duration_s)
+                if task.get("status") == 2:
+                    raise RuntimeError(f"music generation failed: {task}")
+            raise RuntimeError("music generation timed out after ~10 minutes")
 
         _, future = await self._gpu_submit("music", "Podcast Music", work)
         return await future
@@ -370,6 +446,20 @@ class VocariumSFXGenerator:
     def __init__(self, sfx_url: str, gpu_submit: Callable[..., Any]):
         self._sfx_url = sfx_url
         self._gpu_submit = gpu_submit
+        self._aiosession: aiohttp.ClientSession | None = None
+
+    @property
+    def _session(self) -> aiohttp.ClientSession:
+        if self._aiosession is None or self._aiosession.closed:
+            self._aiosession = aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(limit=10, ttl_dns_cache=300),
+            )
+        return self._aiosession
+
+    async def aclose(self) -> None:
+        if self._aiosession is not None and not self._aiosession.closed:
+            await self._aiosession.close()
+        self._aiosession = None
 
     async def generate_to_file(
         self,
@@ -390,18 +480,17 @@ class VocariumSFXGenerator:
         timeout = aiohttp.ClientTimeout(total=300, sock_connect=30, sock_read=300)
 
         async def work():
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(
-                    f"{self._sfx_url}/generate", json=payload
-                ) as resp:
-                    body = await resp.read()
-                    if resp.status >= 400:
-                        raise RuntimeError(
-                            f"sfx failed ({resp.status}): "
-                            f"{body.decode('utf-8', 'replace')[:300]}"
-                        )
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                output_path.write_bytes(body)
+            async with self._session.post(
+                f"{self._sfx_url}/generate", json=payload, timeout=timeout
+            ) as resp:
+                body = await resp.read()
+                if resp.status >= 400:
+                    raise RuntimeError(
+                        f"sfx failed ({resp.status}): "
+                        f"{body.decode('utf-8', 'replace')[:300]}"
+                    )
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            await asyncio.to_thread(output_path.write_bytes, body)
             return float(duration_s)
 
         _, future = await self._gpu_submit("sfx", "Podcast SFX", work)
@@ -431,6 +520,42 @@ _HOST_COLUMNS = (
 )
 
 
+def _embedding_to_blob(embedding: list[float] | None) -> bytes | None:
+    if not embedding:
+        return None
+    try:
+        return struct.pack(f"<{len(embedding)}f", *[float(v) for v in embedding])
+    except (TypeError, ValueError, struct.error):
+        return None
+
+
+def _embedding_from_blob(blob: bytes | memoryview | None) -> list[float] | None:
+    if not blob:
+        return None
+    raw = bytes(blob)
+    if len(raw) % 4:
+        return None
+    try:
+        return list(struct.unpack(f"<{len(raw) // 4}f", raw))
+    except struct.error:
+        return None
+
+
+def _embedding_from_json(text: str | None) -> list[float] | None:
+    if not text:
+        return None
+    try:
+        values = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(values, list):
+        return None
+    try:
+        return [float(v) for v in values]
+    except (TypeError, ValueError):
+        return None
+
+
 def _podcast_row_to_dict(row) -> dict:
     return {
         "id": row[0],
@@ -447,16 +572,18 @@ def _podcast_row_to_dict(row) -> dict:
         "audio_path": row[11],
         "audio_duration": row[12] or 0,
         "audio_format": row[13] or "mp3",
-        "total_words": row[14] or 0,
-        "created_at": row[15],
-        "updated_at": row[16],
+        "audio_size": row[14] or 0,
+        "audio_sha256": row[15] or "",
+        "total_words": row[16] or 0,
+        "created_at": row[17],
+        "updated_at": row[18],
     }
 
 
 _PODCAST_COLUMNS = (
     "id, topic, format, disfluency_level, duration, language, status, error_message, "
     "hosts_json, sources_json, script_json, audio_path, audio_duration, audio_format, "
-    "total_words, created_at, updated_at"
+    "audio_size, audio_sha256, total_words, created_at, updated_at"
 )
 
 
@@ -535,6 +662,121 @@ def _sse_event(kind: str, data: dict | str) -> str:
     return f"event: {kind}\ndata: {payload}\n\n"
 
 
+def _clean_label(value: Any, fallback: str = "") -> str:
+    text = str(value or fallback).strip()
+    return text[:MAX_TITLE_CHARS]
+
+
+def _clean_limited_text(value: Any, field: str, max_chars: int, *, required: bool = False) -> str:
+    text = str(value or "").strip()
+    if required and not text:
+        raise HTTPException(400, f"{field} is required")
+    if len(text) > max_chars:
+        raise HTTPException(413, f"{field} too long (max {max_chars} chars)")
+    return text
+
+
+def _clean_language(value: Any) -> str:
+    language = str(value or "de").strip() or "de"
+    if len(language) > MAX_LANGUAGE_CHARS:
+        raise HTTPException(413, f"language too long (max {MAX_LANGUAGE_CHARS} chars)")
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,31}", language):
+        raise HTTPException(400, "language must be a short language code or name")
+    return language
+
+
+def _require_choice(value: Any, allowed: set[str], field: str) -> str:
+    cleaned = str(value or "").strip()
+    if cleaned not in allowed:
+        raise HTTPException(
+            400,
+            f"{field} must be one of: {', '.join(sorted(allowed))}",
+        )
+    return cleaned
+
+
+def _validate_source_url(raw_url: str) -> str:
+    value = raw_url.strip()
+    if not value:
+        raise HTTPException(400, "url is required")
+    if len(value) > MAX_SOURCE_URL_CHARS:
+        raise HTTPException(400, f"url too long (max {MAX_SOURCE_URL_CHARS} chars)")
+    parsed = urlparse(value)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise HTTPException(400, "url must be an http(s) URL")
+    host = (parsed.hostname or "").strip().lower()
+    if host in {"localhost"} or host.endswith(".localhost"):
+        raise HTTPException(400, "localhost URLs are not allowed")
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+    if ip and not ip.is_global:
+        raise HTTPException(400, "private network URLs are not allowed")
+    if ip is None and os.environ.get("PODCAST_VALIDATE_SOURCE_DNS", "true").lower() in ("1", "true", "yes", "on"):
+        try:
+            infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+        except socket.gaierror as exc:
+            raise HTTPException(400, f"url host could not be resolved: {exc}") from exc
+        resolved = {
+            item[4][0]
+            for item in infos
+            if item and len(item) >= 5 and item[4]
+        }
+        if not resolved:
+            raise HTTPException(400, "url host could not be resolved")
+        for address in resolved:
+            try:
+                resolved_ip = ipaddress.ip_address(address)
+            except ValueError:
+                raise HTTPException(400, "url resolved to an invalid address")
+            if not resolved_ip.is_global:
+                raise HTTPException(400, "url resolves to a private network address")
+    return value
+
+
+def _upload_root() -> Path:
+    root = Path(os.environ.get("PODCAST_UPLOAD_PATH", "/app/data/podcast_uploads"))
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _audio_root() -> Path:
+    root = Path(os.environ.get("PODCAST_AUDIO_PATH", "/app/data/podcast_audio"))
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _safe_audio_path(path_value: str) -> Path:
+    try:
+        root = _audio_root().resolve()
+        candidate = Path(path_value).resolve()
+    except OSError:
+        raise HTTPException(404, "Audio file missing on disk")
+    if candidate != root and root not in candidate.parents:
+        raise HTTPException(404, "Audio file missing on disk")
+    return candidate
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _unlink_uploaded_file(path_value: str) -> None:
+    path = Path(path_value)
+    try:
+        upload_root = _upload_root().resolve()
+        candidate = path.resolve()
+    except OSError:
+        return
+    if upload_root == candidate.parent and candidate.exists():
+        candidate.unlink(missing_ok=True)
+
+
 def _get_podcast_or_404(db: sqlite3.Connection, podcast_id: str, user_id: int) -> dict:
     row = db.execute(
         f"SELECT {_PODCAST_COLUMNS} FROM podcasts WHERE id=? AND user_id=?",
@@ -572,6 +814,72 @@ def _get_custom_voice_or_400(
             "Only custom voices can be assigned to podcast hosts",
         )
     return row[0], row[1]
+
+
+def _coerce_int(value: Any, field: str, default: int = 0) -> int:
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise HTTPException(400, f"{field} must be an integer")
+
+
+def _coerce_float(value: Any, field: str, default: float = 0.0) -> float:
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise HTTPException(400, f"{field} must be numeric")
+
+
+def _validate_segment_text(text: str) -> str:
+    cleaned = text.strip()
+    if len(cleaned) > MAX_SEGMENT_TEXT_CHARS:
+        raise HTTPException(
+            413,
+            f"text too long (max {MAX_SEGMENT_TEXT_CHARS} chars)",
+        )
+    return cleaned
+
+
+def _validate_segment_prompt(prompt: str) -> str:
+    cleaned = prompt.strip()
+    if len(cleaned) > MAX_SEGMENT_PROMPT_CHARS:
+        raise HTTPException(
+            413,
+            f"prompt too long (max {MAX_SEGMENT_PROMPT_CHARS} chars)",
+        )
+    return cleaned
+
+
+def _validate_duration_ms(duration_ms: int) -> int:
+    if duration_ms < 0 or duration_ms > MAX_MEDIA_DURATION_MS:
+        raise HTTPException(400, "duration_ms must be between 0 and 600000")
+    return duration_ms
+
+
+def _validate_volume_db(volume_db: float) -> float:
+    if volume_db < -60 or volume_db > 12:
+        raise HTTPException(400, "volume_db must be between -60 and 12")
+    return volume_db
+
+
+def _validate_overlap_ms(overlap_ms: int) -> int:
+    if overlap_ms < -30000 or overlap_ms > 30000:
+        raise HTTPException(400, "overlap_ms must be between -30000 and 30000")
+    return overlap_ms
+
+
+def _validate_segment_semantics(segment: dict) -> None:
+    seg_type = str(segment.get("type") or "speech")
+    text = str(segment.get("text") or "").strip()
+    prompt = str(segment.get("prompt") or "").strip()
+    if seg_type in ("speech", "reaction") and not text:
+        raise HTTPException(400, f"{seg_type} segments require text")
+    if seg_type in ("music", "sfx") and not (prompt or text):
+        raise HTTPException(400, "music/sfx segments require a prompt")
 
 
 # ---------------------------------------------------------------------------
@@ -636,13 +944,11 @@ def create_podcast_router(
     @router.post("/hosts")
     async def create_host(body: dict, request: Request):
         user = get_current_user(request)
-        name = (body.get("name") or "").strip()
-        if not name:
-            raise HTTPException(400, "name is required")
-        role = body.get("role") or "host"
-        if role not in ("host", "expert"):
-            raise HTTPException(400, "role must be 'host' or 'expert'")
-        voice_id = body.get("voice_id") or None
+        name = _clean_limited_text(
+            body.get("name"), "name", MAX_HOST_NAME_CHARS, required=True
+        )
+        role = _require_choice(body.get("role") or "host", {"host", "expert"}, "role")
+        voice_id = (body.get("voice_id") or "").strip() or None
         db = db_getter()
         # If voice_id given, verify it belongs to user and is a custom voice
         if voice_id:
@@ -656,8 +962,8 @@ def create_podcast_router(
                 host_id,
                 user["id"],
                 name,
-                body.get("personality") or "",
-                body.get("speaking_style") or "",
+                _clean_limited_text(body.get("personality"), "personality", MAX_HOST_PROFILE_CHARS),
+                _clean_limited_text(body.get("speaking_style"), "speaking_style", MAX_HOST_PROFILE_CHARS),
                 voice_id,
                 role,
                 now,
@@ -676,12 +982,23 @@ def create_podcast_router(
         values: list[Any] = []
         for key in ("name", "personality", "speaking_style", "voice_id", "role"):
             if key in body:
-                if key == "role" and body[key] not in ("host", "expert"):
-                    raise HTTPException(400, "role must be 'host' or 'expert'")
-                if key == "voice_id" and body[key]:
-                    _get_custom_voice_or_400(db, body[key], user["id"])
+                value = body[key]
+                if key == "name":
+                    value = _clean_limited_text(
+                        value, "name", MAX_HOST_NAME_CHARS, required=True
+                    )
+                elif key in ("personality", "speaking_style"):
+                    value = _clean_limited_text(
+                        value, key, MAX_HOST_PROFILE_CHARS
+                    )
+                elif key == "role":
+                    value = _require_choice(value, {"host", "expert"}, "role")
+                elif key == "voice_id":
+                    value = (value or "").strip() or None
+                    if value:
+                        _get_custom_voice_or_400(db, value, user["id"])
                 fields.append(f"{key}=?")
-                values.append(body[key])
+                values.append(value)
         if not fields:
             return _get_host_or_404(db, host_id, user["id"])
         fields.append("updated_at=?")
@@ -722,12 +1039,13 @@ def create_podcast_router(
     @router.post("/podcasts")
     async def create_podcast(body: dict, request: Request):
         user = get_current_user(request)
-        fmt = body.get("format") or "dialog"
-        if fmt not in ("dialog", "monolog", "custom"):
-            raise HTTPException(400, "format must be dialog | monolog | custom")
-        duration = body.get("duration") or "medium"
-        if duration not in ("short", "medium", "long"):
-            raise HTTPException(400, "duration must be short | medium | long")
+        fmt = _require_choice(body.get("format") or "dialog", ALLOWED_PODCAST_FORMATS, "format")
+        duration = _require_choice(
+            body.get("duration") or "medium", ALLOWED_PODCAST_DURATIONS, "duration"
+        )
+        audio_format = _require_choice(
+            body.get("audio_format") or "mp3", ALLOWED_AUDIO_FORMATS, "audio_format"
+        )
         try:
             disfluency_level = int(body.get("disfluency_level", 2))
         except (TypeError, ValueError):
@@ -759,15 +1077,15 @@ def create_podcast_router(
             (
                 podcast_id,
                 user["id"],
-                body.get("topic") or "",
+                _clean_limited_text(body.get("topic"), "topic", MAX_TOPIC_CHARS),
                 fmt,
                 disfluency_level,
                 duration,
-                body.get("language") or "de",
+                _clean_language(body.get("language")),
                 "draft",
                 json.dumps(hosts),
                 json.dumps([]),
-                body.get("audio_format") or "mp3",
+                audio_format,
                 now,
                 now,
             ),
@@ -784,6 +1102,16 @@ def create_podcast_router(
         values: list[Any] = []
         for key in ("topic", "format", "duration", "language", "audio_format"):
             if key in body:
+                if key == "format":
+                    body[key] = _require_choice(body[key], ALLOWED_PODCAST_FORMATS, "format")
+                elif key == "duration":
+                    body[key] = _require_choice(body[key], ALLOWED_PODCAST_DURATIONS, "duration")
+                elif key == "audio_format":
+                    body[key] = _require_choice(body[key], ALLOWED_AUDIO_FORMATS, "audio_format")
+                elif key == "topic":
+                    body[key] = _clean_limited_text(body[key], "topic", MAX_TOPIC_CHARS)
+                elif key == "language":
+                    body[key] = _clean_language(body[key])
                 fields.append(f"{key}=?")
                 values.append(body[key])
         if "disfluency_level" in body:
@@ -796,6 +1124,8 @@ def create_podcast_router(
             fields.append("disfluency_level=?")
             values.append(lvl)
         if "host_ids" in body:
+            if not isinstance(body["host_ids"], list):
+                raise HTTPException(400, "host_ids must be a list")
             hosts: list[dict] = []
             for hid in body["host_ids"] or []:
                 hosts.append(_get_host_or_404(db, hid, user["id"]))
@@ -873,28 +1203,29 @@ def create_podcast_router(
                 embeddings = [None] * len(chunks)  # type: ignore[list-item]
 
             db.execute(
-                "DELETE FROM podcast_chunks WHERE source_id=?", (source_id,)
+                "DELETE FROM podcast_chunks WHERE source_id=? AND podcast_id=?",
+                (source_id, podcast_id),
             )
             for pos, chunk in enumerate(chunks):
                 chunk_id = generate_id("chunk")
-                emb_json = json.dumps(embeddings[pos]) if embeddings[pos] else None
+                emb_blob = _embedding_to_blob(embeddings[pos])
                 db.execute(
-                    "INSERT INTO podcast_chunks (id, source_id, podcast_id, content, embedding, position) "
-                    "VALUES (?,?,?,?,?,?)",
-                    (chunk_id, source_id, podcast_id, chunk, emb_json, pos),
+                    "INSERT INTO podcast_chunks (id, source_id, podcast_id, content, embedding, embedding_blob, position) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    (chunk_id, source_id, podcast_id, chunk, None, emb_blob, pos),
                 )
             db.execute(
                 "UPDATE podcast_sources SET status='processed', chunk_count=?, processed_at=CURRENT_TIMESTAMP, error_message=NULL "
-                "WHERE id=?",
-                (len(chunks), source_id),
+                "WHERE id=? AND podcast_id=?",
+                (len(chunks), source_id, podcast_id),
             )
             db.commit()
             logger.info("Source %s processed (chunks=%d)", source_id, len(chunks))
         except Exception as exc:
             logger.exception("Source processing failed: %s", exc)
             db.execute(
-                "UPDATE podcast_sources SET status='failed', error_message=? WHERE id=?",
-                (str(exc), source_id),
+                "UPDATE podcast_sources SET status='failed', error_message=? WHERE id=? AND podcast_id=?",
+                (str(exc), source_id, podcast_id),
             )
             db.commit()
 
@@ -978,10 +1309,11 @@ def create_podcast_router(
             raise HTTPException(
                 413, f"File too large (max {MAX_UPLOAD_BYTES // (1024*1024)} MB)"
             )
+        if not data:
+            raise HTTPException(400, "File is empty")
 
         source_id = generate_id("src")
-        uploads_dir = Path(os.environ.get("PODCAST_UPLOAD_PATH", "/app/data/podcast_uploads"))
-        uploads_dir.mkdir(parents=True, exist_ok=True)
+        uploads_dir = _upload_root()
         safe_suffix = suffix if suffix else ""
         disk_path = uploads_dir / f"{source_id}{safe_suffix}"
         await asyncio.to_thread(disk_path.write_bytes, data)
@@ -989,7 +1321,7 @@ def create_podcast_router(
         db.execute(
             "INSERT INTO podcast_sources (id, podcast_id, type, title, content, status) "
             "VALUES (?,?,?,?,?,?)",
-            (source_id, podcast_id, "file", filename, str(disk_path), "pending"),
+            (source_id, podcast_id, "file", _clean_label(filename, "upload"), str(disk_path), "pending"),
         )
         db.commit()
 
@@ -998,8 +1330,8 @@ def create_podcast_router(
         )
 
         row = db.execute(
-            f"SELECT {_SOURCE_COLUMNS} FROM podcast_sources WHERE id=?",
-            (source_id,),
+            f"SELECT {_SOURCE_COLUMNS} FROM podcast_sources WHERE id=? AND podcast_id=?",
+            (source_id, podcast_id),
         ).fetchone()
         return _source_row_to_dict(row)
 
@@ -1008,10 +1340,8 @@ def create_podcast_router(
         user = get_current_user(request)
         db = db_getter()
         _assert_podcast(db, podcast_id, user["id"])
-        url = (body.get("url") or "").strip()
-        if not url:
-            raise HTTPException(400, "url is required")
-        title = (body.get("title") or url).strip()
+        url = _validate_source_url(body.get("url") or "")
+        title = _clean_label(body.get("title"), url)
         source_id = generate_id("src")
         db.execute(
             "INSERT INTO podcast_sources (id, podcast_id, type, title, url, status) "
@@ -1025,8 +1355,8 @@ def create_podcast_router(
         )
 
         row = db.execute(
-            f"SELECT {_SOURCE_COLUMNS} FROM podcast_sources WHERE id=?",
-            (source_id,),
+            f"SELECT {_SOURCE_COLUMNS} FROM podcast_sources WHERE id=? AND podcast_id=?",
+            (source_id, podcast_id),
         ).fetchone()
         return _source_row_to_dict(row)
 
@@ -1038,11 +1368,12 @@ def create_podcast_router(
         text = body.get("content") or body.get("text") or ""
         if not isinstance(text, str):
             raise HTTPException(400, "content must be a string")
+        text = text.strip()
         if len(text) < MIN_TEXT_CHARS:
             raise HTTPException(400, f"content too short (min {MIN_TEXT_CHARS} chars)")
         if len(text) > MAX_TEXT_CHARS:
             raise HTTPException(400, f"content too long (max {MAX_TEXT_CHARS} chars)")
-        title = (body.get("title") or "Text Input").strip()
+        title = _clean_label(body.get("title"), "Text Input")
         source_id = generate_id("src")
         db.execute(
             "INSERT INTO podcast_sources (id, podcast_id, type, title, content, status) "
@@ -1056,8 +1387,8 @@ def create_podcast_router(
         )
 
         row = db.execute(
-            f"SELECT {_SOURCE_COLUMNS} FROM podcast_sources WHERE id=?",
-            (source_id,),
+            f"SELECT {_SOURCE_COLUMNS} FROM podcast_sources WHERE id=? AND podcast_id=?",
+            (source_id, podcast_id),
         ).fetchone()
         return _source_row_to_dict(row)
 
@@ -1074,7 +1405,7 @@ def create_podcast_router(
             raise HTTPException(404, "Source not found")
         # If it was a file upload, delete from disk
         if row[1] == "file" and row[0]:
-            Path(row[0]).unlink(missing_ok=True)
+            _unlink_uploaded_file(row[0])
         db.execute(
             "DELETE FROM podcast_sources WHERE id=? AND podcast_id=?",
             (source_id, podcast_id),
@@ -1086,18 +1417,13 @@ def create_podcast_router(
 
     def _load_podcast_chunks(db, podcast_id: str) -> list[SourceChunk]:
         rows = db.execute(
-            "SELECT id, source_id, content, position, embedding FROM podcast_chunks "
+            "SELECT id, source_id, content, position, embedding, embedding_blob FROM podcast_chunks "
             "WHERE podcast_id=? ORDER BY position",
             (podcast_id,),
         ).fetchall()
         chunks: list[SourceChunk] = []
         for r in rows:
-            emb = None
-            if r[4]:
-                try:
-                    emb = json.loads(r[4])
-                except json.JSONDecodeError:
-                    emb = None
+            emb = _embedding_from_blob(r[5]) or _embedding_from_json(r[4])
             chunks.append(
                 SourceChunk(
                     id=r[0], source_id=r[1], content=r[2], position=r[3], embedding=emb
@@ -1167,8 +1493,9 @@ def create_podcast_router(
         )
 
         db.execute(
-            "UPDATE podcasts SET status='generating_script', error_message=NULL, updated_at=? WHERE id=?",
-            (_now_iso(), podcast_id),
+            "UPDATE podcasts SET status='generating_script', error_message=NULL, updated_at=? "
+            "WHERE id=? AND user_id=?",
+            (_now_iso(), podcast_id, user["id"]),
         )
         db.commit()
 
@@ -1193,11 +1520,23 @@ def create_podcast_router(
             push_progress("preparing", 5, "Preparing script generation")
             try:
                 result = await script_generator.generate(ctx, user_id=user["id"])
+            except asyncio.CancelledError:
+                logger.info("Script generation cancelled (podcast=%s user=%s)", podcast_id, user["id"])
+                db.execute(
+                    "UPDATE podcasts SET status='cancelled', error_message=?, updated_at=? "
+                    "WHERE id=? AND user_id=?",
+                    ("cancelled", _now_iso(), podcast_id, user["id"]),
+                )
+                db.commit()
+                push_error("cancelled")
+                await event_queue.put(None)
+                raise
             except Exception as exc:
                 logger.exception("Script generation failed")
                 db.execute(
-                    "UPDATE podcasts SET status='error', error_message=?, updated_at=? WHERE id=?",
-                    (str(exc), _now_iso(), podcast_id),
+                    "UPDATE podcasts SET status='error', error_message=?, updated_at=? "
+                    "WHERE id=? AND user_id=?",
+                    (str(exc), _now_iso(), podcast_id, user["id"]),
                 )
                 db.commit()
                 push_error(str(exc))
@@ -1213,8 +1552,8 @@ def create_podcast_router(
 
             db.execute(
                 "UPDATE podcasts SET status='script_ready', script_json=?, total_words=?, updated_at=? "
-                "WHERE id=?",
-                (json.dumps(script_payload), result.total_words, _now_iso(), podcast_id),
+                "WHERE id=? AND user_id=?",
+                (json.dumps(script_payload), result.total_words, _now_iso(), podcast_id, user["id"]),
             )
             db.commit()
             push_complete(script_payload)
@@ -1225,14 +1564,22 @@ def create_podcast_router(
                 "stage": "queued", "progress": 0, "message": "Script generation queued...",
             })
             task = asyncio.create_task(worker())
-            while True:
-                event = await event_queue.get()
-                if event is None:
-                    break
-                yield event
-            # Re-raise if background task failed
-            if task.done() and task.exception():
-                raise task.exception()
+            try:
+                while True:
+                    event = await event_queue.get()
+                    if event is None:
+                        break
+                    yield event
+                # Re-raise if background task failed
+                if task.done() and not task.cancelled() and task.exception():
+                    raise task.exception()
+            finally:
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -1254,22 +1601,40 @@ def create_podcast_router(
             raise HTTPException(404, "Segment not found")
         for key in ("speaker", "text", "type", "voice", "notes", "prompt"):
             if key in body:
-                target[key] = body[key]
+                if key == "type":
+                    target[key] = _require_choice(body[key], ALLOWED_SEGMENT_TYPES, "type")
+                elif key == "voice":
+                    voice = (body[key] or "").strip() or None
+                    if voice:
+                        _get_custom_voice_or_400(db, voice, user["id"])
+                    target[key] = voice
+                elif key == "text":
+                    target[key] = _validate_segment_text(str(body[key] or ""))
+                elif key == "prompt":
+                    prompt = _validate_segment_prompt(str(body[key] or ""))
+                    target[key] = prompt or None
+                else:
+                    target[key] = str(body[key] or "").strip()
         if "overlap_ms" in body:
-            try:
-                target["overlap_ms"] = int(body["overlap_ms"] or 0)
-            except (TypeError, ValueError):
-                target["overlap_ms"] = 0
+            target["overlap_ms"] = _validate_overlap_ms(
+                _coerce_int(body["overlap_ms"], "overlap_ms")
+            )
         if "duration_ms" in body:
-            try:
-                target["duration_ms"] = int(body["duration_ms"] or 0)
-            except (TypeError, ValueError):
-                target["duration_ms"] = 0
+            target["duration_ms"] = _validate_duration_ms(
+                _coerce_int(body["duration_ms"], "duration_ms")
+            )
         if "volume_db" in body:
-            try:
-                target["volume_db"] = float(body["volume_db"] or 0.0)
-            except (TypeError, ValueError):
-                target["volume_db"] = 0.0
+            target["volume_db"] = _validate_volume_db(
+                _coerce_float(body["volume_db"], "volume_db")
+            )
+        if target.get("type") in ("music", "sfx"):
+            prompt = (target.get("prompt") or target.get("text") or "").strip()
+            if not prompt:
+                raise HTTPException(400, "music/sfx segments require a prompt")
+            target["prompt"] = prompt
+        if target.get("type") == "pause" and not target.get("duration_ms"):
+            target["duration_ms"] = 500
+        _validate_segment_semantics(target)
         # Cached audio for music/sfx segments must be invalidated when the
         # prompt or duration changes — let the assembler regenerate next run.
         if "prompt" in body or "duration_ms" in body:
@@ -1284,7 +1649,7 @@ def create_podcast_router(
                     except OSError:
                         pass
         if "text" in body:
-            text = body["text"] or ""
+            text = target.get("text") or ""
             target["word_count"] = count_words(text)
             target["estimated_duration"] = estimate_speaking_duration(target["word_count"])
         # Music/SFX duration drives estimated_duration directly.
@@ -1296,8 +1661,8 @@ def create_podcast_router(
         script["estimated_duration"] = sum(s.get("estimated_duration", 0) for s in segments)
 
         db.execute(
-            "UPDATE podcasts SET script_json=?, total_words=?, updated_at=? WHERE id=?",
-            (json.dumps(script), script["total_words"], _now_iso(), podcast_id),
+            "UPDATE podcasts SET script_json=?, total_words=?, updated_at=? WHERE id=? AND user_id=?",
+            (json.dumps(script), script["total_words"], _now_iso(), podcast_id, user["id"]),
         )
         db.commit()
         return _get_podcast_or_404(db, podcast_id, user["id"])
@@ -1311,31 +1676,36 @@ def create_podcast_router(
         script = podcast.get("script") or {}
         segments = script.get("segments") or []
 
-        seg_type = body.get("type") or "speech"
-        if seg_type not in ("speech", "reaction", "pause", "sfx", "music"):
-            raise HTTPException(400, f"Invalid segment type: {seg_type}")
+        seg_type = _require_choice(
+            body.get("type") or "speech", ALLOWED_SEGMENT_TYPES, "type"
+        )
 
-        text = body.get("text") or ""
+        text = _validate_segment_text(str(body.get("text") or ""))
         prompt = body.get("prompt")
         if seg_type in ("music", "sfx"):
-            prompt = (prompt or text or "").strip()
+            prompt = _validate_segment_prompt(str(prompt or text or ""))
             if not prompt:
                 raise HTTPException(400, "music/sfx segments require a prompt")
+        elif prompt:
+            prompt = _validate_segment_prompt(str(prompt))
 
-        try:
-            duration_ms = int(body.get("duration_ms") or 0)
-        except (TypeError, ValueError):
-            duration_ms = 0
-        try:
-            overlap_ms = int(body.get("overlap_ms") or 0)
-        except (TypeError, ValueError):
-            overlap_ms = 0
-        try:
-            volume_db = float(body.get("volume_db") or 0.0)
-        except (TypeError, ValueError):
-            volume_db = 0.0
+        voice = (body.get("voice") or "").strip() or None
+        if voice:
+            _get_custom_voice_or_400(db, voice, user["id"])
+
+        duration_ms = _validate_duration_ms(
+            _coerce_int(body.get("duration_ms"), "duration_ms")
+        )
+        overlap_ms = _validate_overlap_ms(
+            _coerce_int(body.get("overlap_ms"), "overlap_ms")
+        )
+        volume_db = _validate_volume_db(
+            _coerce_float(body.get("volume_db"), "volume_db")
+        )
 
         # Sensible defaults per type.
+        if seg_type == "pause" and duration_ms <= 0:
+            duration_ms = 500
         if seg_type == "music" and duration_ms <= 0:
             duration_ms = 30000
         if seg_type == "music" and volume_db == 0.0:
@@ -1350,8 +1720,8 @@ def create_podcast_router(
             "speaker": body.get("speaker") or "",
             "text": text or (prompt or ""),
             "type": seg_type,
-            "voice": body.get("voice"),
-            "notes": body.get("notes"),
+            "voice": voice,
+            "notes": str(body.get("notes") or "").strip() or None,
             "position": 0,  # set below
             "word_count": count_words(text),
             "estimated_duration": (duration_ms / 1000.0) if duration_ms else 0.0,
@@ -1363,6 +1733,7 @@ def create_podcast_router(
             "duration_ms": duration_ms,
             "volume_db": volume_db,
         }
+        _validate_segment_semantics(new_seg)
 
         # Insertion index: explicit `position` (int) takes precedence, else after.
         try:
@@ -1379,8 +1750,8 @@ def create_podcast_router(
         script["estimated_duration"] = sum(s.get("estimated_duration", 0) for s in segments)
 
         db.execute(
-            "UPDATE podcasts SET script_json=?, total_words=?, updated_at=? WHERE id=?",
-            (json.dumps(script), script["total_words"], _now_iso(), podcast_id),
+            "UPDATE podcasts SET script_json=?, total_words=?, updated_at=? WHERE id=? AND user_id=?",
+            (json.dumps(script), script["total_words"], _now_iso(), podcast_id, user["id"]),
         )
         db.commit()
         return _get_podcast_or_404(db, podcast_id, user["id"])
@@ -1391,13 +1762,18 @@ def create_podcast_router(
         db = db_getter()
         podcast = _get_podcast_or_404(db, podcast_id, user["id"])
         script = podcast.get("script") or {}
-        segments = [s for s in (script.get("segments") or []) if s.get("id") != segment_id]
+        original = script.get("segments") or []
+        segments = [s for s in original if s.get("id") != segment_id]
+        if len(segments) == len(original):
+            raise HTTPException(404, "Segment not found")
+        for idx, seg in enumerate(segments):
+            seg["position"] = idx
         script["segments"] = segments
         script["total_words"] = sum(s.get("word_count", 0) for s in segments)
         script["estimated_duration"] = sum(s.get("estimated_duration", 0) for s in segments)
         db.execute(
-            "UPDATE podcasts SET script_json=?, total_words=?, updated_at=? WHERE id=?",
-            (json.dumps(script), script["total_words"], _now_iso(), podcast_id),
+            "UPDATE podcasts SET script_json=?, total_words=?, updated_at=? WHERE id=? AND user_id=?",
+            (json.dumps(script), script["total_words"], _now_iso(), podcast_id, user["id"]),
         )
         db.commit()
         return {"status": "deleted", "id": segment_id}
@@ -1437,8 +1813,9 @@ def create_podcast_router(
         audio_format: AudioFormat = "mp3" if (podcast.get("audio_format") or "mp3") == "mp3" else "wav"
 
         db.execute(
-            "UPDATE podcasts SET status='generating_audio', error_message=NULL, updated_at=? WHERE id=?",
-            (_now_iso(), podcast_id),
+            "UPDATE podcasts SET status='generating_audio', error_message=NULL, updated_at=? "
+            "WHERE id=? AND user_id=?",
+            (_now_iso(), podcast_id, user["id"]),
         )
         db.commit()
 
@@ -1462,6 +1839,7 @@ def create_podcast_router(
                 "audio_path": str(r.file_path),
                 "duration": r.duration,
                 "file_size": r.file_size,
+                "audio_sha256": getattr(r, "audio_sha256", ""),
                 "audio_format": audio_format,
             })
 
@@ -1476,24 +1854,41 @@ def create_podcast_router(
                     force=force,
                     user_id=user["id"],
                 )
+                audio_sha256 = await asyncio.to_thread(_sha256_file, result.file_path)
+                result.audio_sha256 = audio_sha256
                 db.execute(
                     "UPDATE podcasts SET status='ready', audio_path=?, audio_duration=?, "
-                    "audio_format=?, error_message=NULL, updated_at=? WHERE id=?",
+                    "audio_format=?, audio_size=?, audio_sha256=?, "
+                    "error_message=NULL, updated_at=? WHERE id=? AND user_id=?",
                     (
                         str(result.file_path),
                         result.duration,
                         audio_format,
+                        result.file_size,
+                        audio_sha256,
                         _now_iso(),
                         podcast_id,
+                        user["id"],
                     ),
                 )
                 db.commit()
                 await event_queue.put(make_complete_event(result))
+            except asyncio.CancelledError:
+                logger.info("Audio assembly cancelled (podcast=%s user=%s)", podcast_id, user["id"])
+                db.execute(
+                    "UPDATE podcasts SET status='cancelled', error_message=?, updated_at=? "
+                    "WHERE id=? AND user_id=?",
+                    ("cancelled", _now_iso(), podcast_id, user["id"]),
+                )
+                db.commit()
+                await event_queue.put(make_error_event("cancelled"))
+                raise
             except Exception as exc:
                 logger.exception("Audio assembly failed")
                 db.execute(
-                    "UPDATE podcasts SET status='error', error_message=?, updated_at=? WHERE id=?",
-                    (str(exc), _now_iso(), podcast_id),
+                    "UPDATE podcasts SET status='error', error_message=?, updated_at=? "
+                    "WHERE id=? AND user_id=?",
+                    (str(exc), _now_iso(), podcast_id, user["id"]),
                 )
                 db.commit()
                 await event_queue.put(make_error_event(str(exc)))
@@ -1505,14 +1900,22 @@ def create_podcast_router(
                 stage="queued", progress=0, message="Audio generation queued...",
             ))
             task = asyncio.create_task(worker())
-            while True:
-                event = await event_queue.get()
-                if event is None:
-                    break
-                yield event
-            # Re-raise if background task failed
-            if task.done() and task.exception():
-                raise task.exception()
+            try:
+                while True:
+                    event = await event_queue.get()
+                    if event is None:
+                        break
+                    yield event
+                # Re-raise if background task failed
+                if task.done() and not task.cancelled() and task.exception():
+                    raise task.exception()
+            finally:
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -1522,9 +1925,24 @@ def create_podcast_router(
         audio_path = podcast.get("audio_path")
         if not audio_path:
             raise HTTPException(404, "Audio not generated for this podcast")
-        path = Path(audio_path)
+        path = _safe_audio_path(audio_path)
         if not path.exists():
             raise HTTPException(404, "Audio file missing on disk")
+        expected_size = int(podcast.get("audio_size") or 0)
+        actual_size = path.stat().st_size
+        if expected_size and actual_size != expected_size:
+            raise HTTPException(409, "Audio artifact integrity check failed")
+        expected_sha = str(podcast.get("audio_sha256") or "")
+        verify_hash = os.environ.get("VERIFY_ARTIFACT_HASH_ON_READ", "false").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if verify_hash and expected_sha:
+            actual_sha = _sha256_file(path)
+            if actual_sha != expected_sha:
+                raise HTTPException(409, "Audio artifact integrity check failed")
         return path
 
     @router.get("/podcasts/{podcast_id}/audio/download")
@@ -1536,10 +1954,11 @@ def create_podcast_router(
         media_type = "audio/mpeg" if fmt == "mp3" else "audio/wav"
         safe_topic = re.sub(r"[^a-zA-Z0-9_-]+", "_", (podcast.get("topic") or "podcast"))[:60]
         filename = f"{safe_topic or 'podcast'}.{fmt}"
-        return Response(
-            content=path.read_bytes(),
+        return FileResponse(
+            path,
             media_type=media_type,
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            filename=filename,
+            content_disposition_type="attachment",
         )
 
     @router.get("/podcasts/{podcast_id}/audio/stream")
@@ -1584,8 +2003,8 @@ def create_podcast_router(
                 },
             )
 
-        return Response(
-            content=path.read_bytes(),
+        return FileResponse(
+            path,
             media_type=media_type,
             headers={
                 "Accept-Ranges": "bytes",

@@ -40,13 +40,13 @@ Returns the authenticated user.
 
 ## GPU Queue System
 
-**Alle GPU-Operationen laufen durch eine FIFO-Queue.** GPU 0 (RTX 3060, 12GB) teilt sich TTS, ASR, Music und SFX. Nur eine Operation gleichzeitig — alle anderen warten.
+**Alle GPU-Operationen laufen durch eine FIFO-Queue.** Im Single-GPU-Default teilt sich GPU 0 (RTX 3060, 12GB) TTS, ASR, Music und SFX. Nur eine Operation gleichzeitig — alle anderen warten.
 
-**TTS-Fallback auf GPU 1:** Wenn GPU 0 beschaeftigt ist (Queue hat laufende oder wartende Jobs), werden TTS-Requests automatisch auf GPU 1 (RTX 5060 Ti, 16GB) umgeleitet. Das betrifft nur TTS — ASR, Music und SFX laufen ausschliesslich auf GPU 0. Fuer den API-Caller ist das transparent, es aendert sich nichts am Request.
+**Dual-GPU ist opt-in:** Eine zweite TTS-Instanz auf GPU 1 wird nur genutzt, wenn der Stack mit `COMPOSE_PROFILES=dual-gpu` und `TTS_URL_2=http://qwen3-tts-2:8880` gestartet wurde. Ohne diese Konfiguration laufen TTS-Requests ausschliesslich ueber `TTS_URL`.
 
 Das bedeutet:
-- TTS-Requests werden bei voller Queue automatisch auf GPU 1 ausgelagert
-- ASR/Music/SFX-Requests koennen trotzdem lange dauern wenn die Queue voll ist
+- TTS-Requests koennen nur dann parallel auf GPU 1 laufen, wenn Dual-GPU explizit aktiviert ist
+- ASR/Music/SFX-Requests koennen lange dauern, wenn die Queue voll ist oder der GPU-Guard nicht genug freien VRAM sieht
 - Timeouts grosszuegig setzen (mindestens 600s)
 - Queue-Status abfragen um dem User Feedback zu geben
 
@@ -109,7 +109,7 @@ Generiert Sprache aus Text. **Haupt-Endpoint fuer Client-Integrationen.**
 {
   "text": "Dies ist ein Testtext.",
   "voice_id": "a1b2c3d4",
-  "model_id": "0.6b-base",
+  "model_id": "1.7b-base",
   "language": "German",
   "response_format": "wav"
 }
@@ -119,7 +119,7 @@ Generiert Sprache aus Text. **Haupt-Endpoint fuer Client-Integrationen.**
 |------|---------|---------|-------------|
 | `text` | ja | — | Zu sprechender Text |
 | `voice_id` | nein | `"default"` | Voice-ID (muss dem User gehoeren) |
-| `model_id` | nein | aktuelles Modell | `"0.6b-base"` oder `"1.7b-base"` |
+| `model_id` | nein | aktuelles Modell | `"1.7b-base"` fuer Clone/Base-TTS |
 | `language` | nein | Voice-Sprache | Sprache der Ausgabe |
 | `response_format` | nein | `"wav"` | Audio-Format |
 
@@ -160,10 +160,60 @@ event: chunk
 data: {"index": 1, "total": 3, "audio": "<base64-wav>", "duration": 1.8, "text": "Zweiter Satz."}
 
 event: done
-data: {"total_duration": 5.4, "generation_time": 8.2, "rtf": 1.52, "model": "0.6b-base", "voice": "a1b2c3d4", "chunks": 3}
+data: {"total_duration": 5.4, "generation_time": 8.2, "rtf": 1.52, "model": "1.7b-base", "voice": "a1b2c3d4", "chunks": 3}
 ```
 
-**Hinweis:** Die gesamte Generierung wird intern gepuffert (GPU-Lock bleibt bis Ende). Der Stream wird danach auf einmal ausgegeben. Fuer echtes Streaming mit niedrigerer Latenz direkt den TTS-Service ansprechen (nur intern sinnvoll).
+**Hinweis:** Der Endpoint streamt Queue-/Progress- und Chunk-Events live per SSE. Lange TTS-Inferenz bleibt GPU-gebunden; setze trotzdem grosszuegige Timeouts.
+
+---
+
+## OpenAI-kompatible TTS-Endpunkte
+
+OpenAI-kompatible Clients verwenden `voice`, aber Vocarium erwartet darin eine echte Voice-ID, nicht den Anzeigenamen aus der UI.
+
+### `GET /v1/voices`
+Listet die Voices des authentifizierten Users im OpenAI-kompatiblen Format.
+
+```bash
+curl -H "Remote-User: alice" http://vocarium-api:8280/v1/voices
+curl -H "Remote-User: alice" "http://vocarium-api:8280/v1/voices?source=clone"
+curl -H "Remote-User: alice" "http://vocarium-api:8280/v1/voices?source=design"
+curl -H "Remote-User: alice" "http://vocarium-api:8280/v1/voices?source=custom"
+```
+
+### Clone/Base-Voices: `POST /v1/audio/speech`
+
+```bash
+curl -X POST http://vocarium-api:8280/v1/audio/speech \
+  -H "Remote-User: alice" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"tts-1","input":"Hallo Welt","voice":"a1b2c3d4","response_format":"wav"}' \
+  --output speech.wav
+```
+
+`default` ist die eingebaute Base-Voice. Geklonte Stimmen muessen per `voice_id` angesprochen werden. Wenn ein SUB/WAVE-Client versehentlich Persona-Labels wie `Michael Scott` als `voice` sendet, routet Vocarium diese kompatibilitaetshalber auf `default`; fuer die echte geklonte Stimme muss weiterhin die konkrete `voice_id` verwendet werden.
+
+### Designed Voices: `POST /v1/audio/speech/designed`
+
+```bash
+curl -X POST http://vocarium-api:8280/v1/audio/speech/designed \
+  -H "Remote-User: alice" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"tts-1","input":"Hallo Welt","voice":"DESIGNED_VOICE_ID","response_format":"wav"}' \
+  --output designed.wav
+```
+
+### Saved Custom Speaker Presets: `POST /v1/audio/speech/custom`
+
+```bash
+curl -X POST http://vocarium-api:8280/v1/audio/speech/custom \
+  -H "Remote-User: alice" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen3-tts-custom","input":"Hallo Welt","voice":"CUSTOM_VOICE_ID","response_format":"wav"}' \
+  --output custom.wav
+```
+
+Custom Voices duerfen nicht an `/v1/audio/speech` gesendet werden; dieser Endpoint akzeptiert nur `default` und Clone-Voices.
 
 ---
 
@@ -355,8 +405,9 @@ Verfuegbare TTS-Modelle.
 ```json
 {
   "models": [
-    {"id": "0.6b-base", "path": "...", "type": "base", "params": "0.6B", "loaded": true},
-    {"id": "1.7b-base", "path": "...", "type": "base", "params": "1.7B", "loaded": false}
+    {"id": "1.7b-base", "path": "...", "type": "base", "params": "1.7B", "loaded": true},
+    {"id": "1.7b-design", "path": "...", "type": "design", "params": "1.7B", "loaded": false},
+    {"id": "1.7b-custom", "path": "...", "type": "custom", "params": "1.7B", "loaded": false}
   ]
 }
 ```

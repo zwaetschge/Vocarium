@@ -32,7 +32,7 @@ if DEVICE != "cpu":
     torch.set_float32_matmul_precision("high")
 
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File, Form
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 
@@ -43,6 +43,7 @@ from faster_qwen3_tts import FasterQwen3TTS
 
 VOICES_DIR = Path(os.environ.get("VOICES_DIR", "/app/voices"))
 VOICES_DIR.mkdir(parents=True, exist_ok=True)
+MAX_VOICE_UPLOAD_BYTES = int(os.environ.get("MAX_VOICE_UPLOAD_BYTES", str(50 * 1024 * 1024)))
 
 REF_AUDIO_DIR = Path("/app/ref_audio")
 IDLE_TIMEOUT = int(os.environ.get("IDLE_TIMEOUT", "600"))
@@ -84,10 +85,54 @@ SUPPORTED_LANGUAGES = [
     "Chinese", "English", "Japanese", "Korean", "German",
     "French", "Russian", "Portuguese", "Spanish", "Italian",
 ]
+SUPPORTED_OUTPUT_FORMATS = {"wav", "mp3", "flac", "opus", "aac", "pcm"}
+VOICE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 
-# Models where CUDA graphs work reliably on this GPU.
-# 1.7B hangs after ~2 CUDA graph replays on Blackwell (RTX 50xx).
-CUDA_GRAPH_MODELS = {"1.7b-base"}
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized == "auto":
+        return default
+    return normalized in {"1", "true", "yes", "on"}
+
+
+def _voice_dir_for(voice_id: str) -> Path:
+    cleaned = (voice_id or "").strip()
+    if not VOICE_ID_RE.fullmatch(cleaned):
+        raise HTTPException(400, "Invalid voice_id")
+    root = VOICES_DIR.resolve()
+    target = (root / cleaned).resolve()
+    if target == root or root not in target.parents:
+        raise HTTPException(400, "Invalid voice_id")
+    return target
+
+
+async def _read_upload_limited(upload: UploadFile, max_bytes: int, label: str) -> bytes:
+    data = await upload.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        mb = max(1, max_bytes // (1024 * 1024))
+        raise HTTPException(413, f"{label} too large (max {mb} MB)")
+    return data
+
+
+def _default_cuda_graphs_enabled() -> bool:
+    if DEVICE == "cpu" or not torch.cuda.is_available():
+        return False
+    try:
+        gpu_name = torch.cuda.get_device_name(0).lower()
+    except Exception:
+        return False
+    # Blackwell / RTX 50xx has shown CUDA graph replay hangs in this stack.
+    return not re.search(r"(blackwell|rtx\s*50|5060|5070|5080|5090)", gpu_name)
+
+
+# The CUDA-graph clone path is the practical default on RTX 30/40 GPUs. The
+# important quality fix is non_streaming_mode=True in _generate_voice_clone();
+# without it, short German Base/Clone prompts can repeat or stop early.
+ENABLE_CUDA_GRAPHS = _env_bool("TTS_ENABLE_CUDA_GRAPHS", _default_cuda_graphs_enabled())
+CUDA_GRAPH_MODELS = {"1.7b-base"} if ENABLE_CUDA_GRAPHS else set()
 
 # ---------------------------------------------------------------------------
 # State
@@ -99,6 +144,7 @@ voice_prompts: dict = {}       # legacy compat — kept for health endpoint
 voice_refs: dict = {}          # {voice_id: {"ref_audio": path, "ref_text": str}}
 last_used: float = 0.0
 model_lock = threading.Lock()
+inference_lock = threading.Lock()
 active_requests: int = 0       # concurrent inference counter
 idle_timer: Optional[threading.Timer] = None
 
@@ -160,14 +206,15 @@ def _trim_silence(audio: np.ndarray, sr: int, threshold: float = 0.03, tail_sile
 def _generate_voice_clone(text: str, language: str, ref_audio: str, ref_text: str,
                           max_new_tokens: int = 800) -> tuple:
     """Generate voice clone using CUDA graphs (fast) or fallback (compatible)."""
-    if use_cuda_graphs:
-        return model.generate_voice_clone(
-            text=text, language=language,
-            ref_audio=ref_audio, ref_text=ref_text,
-            max_new_tokens=max_new_tokens,
-            repetition_penalty=1.05,
-        )
-    else:
+    with inference_lock:
+        if use_cuda_graphs:
+            return model.generate_voice_clone(
+                text=text, language=language,
+                ref_audio=ref_audio, ref_text=ref_text,
+                max_new_tokens=max_new_tokens,
+                non_streaming_mode=True,
+                repetition_penalty=1.05,
+            )
         return model.model.generate_voice_clone(
             text=text, language=language,
             ref_audio=ref_audio, ref_text=ref_text,
@@ -176,6 +223,29 @@ def _generate_voice_clone(text: str, language: str, ref_audio: str, ref_text: st
             eos_token_id=[2150, 2157],
             repetition_penalty=1.05,
         )
+
+
+def _sanitize_ref_text(ref_text: str | None) -> str:
+    """Remove ASR control prefixes before using text as a clone reference."""
+    text = (ref_text or "").strip()
+    text = re.sub(r"^\s*language\s+[A-Za-z]+\s*<asr_text>\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^\s*<asr_text>\s*", "", text, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _write_metadata(meta_file: Path, meta: dict) -> None:
+    meta_file.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+
+def _convert_audio_bytes_to_wav(audio_bytes: bytes, audio_path: Path) -> None:
+    result = subprocess.run(
+        ["ffmpeg", "-y", "-i", "pipe:0", "-ar", "24000", "-ac", "1", str(audio_path)],
+        input=audio_bytes,
+        capture_output=True,
+        timeout=300,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.decode(errors="replace")[:500])
 
 
 def _load_all_voice_refs():
@@ -187,15 +257,23 @@ def _load_all_voice_refs():
     for voice_dir in sorted(VOICES_DIR.iterdir()):
         if not voice_dir.is_dir():
             continue
+        if not VOICE_ID_RE.fullmatch(voice_dir.name):
+            print(f"  Skipping unsafe voice directory '{voice_dir.name}'", flush=True)
+            continue
         ref_audio = voice_dir / "ref_audio.wav"
         meta_file = voice_dir / "metadata.json"
         if not ref_audio.exists() or not meta_file.exists():
             continue
-        meta = json.loads(meta_file.read_text())
+        meta = json.loads(meta_file.read_text(encoding="utf-8"))
+        ref_text = _sanitize_ref_text(meta.get("ref_text", ""))
+        if ref_text != (meta.get("ref_text", "") or ""):
+            meta["ref_text"] = ref_text
+            _write_metadata(meta_file, meta)
+            print(f"  Sanitized ref_text for voice '{voice_dir.name}'", flush=True)
         vid = voice_dir.name
         voice_refs[vid] = {
             "ref_audio": str(ref_audio),
-            "ref_text": meta.get("ref_text", ""),
+            "ref_text": ref_text,
         }
         voice_prompts[vid] = True  # for health endpoint compat
         print(f"  Indexed voice '{vid}'", flush=True)
@@ -226,6 +304,14 @@ def ensure_model(model_id: str | None = None):
     if target not in AVAILABLE_MODELS:
         raise ValueError(f"Unknown model: {target}")
     with model_lock:
+        if (
+            model is not None
+            and current_model_id != target
+            and active_requests > 0
+        ):
+            raise RuntimeError(
+                f"Model {current_model_id} is busy; cannot switch to {target}"
+            )
         if model is None or current_model_id != target:
             if model is not None:
                 _do_unload_model()
@@ -264,7 +350,7 @@ def _init_default_voice():
         "source": "clone",
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
-    (voice_dir / "metadata.json").write_text(json.dumps(meta, indent=2))
+    _write_metadata(voice_dir / "metadata.json", meta)
     print("Initialized default voice from baked-in ref audio", flush=True)
 
 
@@ -272,6 +358,11 @@ def _init_default_voice():
 # Audio encoding
 # ---------------------------------------------------------------------------
 def audio_to_format(audio: np.ndarray, sr: int, fmt: str) -> tuple[bytes, str]:
+    if fmt not in SUPPORTED_OUTPUT_FORMATS:
+        raise ValueError(
+            f"Unsupported response_format {fmt!r}. "
+            f"Allowed: {sorted(SUPPORTED_OUTPUT_FORMATS)}"
+        )
     buf = io.BytesIO()
     if fmt == "flac":
         sf.write(buf, audio, sr, format="FLAC")
@@ -298,6 +389,16 @@ def audio_to_format(audio: np.ndarray, sr: int, fmt: str) -> tuple[bytes, str]:
 
     buf.seek(0)
     return buf.read(), "audio/wav"
+
+
+def _validate_response_format(fmt: str) -> str:
+    normalized = (fmt or "wav").strip().lower()
+    if normalized not in SUPPORTED_OUTPUT_FORMATS:
+        raise HTTPException(
+            400,
+            f"response_format must be one of: {', '.join(sorted(SUPPORTED_OUTPUT_FORMATS))}",
+        )
+    return normalized
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +432,8 @@ async def health():
         "voices_loaded": list(voice_prompts.keys()),
         "languages": SUPPORTED_LANGUAGES,
         "idle_timeout": IDLE_TIMEOUT,
+        "cuda_graphs_enabled": ENABLE_CUDA_GRAPHS,
+        "cuda_graph_models": sorted(CUDA_GRAPH_MODELS),
     }
 
 
@@ -386,6 +489,15 @@ async def load_model_endpoint(request: ModelLoadRequest):
         raise HTTPException(400, f"Unknown model. Available: {list(AVAILABLE_MODELS.keys())}")
     t0 = time.time()
     with model_lock:
+        if (
+            model is not None
+            and current_model_id != request.model_id
+            and active_requests > 0
+        ):
+            raise HTTPException(
+                409,
+                f"Model {current_model_id} is busy; cannot switch to {request.model_id}",
+            )
         if model is not None and current_model_id != request.model_id:
             _do_unload_model()
         if model is None:
@@ -426,22 +538,23 @@ async def register_voice(
     ref_audio: UploadFile = File(...),
 ):
     """Register a new voice from reference audio + transcription."""
-    voice_dir = VOICES_DIR / voice_id
+    ref_text = _sanitize_ref_text(ref_text)
+    voice_dir = _voice_dir_for(voice_id)
     voice_dir.mkdir(parents=True, exist_ok=True)
 
     audio_path = voice_dir / "ref_audio.wav"
-    audio_bytes = await ref_audio.read()
+    audio_bytes = await _read_upload_limited(
+        ref_audio, MAX_VOICE_UPLOAD_BYTES, "Reference audio"
+    )
 
     # Convert to WAV if needed
     if ref_audio.filename and not ref_audio.filename.lower().endswith(".wav"):
-        result = subprocess.run(
-            ["ffmpeg", "-y", "-i", "pipe:0", "-ar", "24000", "-ac", "1", str(audio_path)],
-            input=audio_bytes, capture_output=True,
-        )
-        if result.returncode != 0:
-            raise HTTPException(500, f"Audio conversion failed: {result.stderr.decode()}")
+        try:
+            await asyncio.to_thread(_convert_audio_bytes_to_wav, audio_bytes, audio_path)
+        except Exception as exc:
+            raise HTTPException(500, f"Audio conversion failed: {exc}") from exc
     else:
-        audio_path.write_bytes(audio_bytes)
+        await asyncio.to_thread(audio_path.write_bytes, audio_bytes)
 
     meta = {
         "name": name or voice_id,
@@ -450,7 +563,7 @@ async def register_voice(
         "source": "clone",
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
-    (voice_dir / "metadata.json").write_text(json.dumps(meta, indent=2))
+    await asyncio.to_thread(_write_metadata, voice_dir / "metadata.json", meta)
 
     # Index the voice ref for generation
     voice_refs[voice_id] = {"ref_audio": str(audio_path), "ref_text": ref_text}
@@ -469,12 +582,15 @@ async def register_designed_voice(
     ref_audio: UploadFile = File(...),
 ):
     """Register a voice from audio generated by the Voice Designer."""
-    voice_dir = VOICES_DIR / voice_id
+    ref_text = _sanitize_ref_text(ref_text)
+    voice_dir = _voice_dir_for(voice_id)
     voice_dir.mkdir(parents=True, exist_ok=True)
 
     audio_path = voice_dir / "ref_audio.wav"
-    audio_bytes = await ref_audio.read()
-    audio_path.write_bytes(audio_bytes)
+    audio_bytes = await _read_upload_limited(
+        ref_audio, MAX_VOICE_UPLOAD_BYTES, "Reference audio"
+    )
+    await asyncio.to_thread(audio_path.write_bytes, audio_bytes)
 
     meta = {
         "name": name or voice_id,
@@ -484,7 +600,7 @@ async def register_designed_voice(
         "design_prompt": design_prompt,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
-    (voice_dir / "metadata.json").write_text(json.dumps(meta, indent=2))
+    await asyncio.to_thread(_write_metadata, voice_dir / "metadata.json", meta)
 
     # Index the voice ref for generation
     voice_refs[voice_id] = {"ref_audio": str(audio_path), "ref_text": ref_text}
@@ -495,7 +611,7 @@ async def register_designed_voice(
 
 @app.delete("/v1/voices/{voice_id}")
 async def delete_voice(voice_id: str):
-    voice_dir = VOICES_DIR / voice_id
+    voice_dir = _voice_dir_for(voice_id)
     if not voice_dir.exists():
         raise HTTPException(404, "Voice not found")
     shutil.rmtree(voice_dir)
@@ -507,10 +623,10 @@ async def delete_voice(voice_id: str):
 @app.get("/v1/voices/{voice_id}/audio")
 async def get_voice_audio(voice_id: str):
     """Return the reference audio for a voice."""
-    audio_path = VOICES_DIR / voice_id / "ref_audio.wav"
+    audio_path = _voice_dir_for(voice_id) / "ref_audio.wav"
     if not audio_path.exists():
         raise HTTPException(404, "Voice audio not found")
-    return Response(content=audio_path.read_bytes(), media_type="audio/wav")
+    return FileResponse(audio_path, media_type="audio/wav")
 
 
 # ---- Speech Generation ----------------------------------------------------
@@ -593,10 +709,17 @@ def _split_text_to_chunks(text: str) -> list[str]:
     return final if final else [text]
 
 
+def _clone_token_limit(text: str, override: int | None = None) -> int:
+    if override is not None:
+        return override
+    return min(800, max(180, int(len(text) * 2.0)))
+
+
 @app.post("/v1/audio/speech")
 async def create_speech(request: SpeechRequest):
     if not request.input.strip():
         raise HTTPException(400, "Input text is empty")
+    response_format = _validate_response_format(request.response_format)
 
     target_model = request.model_id or current_model_id or DEFAULT_MODEL
     if AVAILABLE_MODELS.get(target_model, {}).get("type") != "base":
@@ -627,7 +750,7 @@ async def create_speech(request: SpeechRequest):
     n_chunks = len(chunks)
     vref = voice_refs[voice_id]
 
-    global active_requests
+    global active_requests, last_used
     with model_lock:
         if model is None:
             raise HTTPException(503, "Model not ready")
@@ -644,7 +767,7 @@ async def create_speech(request: SpeechRequest):
 
             for i, chunk in enumerate(chunks):
                 chunk_len = len(chunk)
-                token_limit = request.max_new_tokens or min(800, max(150, int(chunk_len * 1.5)))
+                token_limit = _clone_token_limit(chunk, request.max_new_tokens)
                 print(f"[chunk {i+1}/{n_chunks}] {chunk_len} chars → {token_limit} tokens: "
                       f"{chunk[:60]}{'…' if len(chunk) > 60 else ''}", flush=True)
                 wavs, sr = _generate_voice_clone(
@@ -674,8 +797,11 @@ async def create_speech(request: SpeechRequest):
         with model_lock:
             active_requests -= 1
             last_used = time.time()
+        _schedule_unload()
 
-    audio_bytes, content_type = audio_to_format(audio, sr, request.response_format)
+    audio_bytes, content_type = await asyncio.to_thread(
+        audio_to_format, audio, sr, response_format
+    )
     return Response(
         content=audio_bytes, media_type=content_type,
         headers={
@@ -697,6 +823,9 @@ async def create_speech_stream(request: SpeechRequest):
     base64-encoded WAV event as soon as it's generated."""
     if not request.input.strip():
         raise HTTPException(400, "Input text is empty")
+    response_format = _validate_response_format(request.response_format)
+    if response_format != "wav":
+        raise HTTPException(400, "Streaming speech returns base64 WAV chunks; use response_format='wav'")
 
     target_model = request.model_id or current_model_id or DEFAULT_MODEL
     if AVAILABLE_MODELS.get(target_model, {}).get("type") != "base":
@@ -726,28 +855,35 @@ async def create_speech_stream(request: SpeechRequest):
     n_chunks = len(chunks)
     vref = voice_refs[voice_id]
 
+    global active_requests, last_used
+    with model_lock:
+        if model is None:
+            raise HTTPException(503, "Model not ready")
+        active_requests += 1
+
     def _gen_chunk(i: int, chunk: str, token_limit: int):
-        """Run one chunk generation under model_lock (called from executor)."""
+        """Run one chunk generation in an executor thread."""
         with model_lock:
             if model is None:
                 raise RuntimeError("Model not ready")
-            return _generate_voice_clone(
-                text=chunk, language=language,
-                ref_audio=vref["ref_audio"],
-                ref_text=vref["ref_text"],
-                max_new_tokens=token_limit,
-            )
+        return _generate_voice_clone(
+            text=chunk, language=language,
+            ref_audio=vref["ref_audio"],
+            ref_text=vref["ref_text"],
+            max_new_tokens=token_limit,
+        )
 
     async def generate_sse():
+        global active_requests, last_used
         t0 = time.time()
         total_audio_dur = 0.0
         sr = 24000
         loop = asyncio.get_event_loop()
 
-        for i, chunk in enumerate(chunks):
-            try:
+        try:
+            for i, chunk in enumerate(chunks):
                 chunk_len = len(chunk)
-                token_limit = request.max_new_tokens or min(800, max(150, int(chunk_len * 1.5)))
+                token_limit = _clone_token_limit(chunk, request.max_new_tokens)
                 print(f"[stream chunk {i+1}/{n_chunks}] {chunk_len} chars → {token_limit} tokens", flush=True)
 
                 # Run generation in executor — keeps CUDA context stable
@@ -773,25 +909,29 @@ async def create_speech_stream(request: SpeechRequest):
                     "text": chunk[:80],
                 }
                 yield f"event: chunk\ndata: {json.dumps(event_data)}\n\n"
-            except Exception as e:
-                yield f"event: error\ndata: {json.dumps({'error': str(e), 'chunk': i})}\n\n"
-                return
 
-        gen_time = time.time() - t0
-        rtf = gen_time / total_audio_dur if total_audio_dur > 0 else 0
-        cg = "CG" if use_cuda_graphs else "fallback"
-        print(f"[stream/{voice_id}] {total_audio_dur:.1f}s in {gen_time:.1f}s "
-              f"(RTF {rtf:.2f}x) chunks={n_chunks} [{cg}]", flush=True)
+            gen_time = time.time() - t0
+            rtf = gen_time / total_audio_dur if total_audio_dur > 0 else 0
+            cg = "CG" if use_cuda_graphs else "fallback"
+            print(f"[stream/{voice_id}] {total_audio_dur:.1f}s in {gen_time:.1f}s "
+                  f"(RTF {rtf:.2f}x) chunks={n_chunks} [{cg}]", flush=True)
 
-        done_data = {
-            "total_duration": round(total_audio_dur, 2),
-            "generation_time": round(gen_time, 2),
-            "rtf": round(rtf, 4),
-            "model": current_model_id or "",
-            "voice": voice_id,
-            "chunks": n_chunks,
-        }
-        yield f"event: done\ndata: {json.dumps(done_data)}\n\n"
+            done_data = {
+                "total_duration": round(total_audio_dur, 2),
+                "generation_time": round(gen_time, 2),
+                "rtf": round(rtf, 4),
+                "model": current_model_id or "",
+                "voice": voice_id,
+                "chunks": n_chunks,
+            }
+            yield f"event: done\ndata: {json.dumps(done_data)}\n\n"
+        except Exception as e:
+            yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+        finally:
+            with model_lock:
+                active_requests -= 1
+                last_used = time.time()
+            _schedule_unload()
 
     return StreamingResponse(generate_sse(), media_type="text/event-stream")
 
@@ -820,30 +960,51 @@ async def design_voice(request: DesignRequest):
         raise HTTPException(400, "Text is empty")
     if not request.description.strip():
         raise HTTPException(400, "Voice description is empty")
+    response_format = _validate_response_format(request.response_format)
 
     ensure_model("1.7b-design")
 
+    global active_requests, last_used
     with model_lock:
         if model is None:
             raise HTTPException(503, "Model not ready")
-        try:
-            t0 = time.time()
-            text_len = len(request.text.strip())
-            token_limit = request.max_new_tokens or min(800, max(150, int(text_len * 1.5)))
-            wavs, sr = model.model.generate_voice_design(
-                text=request.text, language=request.language,
-                instruct=request.description, max_new_tokens=token_limit,
-                eos_token_id=[2150, 2157],
-                repetition_penalty=1.05,
-            )
-            gen_time = time.time() - t0
-            audio = wavs[0]
-            audio_dur = len(audio) / sr
-            print(f"[design/{request.language}] {audio_dur:.1f}s in {gen_time:.1f}s", flush=True)
-        except Exception as e:
-            raise HTTPException(500, f"Voice design failed: {e}")
+        active_requests += 1
+    try:
+        t0 = time.time()
+        text_len = len(request.text.strip())
+        token_limit = request.max_new_tokens or min(800, max(150, int(text_len * 1.5)))
+        loop = asyncio.get_event_loop()
 
-    audio_bytes, content_type = audio_to_format(audio, sr, request.response_format)
+        def _gen():
+            with inference_lock:
+                return model.model.generate_voice_design(
+                    text=request.text,
+                    language=request.language,
+                    instruct=request.description,
+                    max_new_tokens=token_limit,
+                    eos_token_id=[2150, 2157],
+                    repetition_penalty=1.05,
+                )
+
+        wavs, sr = await loop.run_in_executor(None, _gen)
+        gen_time = time.time() - t0
+        audio = wavs[0]
+        audio_dur = len(audio) / sr
+        print(f"[design/{request.language}] {audio_dur:.1f}s in {gen_time:.1f}s", flush=True)
+    except Exception as e:
+        raise HTTPException(500, f"Voice design failed: {e}")
+    finally:
+        try:
+            with model_lock:
+                active_requests -= 1
+                last_used = time.time()
+            _schedule_unload()
+        except Exception:
+            pass
+
+    audio_bytes, content_type = await asyncio.to_thread(
+        audio_to_format, audio, sr, response_format
+    )
     return Response(
         content=audio_bytes, media_type=content_type,
         headers={
@@ -876,10 +1037,11 @@ async def custom_voice(request: CustomVoiceRequest):
             f"Unknown speaker {request.speaker!r}. "
             f"Available: {sorted(BUILTIN_SPEAKER_IDS)}",
         )
+    response_format = _validate_response_format(request.response_format)
 
     ensure_model("1.7b-custom")
 
-    global active_requests
+    global active_requests, last_used
     with model_lock:
         if model is None:
             raise HTTPException(503, "Model not ready")
@@ -902,7 +1064,8 @@ async def custom_voice(request: CustomVoiceRequest):
         # Run blocking inference in executor to avoid blocking the event loop
         loop = asyncio.get_event_loop()
         def _gen():
-            return model.model.generate_custom_voice(**kwargs)
+            with inference_lock:
+                return model.model.generate_custom_voice(**kwargs)
         wavs, sr = await loop.run_in_executor(None, _gen)
         gen_time = time.time() - t0
         audio = wavs[0]
@@ -919,8 +1082,11 @@ async def custom_voice(request: CustomVoiceRequest):
         with model_lock:
             active_requests -= 1
             last_used = time.time()
+        _schedule_unload()
 
-    audio_bytes, content_type = audio_to_format(audio, sr, request.response_format)
+    audio_bytes, content_type = await asyncio.to_thread(
+        audio_to_format, audio, sr, response_format
+    )
     return Response(
         content=audio_bytes, media_type=content_type,
         headers={

@@ -1,8 +1,4 @@
-"""Embedding client — Jina v5-small (or any OpenAI-compatible embedding API).
-
-Ported from PodForge's embeddingService.ts. The base URL already includes
-``/v1/embeddings`` by convention.
-"""
+"""Embedding client — Jina v5-small or any OpenAI-compatible embedding API."""
 
 from __future__ import annotations
 
@@ -10,12 +6,32 @@ import asyncio
 import logging
 import math
 import os
+import time
 from dataclasses import dataclass
 from typing import overload
 
 import httpx
+from metrics import inc, observe
 
 logger = logging.getLogger(__name__)
+_http_client: httpx.AsyncClient | None = None
+
+
+def _client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(
+            limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
+            timeout=None,
+        )
+    return _http_client
+
+
+async def close_embedding_client() -> None:
+    global _http_client
+    if _http_client is not None and not _http_client.is_closed:
+        await _http_client.aclose()
+    _http_client = None
 
 
 @dataclass
@@ -48,16 +64,16 @@ class EmbeddingClient:
     async def health_check(self) -> dict:
         start = asyncio.get_event_loop().time()
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(
-                    self.config.base_url,
-                    headers=self._headers(),
-                    json={"input": ["test"], "model": self.config.model},
-                )
-                latency = int((asyncio.get_event_loop().time() - start) * 1000)
-                if resp.status_code == 200:
-                    return {"healthy": True, "latency": latency}
-                return {"healthy": False, "latency": latency, "error": f"HTTP {resp.status_code}"}
+            resp = await _client().post(
+                self.config.base_url,
+                headers=self._headers(),
+                json={"input": ["test"], "model": self.config.model},
+                timeout=10.0,
+            )
+            latency = int((asyncio.get_event_loop().time() - start) * 1000)
+            if resp.status_code == 200:
+                return {"healthy": True, "latency": latency}
+            return {"healthy": False, "latency": latency, "error": f"HTTP {resp.status_code}"}
         except Exception as exc:
             latency = int((asyncio.get_event_loop().time() - start) * 1000)
             return {"healthy": False, "latency": latency, "error": str(exc)}
@@ -74,38 +90,48 @@ class EmbeddingClient:
 
         last_err: Exception | None = None
         for attempt in range(3):
+            start = time.perf_counter()
+            status = "error"
+            retry_delay: float | None = None
             try:
-                async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
-                    resp = await client.post(
-                        self.config.base_url,
-                        headers=self._headers(),
-                        json=payload,
+                resp = await _client().post(
+                    self.config.base_url,
+                    headers=self._headers(),
+                    json=payload,
+                    timeout=httpx.Timeout(60.0),
+                )
+                status = str(resp.status_code)
+                if resp.status_code != 200:
+                    raise RuntimeError(
+                        f"Embedding request failed: {resp.status_code} {resp.text}"
                     )
-                    if resp.status_code != 200:
-                        raise RuntimeError(
-                            f"Embedding request failed: {resp.status_code} {resp.text}"
+                data = resp.json()
+                items = data.get("data") or []
+                if not items:
+                    raise RuntimeError("No embeddings returned from API")
+
+                items_sorted = sorted(items, key=lambda x: x.get("index", 0))
+                embeddings = [item["embedding"] for item in items_sorted]
+
+                for emb in embeddings:
+                    if len(emb) != self.config.dimensions:
+                        logger.warning(
+                            "Embedding dimension mismatch: expected %d, got %d",
+                            self.config.dimensions,
+                            len(emb),
                         )
-                    data = resp.json()
-                    items = data.get("data") or []
-                    if not items:
-                        raise RuntimeError("No embeddings returned from API")
 
-                    items_sorted = sorted(items, key=lambda x: x.get("index", 0))
-                    embeddings = [item["embedding"] for item in items_sorted]
-
-                    for emb in embeddings:
-                        if len(emb) != self.config.dimensions:
-                            logger.warning(
-                                "Embedding dimension mismatch: expected %d, got %d",
-                                self.config.dimensions,
-                                len(emb),
-                            )
-
-                    return embeddings[0] if single else embeddings
+                return embeddings[0] if single else embeddings
             except Exception as exc:
                 last_err = exc
                 if attempt < 2:
-                    await asyncio.sleep(1.0 * (2**attempt))
+                    retry_delay = 1.0 * (2**attempt)
+            finally:
+                labels = {"status": status, "batch_size": len(texts)}
+                inc("vocarium_embedding_requests_total", labels=labels)
+                observe("vocarium_embedding_seconds", time.perf_counter() - start, labels)
+            if retry_delay is not None:
+                await asyncio.sleep(retry_delay)
         assert last_err is not None
         raise last_err
 

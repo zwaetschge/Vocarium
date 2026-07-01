@@ -29,7 +29,7 @@ export default function ModelSelector() {
         borderRadius: '999px',
         fontSize: '11px',
         fontFamily: 'var(--font-mono)',
-        letterSpacing: '0.01em',
+        letterSpacing: 0,
         color: 'var(--color-text-secondary)',
       }}
     >

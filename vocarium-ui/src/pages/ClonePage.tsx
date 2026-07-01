@@ -332,7 +332,7 @@ export default function ClonePage() {
             fontSize: '24px',
             fontWeight: 600,
             fontFamily: 'var(--font-display)',
-            letterSpacing: '-0.03em',
+            letterSpacing: 0,
             marginBottom: '8px',
             color: 'var(--color-text)',
           }}
@@ -378,7 +378,7 @@ export default function ClonePage() {
             alignItems: 'center',
             justifyContent: 'center',
             textAlign: 'center',
-            borderRadius: '18px',
+            borderRadius: 'var(--radius-panel)',
             borderWidth: '1.5px',
             borderStyle: 'dashed',
             minHeight: file ? 'auto' : '240px',
@@ -420,7 +420,7 @@ export default function ClonePage() {
                   whiteSpace: 'nowrap',
                   color: 'var(--color-text)',
                   maxWidth: '100%',
-                  letterSpacing: '-0.01em',
+                  letterSpacing: 0,
                 }}
               >
                 {file.name}
@@ -430,7 +430,7 @@ export default function ClonePage() {
                   fontSize: '11px',
                   fontFamily: 'var(--font-mono)',
                   color: 'var(--color-text-dim)',
-                  letterSpacing: '0.02em',
+                  letterSpacing: 0,
                 }}
               >
                 {(file.size / 1024).toFixed(1)} KB
@@ -452,7 +452,7 @@ export default function ClonePage() {
                   border: 'none',
                   cursor: 'pointer',
                   padding: '4px 8px',
-                  letterSpacing: '0.02em',
+                  letterSpacing: 0,
                   transition: 'color 0.15s',
                 }}
                 onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--color-danger)'; }}
@@ -479,7 +479,7 @@ export default function ClonePage() {
                   fontWeight: 500,
                   marginBottom: '6px',
                   color: 'var(--color-text)',
-                  letterSpacing: '-0.005em',
+                  letterSpacing: 0,
                 }}
               >
                 Drop audio file here
@@ -520,7 +520,7 @@ export default function ClonePage() {
                       fontSize: '11.5px',
                       fontFamily: 'var(--font-mono)',
                       color: 'var(--color-accent)',
-                      letterSpacing: '0.02em',
+                      letterSpacing: 0,
                     }}
                   >
                     {fmtTime(clipStart)} – {fmtTime(clipEnd)}
@@ -578,7 +578,7 @@ export default function ClonePage() {
                 color: 'var(--color-text-dim)',
                 textAlign: 'center',
                 padding: '4px 0',
-                letterSpacing: '0.02em',
+                letterSpacing: 0,
               }}
             >
               Audio is {fmtTime(totalDuration)} — no trimming needed
@@ -606,7 +606,7 @@ export default function ClonePage() {
             backdropFilter: 'blur(12px)',
             WebkitBackdropFilter: 'blur(12px)',
             transition: 'background 0.15s, border-color 0.15s, color 0.15s',
-            letterSpacing: '-0.005em',
+            letterSpacing: 0,
           }}
         >
           {recording ? (
@@ -640,7 +640,7 @@ export default function ClonePage() {
               fontSize: '11.5px',
               fontWeight: 500,
               color: 'var(--color-text-secondary)',
-              letterSpacing: '0.01em',
+              letterSpacing: 0,
             }}
           >
             Voice name <span style={{ color: 'var(--color-accent)' }}>*</span>
@@ -660,7 +660,7 @@ export default function ClonePage() {
               fontSize: '11.5px',
               fontWeight: 500,
               color: 'var(--color-text-secondary)',
-              letterSpacing: '0.01em',
+              letterSpacing: 0,
             }}
           >
             Language
@@ -759,7 +759,7 @@ export default function ClonePage() {
                 fontSize: '13px',
                 color: 'var(--color-text)',
                 fontWeight: 500,
-                letterSpacing: '-0.005em',
+                letterSpacing: 0,
               }}
             >
               Auto-transcribe reference
@@ -784,7 +784,7 @@ export default function ClonePage() {
                   fontSize: '11.5px',
                   fontWeight: 500,
                   color: 'var(--color-text-secondary)',
-                  letterSpacing: '0.01em',
+                  letterSpacing: 0,
                 }}
               >
                 Reference text
@@ -847,7 +847,7 @@ export default function ClonePage() {
             gap: '10px',
             cursor: cloning || !file || !name.trim() ? 'not-allowed' : 'pointer',
             opacity: cloning || !file || !name.trim() ? 0.45 : 1,
-            letterSpacing: '-0.005em',
+            letterSpacing: 0,
           }}
         >
           {cloning ? (

@@ -137,7 +137,7 @@ export default function AudioPlayer({ playing, progress, duration, onToggle, onS
             flexShrink: 0,
             fontFamily: 'var(--font-mono)',
             color: 'var(--color-text-dim)',
-            letterSpacing: '0.02em',
+            letterSpacing: 0,
           }}
         >
           {formatTime(duration * progress)} / {formatTime(duration)}

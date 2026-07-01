@@ -6,29 +6,59 @@ cloning / design / benchmark workflows.
 """
 
 import asyncio
+import base64
 import io
 import json
 import logging
 import os
+import re
+import shutil
+import socket
 import time
 import uuid
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import aiohttp
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form, Response, Query
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from database import init_db, get_db, get_or_create_user, backfill_hosts_for_all_users
-from gpu_queue import gpu_queue, register_unloaders
+from artifact_cleanup import cleanup_artifacts
+from database import (
+    gpu_queue_quota_decision,
+    get_db,
+    get_gpu_queue_job,
+    get_or_create_user,
+    init_db,
+    is_gpu_queue_cancel_requested,
+    list_gpu_queue_jobs,
+    mark_interrupted_gpu_jobs,
+    request_cancel_gpu_queue_job,
+    upsert_gpu_queue_job,
+    backfill_hosts_for_all_users,
+)
+from gpu_queue import (
+    GpuResourceError,
+    QueueQuotaError,
+    get_resource_status,
+    gpu_queue,
+    register_cancel_checker,
+    register_job_recorder,
+    register_quota_checker,
+    register_unloaders,
+)
+from metrics import inc, observe, render_prometheus
 from podcast.routes import create_podcast_router
+from request_context import request_id_var, user_id_var
+from url_security import URLValidationError, normalize_http_base_url
 
 logger = logging.getLogger(__name__)
 
+API_INSTANCE_ID = os.environ.get("VOCARIUM_INSTANCE_ID") or socket.gethostname()
 TTS_URL = os.environ.get("TTS_URL", "http://qwen3-tts:8880")
 # Optional second TTS replica (set when running with COMPOSE_PROFILES=dual-gpu).
 # Empty/unset means single-GPU mode — all TTS goes through TTS_URL.
@@ -44,8 +74,23 @@ MAX_TRANSCRIBE_UPLOAD_BYTES = int(
     os.environ.get("MAX_TRANSCRIBE_UPLOAD_BYTES", str(500 * 1024 * 1024))
 )
 MAX_TTS_TEXT_CHARS = int(os.environ.get("MAX_TTS_TEXT_CHARS", "20000"))
+MAX_LLM_TEST_BODY_BYTES = int(os.environ.get("MAX_LLM_TEST_BODY_BYTES", str(32 * 1024)))
+MAX_MUSIC_ENHANCE_BODY_BYTES = int(
+    os.environ.get("MAX_MUSIC_ENHANCE_BODY_BYTES", str(64 * 1024))
+)
+TTS_RESPONSE_FORMATS = {"wav", "mp3", "flac", "opus", "aac", "pcm"}
+MUSIC_RESPONSE_FORMATS = {"wav", "mp3", "flac"}
+VOICE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+REQUEST_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
+TRACE_HEADER = "X-Request-ID"
+OPENAI_TTS_DEFAULT_VOICE_PERSONA_ALIASES = {
+    "michael scott",
+    "michaelscott",
+    "michael-scott",
+    "michael_scott",
+}
 
-# `true` allows OpenAI-style endpoints to fall back to a shared "api" user
+# `true` allows local single-user setups to fall back to a shared "api" user
 # when no Remote-User header is present. Disable for multi-user deployments.
 ALLOW_ANONYMOUS = os.environ.get("ALLOW_ANONYMOUS", "true").lower() in ("1", "true", "yes")
 
@@ -57,6 +102,55 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 VOICES_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="Vocarium API")
+_aiohttp_session: aiohttp.ClientSession | None = None
+
+
+def _http_session() -> aiohttp.ClientSession:
+    global _aiohttp_session
+    if _aiohttp_session is None or _aiohttp_session.closed:
+        _aiohttp_session = aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(limit=100, ttl_dns_cache=300)
+        )
+    return _aiohttp_session
+
+
+async def _close_http_session() -> None:
+    global _aiohttp_session
+    if _aiohttp_session is not None and not _aiohttp_session.closed:
+        await _aiohttp_session.close()
+    _aiohttp_session = None
+
+
+@app.exception_handler(GpuResourceError)
+async def gpu_resource_exception_handler(request: Request, exc: GpuResourceError):
+    inc("vocarium_gpu_guard_blocks_total", labels={"service_type": exc.service_type})
+    return JSONResponse(
+        status_code=503,
+        headers={TRACE_HEADER: getattr(request.state, "request_id", "")},
+        content={
+            "error": "gpu_resource_unavailable",
+            "message": str(exc),
+            "service_type": exc.service_type,
+            "decision": exc.decision,
+            "request_id": getattr(request.state, "request_id", None),
+        },
+    )
+
+
+@app.exception_handler(QueueQuotaError)
+async def queue_quota_exception_handler(request: Request, exc: QueueQuotaError):
+    inc("vocarium_gpu_queue_quota_blocks_total", labels={"service_type": exc.service_type})
+    return JSONResponse(
+        status_code=429,
+        headers={TRACE_HEADER: getattr(request.state, "request_id", "")},
+        content={
+            "error": "gpu_queue_quota_exceeded",
+            "message": str(exc),
+            "service_type": exc.service_type,
+            "decision": exc.decision,
+            "request_id": getattr(request.state, "request_id", None),
+        },
+    )
 
 app.add_middleware(
     CORSMiddleware,
@@ -64,22 +158,64 @@ app.add_middleware(
     allow_credentials=CORS_ORIGINS != ["*"],
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["X-Audio-Duration", "X-Generation-Time", "X-RTF", "X-Model", "X-Voice", "X-Chunks"],
+    expose_headers=[
+        "X-Audio-Duration",
+        "X-Generation-Time",
+        "X-RTF",
+        "X-Model",
+        "X-Voice",
+        "X-Chunks",
+        TRACE_HEADER,
+    ],
 )
+
+
+@app.middleware("http")
+async def metrics_middleware(request: Request, call_next):
+    request_id = _request_id_from_headers(request)
+    request.state.request_id = request_id
+    request_token = request_id_var.set(request_id)
+    user_token = user_id_var.set(None)
+    start = time.perf_counter()
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        response.headers[TRACE_HEADER] = request_id
+        return response
+    finally:
+        route = request.scope.get("route")
+        route_path = getattr(route, "path", request.url.path)
+        labels = {
+            "method": request.method,
+            "path": route_path,
+            "status": status_code,
+        }
+        inc("vocarium_http_requests_total", labels=labels)
+        observe("vocarium_http_request_seconds", time.perf_counter() - start, labels)
+        request_id_var.reset(request_token)
+        user_id_var.reset(user_token)
+
+
+def _request_id_from_headers(request: Request) -> str:
+    for header in (TRACE_HEADER, "X-Correlation-ID", "X-Request-Id"):
+        raw = (request.headers.get(header) or "").strip()
+        if raw and REQUEST_ID_RE.fullmatch(raw):
+            return raw
+    return uuid.uuid4().hex
 
 
 # ---------------------------------------------------------------------------
 # Auth: forward-auth via Remote-User / X-Forwarded-User header
 # ---------------------------------------------------------------------------
-def get_current_user(request: Request, allow_anonymous: bool = False) -> dict:
+def get_current_user(request: Request, allow_anonymous: bool = True) -> dict:
     """Extract authenticated user from the upstream identity proxy.
 
     Reads ``Remote-User`` (Authelia) or ``X-Forwarded-User`` (oauth2-proxy etc.).
-    Auto-creates the user on first login. When ``allow_anonymous=True`` AND
-    the global ``ALLOW_ANONYMOUS`` flag is set, requests without a header are
-    routed to a shared ``api`` user — convenient for single-user OpenAI-style
-    integrations (e.g. OpenWebUI). Disable in any multi-user deployment by
-    setting ``ALLOW_ANONYMOUS=false``.
+    Auto-creates the user on first login. When ``ALLOW_ANONYMOUS`` is set,
+    requests without a header are routed to a shared ``api`` user. This keeps
+    local single-user UI/API access usable without an auth proxy. Disable in
+    any multi-user deployment by setting ``ALLOW_ANONYMOUS=false``.
     """
     username = (
         request.headers.get("Remote-User")
@@ -87,10 +223,18 @@ def get_current_user(request: Request, allow_anonymous: bool = False) -> dict:
         or ""
     ).strip()
     if not username and allow_anonymous and ALLOW_ANONYMOUS:
-        return get_or_create_user("api")
+        user = get_or_create_user("api")
+        user_id_var.set(user["id"])
+        request.state.user = user
+        return user
     if not username:
         raise HTTPException(401, "Not authenticated — Remote-User header missing")
-    return get_or_create_user(username)
+    if len(username) > 255 or any(ord(ch) < 32 for ch in username):
+        raise HTTPException(400, "Invalid Remote-User header")
+    user = get_or_create_user(username)
+    user_id_var.set(user["id"])
+    request.state.user = user
+    return user
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +242,30 @@ def get_current_user(request: Request, allow_anonymous: bool = False) -> dict:
 # ---------------------------------------------------------------------------
 def _mb(n_bytes: int) -> int:
     return max(1, n_bytes // (1024 * 1024))
+
+
+def _size_label(n_bytes: int) -> str:
+    if n_bytes >= 1024 * 1024:
+        return f"{_mb(n_bytes)} MB"
+    return f"{max(1, n_bytes // 1024)} KB"
+
+
+def _voice_dir_for(voice_id: str) -> Path:
+    cleaned = (voice_id or "").strip()
+    if not VOICE_ID_RE.fullmatch(cleaned):
+        raise HTTPException(400, "Invalid voice_id")
+    root = VOICES_DIR.resolve()
+    target = (root / cleaned).resolve()
+    if target == root or root not in target.parents:
+        raise HTTPException(400, "Invalid voice_id")
+    return target
+
+
+def _voice_has_audio(voice_id: str) -> bool:
+    try:
+        return (_voice_dir_for(voice_id) / "ref_audio.wav").exists()
+    except HTTPException:
+        return False
 
 
 async def _read_upload_limited(
@@ -112,6 +280,8 @@ async def _read_upload_limited(
 
 
 def _require_text_limit(text: str, field: str = "text") -> None:
+    if not (text or "").strip():
+        raise HTTPException(400, f"{field} is required")
     if len(text) > MAX_TTS_TEXT_CHARS:
         raise HTTPException(
             413,
@@ -119,7 +289,92 @@ def _require_text_limit(text: str, field: str = "text") -> None:
         )
 
 
-def _is_youtube_url(raw_url: str) -> bool:
+def _validate_audio_format(
+    response_format: str,
+    *,
+    allowed: set[str],
+    field: str = "response_format",
+) -> str:
+    fmt = (response_format or "wav").strip().lower()
+    if fmt not in allowed:
+        raise HTTPException(
+            400,
+            f"{field} must be one of: {', '.join(sorted(allowed))}",
+        )
+    return fmt
+
+
+def _sse_event(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _normalize_http_base_url(raw_url: str, field: str = "base_url") -> str:
+    try:
+        return normalize_http_base_url(
+            raw_url,
+            field=field,
+            allow_private_env="LLM_ALLOW_PRIVATE_BASE_URLS",
+            allowed_hosts_env="LLM_ALLOWED_PRIVATE_HOSTS",
+            validate_dns_env="LLM_VALIDATE_BASE_URL_DNS",
+        )
+    except URLValidationError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+def _validate_llm_common(
+    *,
+    name: str | None = None,
+    base_url: str | None = None,
+    model: str | None = None,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+    provider_type: str | None = None,
+    require_name: bool = False,
+    require_base_url: bool = False,
+    require_model: bool = False,
+) -> dict:
+    updates: dict[str, str | float | int] = {}
+    if name is not None:
+        cleaned = name.strip()
+        if not cleaned:
+            raise HTTPException(400, "name is required")
+        updates["name"] = cleaned
+    elif require_name:
+        raise HTTPException(400, "name is required")
+
+    if base_url is not None:
+        updates["base_url"] = _normalize_http_base_url(base_url)
+    elif require_base_url:
+        raise HTTPException(400, "base_url is required")
+
+    if model is not None:
+        cleaned = model.strip()
+        if not cleaned:
+            raise HTTPException(400, "model is required")
+        updates["model"] = cleaned
+    elif require_model:
+        raise HTTPException(400, "model is required")
+
+    if temperature is not None:
+        if temperature < 0 or temperature > 2:
+            raise HTTPException(400, "temperature must be between 0 and 2")
+        updates["temperature"] = temperature
+
+    if max_tokens is not None:
+        if max_tokens < 1 or max_tokens > 262144:
+            raise HTTPException(400, "max_tokens must be between 1 and 262144")
+        updates["max_tokens"] = max_tokens
+
+    if provider_type is not None:
+        cleaned = provider_type.strip().lower()
+        if cleaned not in ("openai", "openai-compatible"):
+            raise HTTPException(400, "provider_type must be openai or openai-compatible")
+        updates["provider_type"] = cleaned
+
+    return updates
+
+
+def _is_supported_media_url(raw_url: str) -> bool:
     parsed = urlparse(raw_url)
     if parsed.scheme not in ("http", "https"):
         return False
@@ -128,6 +383,8 @@ def _is_youtube_url(raw_url: str) -> bool:
         host == "youtu.be"
         or host == "youtube.com"
         or host.endswith(".youtube.com")
+        or host == "vimeo.com"
+        or host.endswith(".vimeo.com")
     )
 
 
@@ -142,27 +399,26 @@ async def _post_unload(
     for attempt in range(attempts):
         try:
             timeout = aiohttp.ClientTimeout(total=30)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(f"{url}/unload") as resp:
-                    if resp.status < 400:
-                        try:
-                            data = await resp.json()
-                        except Exception:
-                            data = {}
-                        if data.get("status") == "busy":
-                            if attempt + 1 < attempts:
-                                await asyncio.sleep(2)
-                                continue
-                            logger.warning(
-                                "%s stayed busy; continuing without unloading", label
-                            )
-                            return
-                        if data.get(loaded_key):
-                            logger.info("Unloaded %s to free shared GPU VRAM", label)
+            async with _http_session().post(f"{url}/unload", timeout=timeout) as resp:
+                if resp.status < 400:
+                    try:
+                        data = await resp.json()
+                    except Exception:
+                        data = {}
+                    if data.get("status") == "busy":
+                        if attempt + 1 < attempts:
+                            await asyncio.sleep(2)
+                            continue
+                        logger.warning(
+                            "%s stayed busy; continuing without unloading", label
+                        )
                         return
-                    body = await resp.text()
-                    logger.warning("%s unload failed (%s): %s", label, resp.status, body[:200])
+                    if data.get(loaded_key):
+                        logger.info("Unloaded %s to free shared GPU VRAM", label)
                     return
+                body = await resp.text()
+                logger.warning("%s unload failed (%s): %s", label, resp.status, body[:200])
+                return
         except Exception as exc:
             logger.debug("%s unload skipped: %s", label, exc)
             return
@@ -197,14 +453,23 @@ async def _unload_sfx():
 async def tts_request(method: str, path: str, *, url: str | None = None, **kwargs) -> tuple[int, dict, bytes]:
     target = url or TTS_URL
     timeout = aiohttp.ClientTimeout(total=600, sock_connect=30, sock_read=600)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.request(method, f"{target}{path}", **kwargs) as resp:
+    start = time.perf_counter()
+    status = 0
+    try:
+        async with _http_session().request(
+            method, f"{target}{path}", timeout=timeout, **kwargs
+        ) as resp:
+            status = resp.status
             body = await resp.read()
             # Normalize header keys to exact case for X- headers
             headers = {}
             for k, v in resp.headers.items():
                 headers[k] = v
             return resp.status, headers, body
+    finally:
+        labels = {"path": path, "status": status or "error"}
+        inc("vocarium_tts_requests_total", labels=labels)
+        observe("vocarium_tts_inference_seconds", time.perf_counter() - start, labels)
 
 
 async def tts_json(method: str, path: str, **kwargs) -> dict:
@@ -258,18 +523,74 @@ async def auth_me(request: Request):
 @app.get("/api/queue/status")
 async def queue_status(request: Request):
     """Return current GPU queue state."""
-    get_current_user(request)
-    return gpu_queue.get_status()
+    user = get_current_user(request)
+    return gpu_queue.get_status(user_id=user["id"])
+
+
+@app.get("/api/queue/jobs")
+async def queue_jobs(request: Request, limit: int = 50):
+    """Return recent persisted GPU queue jobs, including interrupted jobs."""
+    user = get_current_user(request)
+    return {"jobs": list_gpu_queue_jobs(limit, user_id=user["id"])}
 
 
 @app.get("/api/queue/status/{job_id}")
 async def queue_job_status(job_id: str, request: Request):
     """Return status of a specific queued job."""
-    get_current_user(request)
-    info = gpu_queue.get_job_status(job_id)
+    user = get_current_user(request)
+    info = gpu_queue.get_job_status(job_id, user_id=user["id"])
+    if not info:
+        info = get_gpu_queue_job(job_id, user_id=user["id"])
     if not info:
         raise HTTPException(404, "Job not found")
     return info
+
+
+@app.post("/api/queue/jobs/{job_id}/cancel")
+async def cancel_queue_job(job_id: str, request: Request):
+    """Request cancellation for one of the caller's queued/running GPU jobs."""
+    user = get_current_user(request)
+    info = gpu_queue.cancel_job(job_id, user_id=user["id"])
+    if not info:
+        info = request_cancel_gpu_queue_job(job_id, user_id=user["id"])
+    if not info:
+        raise HTTPException(404, "Job not found")
+    return info
+
+
+@app.get("/api/resources/status")
+async def resources_status(request: Request):
+    """Return gputasks-backed GPU guard decisions for each service."""
+    get_current_user(request, allow_anonymous=True)
+    return await get_resource_status()
+
+
+@app.get("/api/metrics")
+async def metrics(request: Request):
+    """Return process metrics in Prometheus text format."""
+    get_current_user(request, allow_anonymous=True)
+    return Response(content=render_prometheus(), media_type="text/plain; version=0.0.4")
+
+
+@app.post("/api/admin/artifacts/cleanup")
+async def admin_artifact_cleanup(
+    request: Request,
+    dry_run: bool = Query(True),
+    max_age_hours: float = Query(24.0, ge=0.0, le=24 * 365),
+):
+    """Sweep orphaned local generated artifacts.
+
+    ``dry_run=true`` reports candidates without deleting them.
+    """
+    get_current_user(request)
+    return await asyncio.to_thread(
+        cleanup_artifacts,
+        get_db(),
+        DATA_DIR,
+        VOICES_DIR,
+        max_age_hours=max_age_hours,
+        dry_run=dry_run,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +599,16 @@ async def queue_job_status(job_id: str, request: Request):
 @app.on_event("startup")
 async def startup():
     init_db(DATA_DIR / "vocarium.db")
+    interrupted = mark_interrupted_gpu_jobs(worker_id=API_INSTANCE_ID)
+    if interrupted:
+        logger.warning("Marked %d persisted GPU queue job(s) as interrupted", interrupted)
+    def record_gpu_job(job: dict) -> None:
+        job["worker_id"] = API_INSTANCE_ID
+        upsert_gpu_queue_job(job)
+
+    register_job_recorder(record_gpu_job)
+    register_quota_checker(gpu_queue_quota_decision)
+    register_cancel_checker(is_gpu_queue_cancel_requested)
     # Backfill preset hosts for existing users (idempotent)
     backfill = backfill_hosts_for_all_users()
     if backfill:
@@ -306,6 +637,25 @@ async def startup():
     logger.info("Vocarium API ready (GPU queue active)")
 
 
+@app.on_event("shutdown")
+async def shutdown():
+    await _close_http_session()
+    try:
+        await audio_assembler.aclose()
+    except Exception as exc:
+        logger.debug("Podcast client shutdown skipped: %s", exc)
+    try:
+        from podcast.docling_client import close_docling_client
+        from podcast.embedding_client import close_embedding_client
+        from podcast.llm_client import close_llm_clients
+
+        await close_docling_client()
+        await close_embedding_client()
+        await close_llm_clients()
+    except Exception as exc:
+        logger.debug("HTTPX client shutdown skipped: %s", exc)
+
+
 async def _sync_voices_from_tts():
     """Ensure all voices in the shared volume are tracked in SQLite."""
     db = get_db()
@@ -314,6 +664,9 @@ async def _sync_voices_from_tts():
         if not voice_dir.is_dir():
             continue
         vid = voice_dir.name
+        if not VOICE_ID_RE.fullmatch(vid):
+            logger.warning("Skipping unsafe voice directory during sync: %s", vid)
+            continue
         if vid in existing_ids:
             continue
         meta_file = voice_dir / "metadata.json"
@@ -353,7 +706,12 @@ class SwitchModelRequest(BaseModel):
 @app.post("/api/models/switch")
 async def switch_model(req: SwitchModelRequest, request: Request):
     get_current_user(request)
-    return await tts_json("POST", "/v1/models/load", json={"model_id": req.model_id})
+
+    async def work():
+        return await tts_json("POST", "/v1/models/load", json={"model_id": req.model_id})
+
+    _, future = await gpu_queue.submit("tts", f"Switch TTS model to {req.model_id}", work)
+    return await future
 
 
 # ---------------------------------------------------------------------------
@@ -374,7 +732,7 @@ async def list_voices(request: Request):
             "id": r[0], "name": r[1], "language": r[2], "source": r[3],
             "design_prompt": r[4], "ref_text": r[5],
             "speaker": r[6], "instruct": r[7], "created_at": r[8],
-            "has_audio": (VOICES_DIR / r[0] / "ref_audio.wav").exists(),
+            "has_audio": _voice_has_audio(r[0]),
         })
     return {"voices": voices}
 
@@ -394,7 +752,7 @@ async def get_voice(voice_id: str, request: Request):
         "id": r[0], "name": r[1], "language": r[2], "source": r[3],
         "design_prompt": r[4], "ref_text": r[5],
         "speaker": r[6], "instruct": r[7], "created_at": r[8],
-        "has_audio": (VOICES_DIR / r[0] / "ref_audio.wav").exists(),
+        "has_audio": _voice_has_audio(r[0]),
     }
 
 
@@ -405,6 +763,10 @@ async def delete_voice(voice_id: str, request: Request):
     r = db.execute("SELECT id FROM voices WHERE id=? AND user_id=?", (voice_id, user["id"])).fetchone()
     if not r:
         raise HTTPException(404, "Voice not found")
+    db.execute(
+        "UPDATE hosts SET voice_id=NULL, updated_at=? WHERE user_id=? AND voice_id=?",
+        (time.strftime("%Y-%m-%dT%H:%M:%SZ"), user["id"], voice_id),
+    )
     db.execute("DELETE FROM voices WHERE id=? AND user_id=?", (voice_id, user["id"]))
     db.commit()
     # Tell TTS to remove cached prompt
@@ -422,10 +784,10 @@ async def get_voice_audio(voice_id: str, request: Request):
     r = db.execute("SELECT id FROM voices WHERE id=? AND user_id=?", (voice_id, user["id"])).fetchone()
     if not r:
         raise HTTPException(404, "Voice not found")
-    audio_path = VOICES_DIR / voice_id / "ref_audio.wav"
+    audio_path = _voice_dir_for(voice_id) / "ref_audio.wav"
     if not audio_path.exists():
         raise HTTPException(404, "Audio not found")
-    return Response(content=audio_path.read_bytes(), media_type="audio/wav")
+    return FileResponse(audio_path, media_type="audio/wav")
 
 
 # ---------------------------------------------------------------------------
@@ -436,8 +798,10 @@ async def _register_voice_on_tts(
     audio_bytes: bytes, *, endpoint: str = "/v1/voices/register",
     design_prompt: str | None = None,
 ):
-    """Register a voice on the TTS service."""
-    try:
+    """Register a voice on every configured TTS service."""
+    urls = [TTS_URL, *EXTRA_TTS_URLS]
+
+    for url in urls:
         form = aiohttp.FormData()
         form.add_field("voice_id", voice_id)
         form.add_field("ref_text", ref_text)
@@ -447,11 +811,30 @@ async def _register_voice_on_tts(
             form.add_field("design_prompt", design_prompt)
         form.add_field("ref_audio", audio_bytes,
                        filename="ref_audio.wav", content_type="audio/wav")
-        status, _, body = await tts_request("POST", endpoint, url=TTS_URL, data=form)
-        if status >= 400:
-            logger.warning("TTS registration warning: %s", body.decode(errors="replace"))
-    except Exception as e:
-        logger.warning("TTS registration failed: %s", e)
+        try:
+            status, _, body = await tts_request("POST", endpoint, url=url, data=form)
+            if status >= 400:
+                logger.warning(
+                    "TTS registration warning on %s: %s",
+                    url,
+                    body.decode(errors="replace"),
+                )
+        except Exception as e:
+            logger.warning("TTS registration failed on %s: %s", url, e)
+
+
+def _convert_reference_audio_to_wav(audio_bytes: bytes, audio_path: Path) -> None:
+    import subprocess
+
+    result = subprocess.run(
+        ["ffmpeg", "-y", "-i", "pipe:0", "-ar", "24000", "-ac", "1", str(audio_path)],
+        input=audio_bytes,
+        capture_output=True,
+        timeout=300,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode(errors="replace")[:500]
+        raise RuntimeError(detail or "ffmpeg conversion failed")
 
 
 # ---------------------------------------------------------------------------
@@ -468,80 +851,93 @@ async def clone_voice(
 ):
     """Clone a voice from reference audio."""
     user = get_current_user(request)
+    name = name.strip()
+    language = language.strip() or "German"
+    if not name:
+        raise HTTPException(400, "name is required")
     voice_id = str(uuid.uuid4())[:8]
-    voice_dir = VOICES_DIR / voice_id
+    voice_dir = _voice_dir_for(voice_id)
     voice_dir.mkdir(parents=True, exist_ok=True)
-
-    audio_bytes = await _read_upload_limited(
-        ref_audio, MAX_VOICE_UPLOAD_BYTES, "Reference audio"
-    )
-    audio_path = voice_dir / "ref_audio.wav"
-
-    # Convert to WAV
-    if ref_audio.filename and not ref_audio.filename.lower().endswith(".wav"):
-        import subprocess
-        result = subprocess.run(
-            ["ffmpeg", "-y", "-i", "pipe:0", "-ar", "24000", "-ac", "1", str(audio_path)],
-            input=audio_bytes, capture_output=True,
+    try:
+        audio_bytes = await _read_upload_limited(
+            ref_audio, MAX_VOICE_UPLOAD_BYTES, "Reference audio"
         )
-        if result.returncode != 0:
-            raise HTTPException(500, f"Audio conversion failed")
-    else:
-        audio_path.write_bytes(audio_bytes)
+        audio_path = voice_dir / "ref_audio.wav"
 
-    # Auto-transcribe if no ref_text provided (always attempt as fallback)
-    if not ref_text.strip():
-        try:
-            ref_text = await _transcribe_audio(audio_path)
-        except Exception as e:
-            logger.warning("Auto-transcription failed: %s", e)
-            ref_text = ""
+        # Convert to WAV without blocking the FastAPI event loop.
+        if ref_audio.filename and not ref_audio.filename.lower().endswith(".wav"):
+            try:
+                await asyncio.to_thread(
+                    _convert_reference_audio_to_wav, audio_bytes, audio_path
+                )
+            except Exception as exc:
+                raise HTTPException(400, f"Audio conversion failed: {exc}")
+        else:
+            await asyncio.to_thread(audio_path.write_bytes, audio_bytes)
 
-    if not ref_text.strip():
-        raise HTTPException(400, "Reference text is required and auto-transcription failed")
+        # Auto-transcribe if no ref_text provided (always attempt as fallback)
+        if not ref_text.strip():
+            try:
+                ref_text = await _transcribe_audio(audio_path)
+            except Exception as e:
+                logger.warning("Auto-transcription failed: %s", e)
+                ref_text = ""
 
-    # Save metadata
-    meta = {
-        "name": name,
-        "ref_text": ref_text,
-        "language": language,
-        "source": "clone",
-        "user_id": user["id"],
-        "username": user["username"],
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-    }
-    (voice_dir / "metadata.json").write_text(json.dumps(meta, indent=2))
+        ref_text = ref_text.strip()
+        if not ref_text:
+            raise HTTPException(400, "Reference text is required and auto-transcription failed")
 
-    # Register on all TTS instances (GPU 0 + GPU 1 fallback)
-    await _register_voice_on_tts(
-        voice_id, name, language, ref_text, audio_path.read_bytes(),
-    )
+        # Save metadata
+        meta = {
+            "name": name,
+            "ref_text": ref_text,
+            "language": language,
+            "source": "clone",
+            "user_id": user["id"],
+            "username": user["username"],
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        await asyncio.to_thread(
+            (voice_dir / "metadata.json").write_text,
+            json.dumps(meta, indent=2),
+        )
 
-    # Save to DB
-    db = get_db()
-    db.execute(
-        "INSERT INTO voices (id, user_id, name, language, source, ref_text, created_at) VALUES (?,?,?,?,?,?,?)",
-        (voice_id, user["id"], name, language, "clone", ref_text, meta["created_at"]),
-    )
-    db.commit()
+        # Register on all TTS instances (GPU 0 + GPU 1 fallback)
+        registered_audio = await asyncio.to_thread(audio_path.read_bytes)
+        await _register_voice_on_tts(
+            voice_id, name, language, ref_text, registered_audio,
+        )
 
-    return {"status": "created", "voice_id": voice_id, "name": name}
+        # Save to DB
+        db = get_db()
+        db.execute(
+            "INSERT INTO voices (id, user_id, name, language, source, ref_text, created_at) VALUES (?,?,?,?,?,?,?)",
+            (voice_id, user["id"], name, language, "clone", ref_text, meta["created_at"]),
+        )
+        db.commit()
+
+        return {"status": "created", "voice_id": voice_id, "name": name}
+    except HTTPException:
+        shutil.rmtree(voice_dir, ignore_errors=True)
+        raise
+    except Exception:
+        shutil.rmtree(voice_dir, ignore_errors=True)
+        raise
 
 
 async def _transcribe_audio(audio_path: Path) -> str:
     """Send audio to ASR for transcription via GPU queue."""
-    audio_bytes = audio_path.read_bytes()
+    audio_bytes = await asyncio.to_thread(audio_path.read_bytes)
 
     async def work():
         form = aiohttp.FormData()
         form.add_field("file", audio_bytes, filename="audio.wav", content_type="audio/wav")
         form.add_field("model", "Qwen/Qwen3-ASR-0.6B")
-        async with aiohttp.ClientSession() as session:
-            async with session.post(f"{ASR_URL}/v1/audio/transcriptions", data=form) as resp:
-                if resp.status >= 400:
-                    raise Exception(f"ASR error {resp.status}")
-                data = await resp.json()
-                return data.get("text", "").strip()
+        async with _http_session().post(f"{ASR_URL}/v1/audio/transcriptions", data=form) as resp:
+            if resp.status >= 400:
+                raise Exception(f"ASR error {resp.status}")
+            data = await resp.json()
+            return data.get("text", "").strip()
 
     _, future = await gpu_queue.submit("asr", "Transcribe (clone)", work)
     return await future
@@ -561,6 +957,8 @@ async def design_preview(req: DesignPreviewRequest, request: Request):
     """Preview a designed voice (does not save it)."""
     get_current_user(request)  # auth check
     _require_text_limit(req.text)
+    if not req.description.strip():
+        raise HTTPException(400, "description is required")
 
     async def work_maker(tts_url):
         status, headers, body = await tts_request(
@@ -588,6 +986,12 @@ async def design_and_save(req: DesignSaveRequest, request: Request):
     """Design a voice and save it for future use."""
     user = get_current_user(request)
     _require_text_limit(req.text)
+    name = req.name.strip()
+    description = req.description.strip()
+    if not name:
+        raise HTTPException(400, "name is required")
+    if not description:
+        raise HTTPException(400, "description is required")
 
     async def work_maker(tts_url):
         status, headers, audio_bytes = await tts_request(
@@ -599,37 +1003,40 @@ async def design_and_save(req: DesignSaveRequest, request: Request):
             raise HTTPException(status, audio_bytes.decode(errors="replace"))
 
         voice_id = str(uuid.uuid4())[:8]
-        voice_dir = VOICES_DIR / voice_id
+        voice_dir = _voice_dir_for(voice_id)
         voice_dir.mkdir(parents=True, exist_ok=True)
 
         audio_path = voice_dir / "ref_audio.wav"
-        audio_path.write_bytes(audio_bytes)
+        await asyncio.to_thread(audio_path.write_bytes, audio_bytes)
 
         meta = {
-            "name": req.name,
+            "name": name,
             "ref_text": req.text,
             "language": req.language,
             "source": "design",
-            "design_prompt": req.description,
+            "design_prompt": description,
             "user_id": user["id"],
             "username": user["username"],
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
-        (voice_dir / "metadata.json").write_text(json.dumps(meta, indent=2))
+        await asyncio.to_thread(
+            (voice_dir / "metadata.json").write_text,
+            json.dumps(meta, indent=2),
+        )
 
         # Register on both TTS instances so either GPU can use this voice
         await _register_voice_on_tts(
-            voice_id, req.name, req.language, req.text, audio_bytes,
-            endpoint="/v1/voices/register-designed", design_prompt=req.description,
+            voice_id, name, req.language, req.text, audio_bytes,
+            endpoint="/v1/voices/register-designed", design_prompt=description,
         )
 
         db = get_db()
         db.execute(
             "INSERT INTO voices (id, user_id, name, language, source, design_prompt, ref_text, created_at) VALUES (?,?,?,?,?,?,?,?)",
-            (voice_id, user["id"], req.name, req.language, "design", req.description, req.text, meta["created_at"]),
+            (voice_id, user["id"], name, req.language, "design", description, req.text, meta["created_at"]),
         )
         db.commit()
-        return {"status": "created", "voice_id": voice_id, "name": req.name}
+        return {"status": "created", "voice_id": voice_id, "name": name}
 
     result = await _run_tts_job("Voice Design Save", work_maker)
     return result
@@ -693,6 +1100,9 @@ async def custom_voice_save(req: CustomVoiceSaveRequest, request: Request):
     model generates directly from speaker + (optional) instruct at call time.
     """
     user = get_current_user(request)
+    name = req.name.strip()
+    if not name:
+        raise HTTPException(400, "name is required")
 
     # Validate speaker against upstream list
     speakers_resp = await tts_json("GET", "/v1/speakers")
@@ -708,13 +1118,13 @@ async def custom_voice_save(req: CustomVoiceSaveRequest, request: Request):
     db.execute(
         "INSERT INTO voices (id, user_id, name, language, source, speaker, instruct, created_at) "
         "VALUES (?,?,?,?,?,?,?,?)",
-        (voice_id, user["id"], req.name, req.language, "custom",
+        (voice_id, user["id"], name, req.language, "custom",
          req.speaker, instruct, created_at),
     )
     db.commit()
 
     return {
-        "status": "created", "voice_id": voice_id, "name": req.name,
+        "status": "created", "voice_id": voice_id, "name": name,
         "speaker": req.speaker, "instruct": instruct, "language": req.language,
     }
 
@@ -763,6 +1173,9 @@ async def openai_tts_custom(req: CustomSpeechRequest, request: Request):
     """
     user = get_current_user(request, allow_anonymous=True)
     _require_text_limit(req.input, "input")
+    response_format = _validate_audio_format(
+        req.response_format, allowed=TTS_RESPONSE_FORMATS
+    )
     preset = _resolve_custom_voice(req.voice, user_id=user["id"])
 
     async def work_maker(tts_url):
@@ -773,7 +1186,7 @@ async def openai_tts_custom(req: CustomSpeechRequest, request: Request):
                 "speaker": preset["speaker"],
                 "language": preset["language"],
                 "instruct": preset["instruct"] or None,
-                "response_format": req.response_format,
+                "response_format": response_format,
             },
         )
         if status >= 400:
@@ -837,52 +1250,194 @@ def _verify_voice_source(voice_id: str, allowed_sources: tuple[str, ...], user_i
         )
 
 
+def _voice_source(voice_id: str, user_id: int | None = None) -> str:
+    """Return the stored voice source for routing generation endpoints."""
+    if voice_id in ("default", ""):
+        return "clone"
+    db = get_db()
+    if user_id is not None:
+        row = db.execute(
+            "SELECT source FROM voices WHERE id=? AND user_id=?",
+            (voice_id, user_id),
+        ).fetchone()
+    else:
+        row = db.execute("SELECT source FROM voices WHERE id=?", (voice_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Voice not found")
+    return (row[0] or "clone").lower()
+
+
+def _custom_tts_payload(
+    *,
+    text: str,
+    voice_id: str,
+    response_format: str,
+    user_id: int,
+    language_override: str | None = None,
+) -> dict:
+    preset = _resolve_custom_voice(voice_id, user_id=user_id)
+    return {
+        "text": text,
+        "speaker": preset["speaker"],
+        "language": language_override or preset["language"],
+        "instruct": preset["instruct"] or None,
+        "response_format": response_format,
+    }
+
+
+async def _tts_generate_for_voice(
+    *,
+    tts_url: str,
+    text: str,
+    voice_id: str,
+    source: str,
+    response_format: str,
+    user_id: int,
+    model_id: str | None = None,
+    language: str | None = None,
+) -> tuple[int, dict, bytes]:
+    response_format = _validate_audio_format(
+        response_format, allowed=TTS_RESPONSE_FORMATS
+    )
+    if source == "custom":
+        return await tts_request(
+            "POST",
+            "/v1/audio/speech/custom",
+            url=tts_url,
+            json=_custom_tts_payload(
+                text=text,
+                voice_id=voice_id,
+                response_format=response_format,
+                user_id=user_id,
+                language_override=language,
+            ),
+        )
+
+    payload = {
+        "input": text,
+        "voice": voice_id,
+        "response_format": response_format,
+    }
+    if model_id:
+        payload["model_id"] = model_id
+    if language:
+        payload["language"] = language
+    status, headers, body = await tts_request(
+        "POST", "/v1/audio/speech", url=tts_url, json=payload
+    )
+    if status < 400 and voice_id not in ("default", ""):
+        h_lower = {k.lower(): v for k, v in headers.items()}
+        actual_voice = h_lower.get("x-voice")
+        if actual_voice and actual_voice != voice_id:
+            raise HTTPException(
+                502,
+                f"TTS returned voice {actual_voice!r} for requested voice {voice_id!r}",
+            )
+    return status, headers, body
+
+
 @app.post("/api/generate/stream")
 async def generate_speech_stream(req: GenerateRequest, request: Request):
-    """Stream speech generation via SSE — queued for GPU access, buffered then streamed."""
+    """Stream speech generation via SSE while the GPU queue job is running."""
     user = get_current_user(request)
     _require_text_limit(req.text)
     _verify_voice_exists(req.voice_id, user_id=user["id"])
-    payload = {
-        "input": req.text,
-        "voice": req.voice_id,
-        "response_format": "wav",
-    }
-    if req.model_id:
-        payload["model_id"] = req.model_id
-    if req.language:
-        payload["language"] = req.language
+    source = _voice_source(req.voice_id, user_id=user["id"])
+    event_queue: asyncio.Queue[str | None] = asyncio.Queue()
 
     async def work_maker(tts_url):
-        """Buffer entire SSE response inside queue to hold GPU lock."""
-        events = []
+        if source == "custom":
+            status, headers, body = await _tts_generate_for_voice(
+                tts_url=tts_url,
+                text=req.text,
+                voice_id=req.voice_id,
+                source=source,
+                response_format="wav",
+                user_id=user["id"],
+                language=req.language,
+            )
+            if status >= 400:
+                await event_queue.put(
+                    _sse_event("error", {"error": body.decode(errors="replace")})
+                )
+                return
+            h_lower = {k.lower(): v for k, v in headers.items()}
+            duration = float(h_lower.get("x-audio-duration", "0") or 0)
+            chunk = {
+                "index": 0,
+                "total": 1,
+                "audio": base64.b64encode(body).decode("ascii"),
+                "duration": round(duration, 2),
+                "text": req.text[:80],
+            }
+            done = {
+                "total_duration": round(duration, 2),
+                "generation_time": float(h_lower.get("x-generation-time", "0") or 0),
+                "rtf": float(h_lower.get("x-rtf", "0") or 0),
+                "model": h_lower.get("x-model", "1.7b-custom"),
+                "voice": req.voice_id,
+                "chunks": 1,
+            }
+            await event_queue.put(_sse_event("chunk", chunk))
+            await event_queue.put(_sse_event("done", done))
+            return
+
+        payload = {
+            "input": req.text,
+            "voice": req.voice_id,
+            "response_format": "wav",
+        }
+        if req.model_id:
+            payload["model_id"] = req.model_id
+        if req.language:
+            payload["language"] = req.language
+
         timeout = aiohttp.ClientTimeout(total=600, sock_connect=30, sock_read=600)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(
-                f"{tts_url}/v1/audio/speech/stream", json=payload
-            ) as resp:
-                if resp.status >= 400:
-                    body = await resp.read()
-                    error_msg = json.dumps({"error": body.decode(errors="replace")})
-                    events.append(f"event: error\ndata: {error_msg}\n\n")
-                    return events
-                buf = b""
-                async for chunk in resp.content.iter_any():
-                    buf += chunk
-                    while b"\n\n" in buf:
-                        event, buf = buf.split(b"\n\n", 1)
-                        events.append(event.decode(errors="replace") + "\n\n")
-                if buf.strip():
-                    events.append(buf.decode(errors="replace") + "\n\n")
-        return events
+        async with _http_session().post(
+            f"{tts_url}/v1/audio/speech/stream", json=payload, timeout=timeout
+        ) as resp:
+            if resp.status >= 400:
+                body = await resp.read()
+                await event_queue.put(
+                    _sse_event("error", {"error": body.decode(errors="replace")})
+                )
+                return
+            buf = b""
+            async for chunk in resp.content.iter_any():
+                buf += chunk
+                while b"\n\n" in buf:
+                    event, buf = buf.split(b"\n\n", 1)
+                    await event_queue.put(event.decode(errors="replace") + "\n\n")
+            if buf.strip():
+                await event_queue.put(buf.decode(errors="replace") + "\n\n")
 
-    events = await _run_tts_job("TTS Stream", work_maker)
+    async def worker():
+        try:
+            await _run_tts_job("TTS Stream", work_maker)
+        except Exception as exc:
+            logger.exception("TTS stream failed")
+            await event_queue.put(_sse_event("error", {"error": str(exc)}))
+        finally:
+            await event_queue.put(None)
 
-    async def replay_sse():
-        for ev in events:
-            yield ev
+    async def event_stream():
+        task = asyncio.create_task(worker())
+        try:
+            yield _sse_event(
+                "progress",
+                {"stage": "queued", "progress": 0, "message": "TTS stream queued"},
+            )
+            while True:
+                ev = await event_queue.get()
+                if ev is None:
+                    break
+                yield ev
+            await task
+        except asyncio.CancelledError:
+            task.cancel()
+            raise
 
-    return StreamingResponse(replay_sse(), media_type="text/event-stream")
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @app.post("/api/generate")
@@ -891,18 +1446,19 @@ async def generate_speech(req: GenerateRequest, request: Request):
     user = get_current_user(request)
     _require_text_limit(req.text)
     _verify_voice_exists(req.voice_id, user_id=user["id"])
-    payload = {
-        "input": req.text,
-        "voice": req.voice_id,
-        "response_format": req.response_format,
-    }
-    if req.model_id:
-        payload["model_id"] = req.model_id
-    if req.language:
-        payload["language"] = req.language
+    source = _voice_source(req.voice_id, user_id=user["id"])
 
     async def work_maker(tts_url):
-        status, headers, body = await tts_request("POST", "/v1/audio/speech", url=tts_url, json=payload)
+        status, headers, body = await _tts_generate_for_voice(
+            tts_url=tts_url,
+            text=req.text,
+            voice_id=req.voice_id,
+            source=source,
+            response_format=req.response_format,
+            user_id=user["id"],
+            model_id=req.model_id,
+            language=req.language,
+        )
         if status >= 400:
             raise HTTPException(status, body.decode(errors="replace"))
         resp_headers = {k: v for k, v in headers.items() if k.lower().startswith("x-")}
@@ -927,16 +1483,29 @@ class BenchmarkRequest(BaseModel):
 async def run_benchmark(req: BenchmarkRequest, request: Request):
     """Run a benchmark across model × voice combinations."""
     user = get_current_user(request)
-    if not req.text.strip():
+    text = req.text.strip()
+    if not text:
         raise HTTPException(400, "text is required")
-    _require_text_limit(req.text)
-    for voice_id in req.voice_ids:
-        _verify_voice_exists(voice_id, user_id=user["id"])
+    _require_text_limit(text)
+    voice_ids = list(dict.fromkeys(v.strip() for v in req.voice_ids if v.strip()))
+    model_ids = list(dict.fromkeys(m.strip() for m in req.model_ids if m.strip()))
+    if not voice_ids:
+        raise HTTPException(400, "at least one voice_id is required")
+    if not model_ids:
+        raise HTTPException(400, "at least one model_id is required")
+    if len(voice_ids) > 20:
+        raise HTTPException(400, "at most 20 voices can be benchmarked at once")
+    if len(model_ids) > 8:
+        raise HTTPException(400, "at most 8 models can be benchmarked at once")
+    if req.runs_per_combo < 1 or req.runs_per_combo > 20:
+        raise HTTPException(400, "runs_per_combo must be between 1 and 20")
+    for voice_id in voice_ids:
+        _verify_voice_source(voice_id, allowed_sources=("clone", "design"), user_id=user["id"])
 
     async def work():
         results = []
         db = get_db()
-        for model_id in req.model_ids:
+        for model_id in model_ids:
             try:
                 switch_result = await tts_json("POST", "/v1/models/load", json={"model_id": model_id})
                 load_time = switch_result.get("load_time_s", 0)
@@ -944,12 +1513,12 @@ async def run_benchmark(req: BenchmarkRequest, request: Request):
                 results.append({"model_id": model_id, "error": str(e)})
                 continue
 
-            for voice_id in req.voice_ids:
+            for voice_id in voice_ids:
                 for run_idx in range(req.runs_per_combo):
                     try:
                         status, headers, body = await tts_request(
                             "POST", "/v1/audio/speech",
-                            json={"input": req.text, "voice": voice_id,
+                            json={"input": text, "voice": voice_id,
                                   "model_id": model_id, "response_format": "wav"},
                         )
                         if status >= 400:
@@ -979,7 +1548,7 @@ async def run_benchmark(req: BenchmarkRequest, request: Request):
                             "INSERT INTO benchmarks "
                             "(user_id, voice_id, model_id, text, audio_duration, generation_time, rtf) "
                             "VALUES (?,?,?,?,?,?,?)",
-                            (user["id"], voice_id, model_id, req.text, audio_dur, gen_time, rtf),
+                            (user["id"], voice_id, model_id, text, audio_dur, gen_time, rtf),
                         )
                     except Exception as e:
                         results.append({
@@ -1050,8 +1619,8 @@ def _convert_to_wav(data: bytes, suffix: str) -> bytes:
         Path(out_path).unlink(missing_ok=True)
 
 
-def _download_youtube(url: str) -> bytes:
-    """Download audio from YouTube URL as WAV (sync, for run_in_executor)."""
+def _download_media_url(url: str) -> bytes:
+    """Download supported media URLs as WAV (sync, for run_in_executor)."""
     import subprocess
     import shutil
     import tempfile
@@ -1081,13 +1650,23 @@ async def _transcribe_wav_bytes(wav_bytes: bytes) -> dict:
     form = aiohttp.FormData()
     form.add_field("file", wav_bytes, filename="audio.wav", content_type="audio/wav")
     form.add_field("model", "Qwen/Qwen3-ASR-0.6B")
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(f"{ASR_URL}/v1/audio/transcriptions", data=form) as resp:
-            if resp.status >= 400:
-                body = await resp.read()
-                raise RuntimeError(f"ASR error {resp.status}: {body.decode(errors='replace')[:500]}")
-            data = await resp.json()
-            return {"text": data.get("text", "").strip()}
+    async with _http_session().post(
+        f"{ASR_URL}/v1/audio/transcriptions", data=form, timeout=timeout
+    ) as resp:
+        if resp.status >= 400:
+            body = await resp.read()
+            raise RuntimeError(f"ASR error {resp.status}: {body.decode(errors='replace')[:500]}")
+        data = await resp.json()
+        return {"text": _clean_asr_text(data.get("text", ""))}
+
+
+def _clean_asr_text(raw: str) -> str:
+    text = (raw or "").strip()
+    if "<asr_text>" in text:
+        text = text.split("<asr_text>", 1)[1]
+    for marker in ("</asr_text>", "<|endoftext|>"):
+        text = text.replace(marker, "")
+    return text.strip()
 
 
 @app.post("/api/transcribe")
@@ -1096,15 +1675,15 @@ async def transcribe(
     file: UploadFile | None = File(None),
     url: str = Form(""),
 ):
-    """Transcribe audio/video files or YouTube URLs."""
+    """Transcribe audio/video files or supported media URLs."""
     get_current_user(request)  # auth check
     loop = asyncio.get_event_loop()
 
     if url.strip():
-        if not _is_youtube_url(url.strip()):
-            raise HTTPException(400, "Only YouTube URLs are supported")
+        if not _is_supported_media_url(url.strip()):
+            raise HTTPException(400, "Only YouTube and Vimeo URLs are supported")
         try:
-            wav_bytes = await loop.run_in_executor(None, _download_youtube, url.strip())
+            wav_bytes = await loop.run_in_executor(None, _download_media_url, url.strip())
         except Exception as e:
             raise HTTPException(400, f"Download failed: {e}")
 
@@ -1141,7 +1720,8 @@ async def health():
         tts_health = await tts_json("GET", "/health")
     except Exception:
         tts_health = {"status": "unreachable"}
-    return {"api": "ok", "tts": tts_health}
+    gpu_resources = await get_resource_status()
+    return {"api": "ok", "tts": tts_health, "gpu_resources": gpu_resources}
 
 
 # ---------------------------------------------------------------------------
@@ -1162,16 +1742,152 @@ class MusicGenerateRequest(BaseModel):
 
 async def _music_request(method: str, path: str, **kwargs) -> tuple[int, bytes]:
     timeout = aiohttp.ClientTimeout(total=120, sock_connect=30)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.request(method, f"{MUSIC_URL}{path}", **kwargs) as resp:
+    start = time.perf_counter()
+    status = 0
+    try:
+        async with _http_session().request(
+            method, f"{MUSIC_URL}{path}", timeout=timeout, **kwargs
+        ) as resp:
+            status = resp.status
             body = await resp.read()
             return resp.status, body
+    finally:
+        labels = {"path": path, "status": status or "error"}
+        inc("vocarium_music_requests_total", labels=labels)
+        observe("vocarium_music_seconds", time.perf_counter() - start, labels)
+
+
+def _normalize_music_audio_path(raw_path: str, *, strict: bool = True) -> str | None:
+    value = unquote((raw_path or "").strip())
+    if not value:
+        if strict:
+            raise HTTPException(400, "path is required")
+        return None
+
+    parsed = urlparse(value)
+    if parsed.query and parsed.path.endswith("/v1/audio"):
+        query_path = (parse_qs(parsed.query).get("path") or [""])[0]
+        value = unquote(query_path.strip())
+    elif value.startswith("/v1/audio?"):
+        query_path = (parse_qs(value.split("?", 1)[1]).get("path") or [""])[0]
+        value = unquote(query_path.strip())
+
+    if not value or "\x00" in value or len(value) > 2048:
+        if strict:
+            raise HTTPException(400, "invalid audio path")
+        return None
+    return value
+
+
+def _extract_music_audio_paths(payload: object) -> list[str]:
+    paths: list[str] = []
+
+    def visit(value: object) -> None:
+        if isinstance(value, dict):
+            file_ref = value.get("file")
+            if isinstance(file_ref, str):
+                path = _normalize_music_audio_path(file_ref, strict=False)
+                if path:
+                    paths.append(path)
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+        elif isinstance(value, str):
+            stripped = value.strip()
+            if stripped.startswith("{") or stripped.startswith("["):
+                try:
+                    visit(json.loads(stripped))
+                except json.JSONDecodeError:
+                    return
+
+    visit(payload)
+    return sorted(set(paths))
+
+
+def _record_music_task(
+    user_id: int,
+    task_id: str,
+    status: str,
+    file_paths: list[str] | None = None,
+) -> None:
+    db = get_db()
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ")
+    if file_paths is None:
+        db.execute(
+            "INSERT INTO music_tasks (task_id, user_id, status, updated_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(task_id) DO UPDATE SET status=excluded.status, updated_at=excluded.updated_at "
+            "WHERE music_tasks.user_id=excluded.user_id",
+            (task_id, user_id, status, now),
+        )
+    else:
+        db.execute(
+            "INSERT INTO music_tasks (task_id, user_id, status, file_paths, updated_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(task_id) DO UPDATE SET "
+            "status=excluded.status, file_paths=excluded.file_paths, updated_at=excluded.updated_at "
+            "WHERE music_tasks.user_id=excluded.user_id",
+            (task_id, user_id, status, json.dumps(file_paths), now),
+        )
+    owner = db.execute(
+        "SELECT user_id FROM music_tasks WHERE task_id=?", (task_id,)
+    ).fetchone()
+    if not owner or owner[0] != user_id:
+        db.rollback()
+        raise RuntimeError("music task ownership conflict")
+    if file_paths is not None:
+        db.execute(
+            "DELETE FROM music_task_files WHERE task_id=? AND user_id=?",
+            (task_id, user_id),
+        )
+        db.executemany(
+            "INSERT OR IGNORE INTO music_task_files (task_id, user_id, path, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            [(task_id, user_id, path, now) for path in sorted(set(file_paths))],
+        )
+    db.commit()
+
+
+def _require_owned_music_tasks(user_id: int, task_ids: list[str]) -> None:
+    placeholders = ",".join("?" for _ in task_ids)
+    rows = get_db().execute(
+        f"SELECT task_id FROM music_tasks WHERE user_id=? AND task_id IN ({placeholders})",
+        (user_id, *task_ids),
+    ).fetchall()
+    owned = {row[0] for row in rows}
+    if owned != set(task_ids):
+        raise HTTPException(404, "Music task not found")
+
+
+def _sync_music_tasks_from_poll(user_id: int, poll: dict) -> None:
+    for task in poll.get("data") or []:
+        if not isinstance(task, dict):
+            continue
+        task_id = str(task.get("task_id") or "").strip()
+        if not task_id:
+            continue
+        status_code = task.get("status")
+        status = "completed" if status_code == 1 else "failed" if status_code == 2 else "running"
+        paths = _extract_music_audio_paths(task)
+        _record_music_task(user_id, task_id, status, paths if paths else None)
+
+
+def _require_owned_music_audio_path(user_id: int, path: str) -> None:
+    row = get_db().execute(
+        "SELECT 1 FROM music_task_files WHERE user_id=? AND path=? LIMIT 1",
+        (user_id, path),
+    ).fetchone()
+    if row:
+        return
+    raise HTTPException(404, "Music audio not found")
 
 
 @app.post("/api/music/generate")
 async def music_generate(req: MusicGenerateRequest, request: Request):
     """Submit music generation, hold GPU lock until complete, return result."""
-    get_current_user(request)  # auth check
+    user = get_current_user(request)
     if not req.prompt.strip():
         raise HTTPException(400, "prompt is required")
     if len(req.prompt) > 2000:
@@ -1182,6 +1898,9 @@ async def music_generate(req: MusicGenerateRequest, request: Request):
         raise HTTPException(400, "audio_duration must be between 10 and 300 seconds")
     if req.batch_size < 1 or req.batch_size > 4:
         raise HTTPException(400, "batch_size must be between 1 and 4")
+    audio_format = _validate_audio_format(
+        req.audio_format, allowed=MUSIC_RESPONSE_FORMATS, field="audio_format"
+    )
 
     payload = {
         "prompt": req.prompt,
@@ -1191,7 +1910,7 @@ async def music_generate(req: MusicGenerateRequest, request: Request):
         "model": "acestep-v15-turbo",
         "inference_steps": 8,
         "batch_size": req.batch_size,
-        "audio_format": req.audio_format,
+        "audio_format": audio_format,
     }
     if req.bpm is not None:
         payload["bpm"] = req.bpm
@@ -1214,6 +1933,7 @@ async def music_generate(req: MusicGenerateRequest, request: Request):
         task_id = submit_result.get("data", {}).get("task_id")
         if not task_id:
             return submit_result  # no task_id means immediate result or error
+        _record_music_task(user["id"], task_id, "submitted")
 
         # Poll until complete (holds GPU lock)
         for _ in range(300):  # max ~10 min (2s * 300)
@@ -1227,8 +1947,10 @@ async def music_generate(req: MusicGenerateRequest, request: Request):
                 continue
             task = tasks[0]
             if task.get("status") == 1:  # success
+                _sync_music_tasks_from_poll(user["id"], poll)
                 return {"submit": submit_result, "result": poll}
             if task.get("status") == 2:  # failed
+                _record_music_task(user["id"], task_id, "failed")
                 raise HTTPException(500, "Music generation failed")
         raise HTTPException(504, "Music generation timed out")
 
@@ -1243,20 +1965,33 @@ class MusicStatusRequest(BaseModel):
 @app.post("/api/music/status")
 async def music_status(req: MusicStatusRequest, request: Request):
     """Poll for music generation task status."""
-    get_current_user(request)  # auth check
+    user = get_current_user(request)
+    task_ids = [tid.strip() for tid in req.task_ids if tid and tid.strip()]
+    if not task_ids:
+        raise HTTPException(400, "at least one task_id is required")
+    if len(task_ids) > 20:
+        raise HTTPException(400, "at most 20 task_ids can be queried at once")
+    if any(len(tid) > 128 or "\x00" in tid for tid in task_ids):
+        raise HTTPException(400, "invalid task_id")
+    _require_owned_music_tasks(user["id"], task_ids)
     status, body = await _music_request(
         "POST", "/query_result",
-        json={"task_id_list": req.task_ids},
+        json={"task_id_list": task_ids},
     )
     if status >= 400:
         raise HTTPException(status, body.decode(errors="replace"))
-    return json.loads(body)
+    poll = json.loads(body)
+    _sync_music_tasks_from_poll(user["id"], poll)
+    return poll
 
 
 @app.get("/api/music/audio")
 async def music_audio(path: str, request: Request):
     """Download generated music audio file."""
-    get_current_user(request)  # auth check
+    user = get_current_user(request)
+    path = _normalize_music_audio_path(path)
+    assert path is not None
+    _require_owned_music_audio_path(user["id"], path)
     status, body = await _music_request("GET", "/v1/audio", params={"path": path})
     if status >= 400:
         raise HTTPException(status, body.decode(errors="replace"))
@@ -1277,6 +2012,11 @@ async def music_enhance(request: Request):
     """Enhance prompt/lyrics using ACE-Step's LM."""
     get_current_user(request)  # auth check
     body = await request.body()
+    if len(body) > MAX_MUSIC_ENHANCE_BODY_BYTES:
+        raise HTTPException(
+            413,
+            f"request body too large (max {_size_label(MAX_MUSIC_ENHANCE_BODY_BYTES)})",
+        )
     status, resp_body = await _music_request(
         "POST", "/format_input",
         data=body, headers={"Content-Type": "application/json"},
@@ -1301,17 +2041,29 @@ async def music_health():
 # ---------------------------------------------------------------------------
 async def _sfx_request(method: str, path: str, **kwargs) -> tuple[int, bytes]:
     timeout = aiohttp.ClientTimeout(total=300, sock_connect=30, sock_read=300)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.request(method, f"{SFX_URL}{path}", **kwargs) as resp:
+    start = time.perf_counter()
+    status = 0
+    try:
+        async with _http_session().request(
+            method, f"{SFX_URL}{path}", timeout=timeout, **kwargs
+        ) as resp:
+            status = resp.status
             body = await resp.read()
             return resp.status, body
+    finally:
+        labels = {"path": path, "status": status or "error"}
+        inc("vocarium_sfx_requests_total", labels=labels)
+        observe("vocarium_sfx_seconds", time.perf_counter() - start, labels)
 
 
 @app.post("/api/sfx/generate")
 async def sfx_generate(request: Request):
     """Generate a sound effect from a text prompt. Returns WAV audio."""
     get_current_user(request)
-    body = await request.json()
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(400, "Invalid JSON body")
     prompt = body.get("prompt", "").strip()
     if not prompt:
         raise HTTPException(400, "prompt is required")
@@ -1381,13 +2133,42 @@ class OpenAISpeechRequest(BaseModel):
     speed: float = 1.0  # ignored, kept for compat
 
 
-async def _openai_speech_proxy(req: OpenAISpeechRequest, description: str) -> Response:
+def _normalize_openai_tts_voice(voice: str) -> str:
+    """Map SUB/WAVE persona labels to the only built-in OpenAI TTS voice.
+
+    Persona names belong in the caller's script/persona fields. The
+    OpenAI-compatible voice field stays a concrete Vocarium voice id.
+    """
+    cleaned = (voice or "").strip()
+    if not cleaned:
+        return "default"
+    normalized = re.sub(r"[\s_-]+", " ", cleaned).casefold()
+    compact = re.sub(r"[\s_-]+", "", cleaned).casefold()
+    if (
+        normalized in OPENAI_TTS_DEFAULT_VOICE_PERSONA_ALIASES
+        or compact in OPENAI_TTS_DEFAULT_VOICE_PERSONA_ALIASES
+    ):
+        return "default"
+    return cleaned
+
+
+async def _openai_speech_proxy(
+    req: OpenAISpeechRequest,
+    description: str,
+    *,
+    voice_override: str | None = None,
+) -> Response:
     """Shared TTS proxy used by both /v1/audio/speech endpoints."""
     _require_text_limit(req.input, "input")
+    response_format = _validate_audio_format(
+        req.response_format, allowed=TTS_RESPONSE_FORMATS
+    )
+    requested_voice = (req.voice or "").strip()
+    voice = voice_override or _normalize_openai_tts_voice(req.voice)
     payload = {
         "input": req.input,
-        "voice": req.voice,
-        "response_format": req.response_format,
+        "voice": voice,
+        "response_format": response_format,
     }
     # Map OpenAI model names to internal model_id
     model_map = {"tts-1": "1.7b-base", "tts-1-hd": "1.7b-base"}
@@ -1400,11 +2181,23 @@ async def _openai_speech_proxy(req: OpenAISpeechRequest, description: str) -> Re
         status, headers, body = await tts_request("POST", "/v1/audio/speech", url=tts_url, json=payload)
         if status >= 400:
             raise HTTPException(status, body.decode(errors="replace"))
+        if voice not in ("default", ""):
+            h_lower = {k.lower(): v for k, v in headers.items()}
+            actual_voice = h_lower.get("x-voice")
+            if actual_voice and actual_voice != voice:
+                raise HTTPException(
+                    502,
+                    f"TTS returned voice {actual_voice!r} for requested voice {voice!r}",
+                )
         content_type = headers.get("Content-Type", headers.get("content-type", "audio/wav"))
-        return {"body": body, "media_type": content_type}
+        return {"body": body, "media_type": content_type, "voice": voice}
 
     result = await _run_tts_job(description, work_maker)
-    return Response(content=result["body"], media_type=result["media_type"])
+    headers = {}
+    if result.get("voice") and result["voice"] != requested_voice:
+        headers["X-Voice"] = result["voice"]
+        headers["X-Requested-Voice"] = requested_voice
+    return Response(content=result["body"], media_type=result["media_type"], headers=headers)
 
 
 @app.post("/v1/audio/speech")
@@ -1415,8 +2208,13 @@ async def openai_tts(req: OpenAISpeechRequest, request: Request):
     Designed voices live behind ``/v1/audio/speech/designed``.
     """
     user = get_current_user(request, allow_anonymous=True)
-    _verify_voice_source(req.voice, allowed_sources=("clone",), user_id=user["id"])
-    return await _openai_speech_proxy(req, "OpenAI TTS (base/clone)")
+    voice = _normalize_openai_tts_voice(req.voice)
+    _verify_voice_source(voice, allowed_sources=("clone",), user_id=user["id"])
+    return await _openai_speech_proxy(
+        req,
+        "OpenAI TTS (base/clone)",
+        voice_override=voice,
+    )
 
 
 @app.post("/v1/audio/speech/designed")
@@ -1487,8 +2285,10 @@ async def openai_models():
 
 @app.get("/v1/voices")
 async def openai_voices(request: Request, source: str | None = Query(default=None)):
-    """List available TTS voices. Optional ``source`` filter (``clone`` | ``design`` )."""
+    """List available TTS voices. Optional source filter: clone, design, or custom."""
     user = get_current_user(request, allow_anonymous=True)
+    if source and source not in ("clone", "design", "custom"):
+        raise HTTPException(400, "source must be clone, design, or custom")
     db = get_db()
     if source:
         rows = db.execute(
@@ -1501,6 +2301,13 @@ async def openai_voices(request: Request, source: str | None = Query(default=Non
             (user["id"],),
         ).fetchall()
     voices = []
+    if source in (None, "clone"):
+        voices.append({
+            "voice_id": "default",
+            "name": "Default",
+            "language": "German",
+            "source": "clone",
+        })
     for r in rows:
         voices.append({
             "voice_id": r[0],
@@ -1509,6 +2316,177 @@ async def openai_voices(request: Request, source: str | None = Query(default=Non
             "source": r[3],
         })
     return {"voices": voices}
+
+
+class PersonaRequest(BaseModel):
+    name: str
+    tagline: str | None = None
+    soul: str | None = None
+    humour: str | None = None
+    warmth: str | None = None
+    scriptLength: str | None = None
+
+
+class PersonaUpdate(BaseModel):
+    name: str | None = None
+    tagline: str | None = None
+    soul: str | None = None
+    humour: str | None = None
+    warmth: str | None = None
+    scriptLength: str | None = None
+
+
+def _clean_persona_text(
+    value: str | None,
+    field: str,
+    *,
+    required: bool = False,
+    max_chars: int = 2000,
+) -> str:
+    cleaned = (value or "").strip()
+    if required and not cleaned:
+        raise HTTPException(400, f"{field} is required")
+    if len(cleaned) > max_chars:
+        raise HTTPException(400, f"{field} is too long (max {max_chars} characters)")
+    return cleaned
+
+
+def _persona_row_to_dict(row) -> dict:
+    return {
+        "id": row[0],
+        "name": row[1],
+        "tagline": row[3] or "",
+        "soul": row[2] or "",
+        "humour": row[4] or "",
+        "warmth": row[5] or row[7] or "",
+        "scriptLength": row[6] or "medium",
+        "voice": "default",
+        "created_at": row[8],
+        "updated_at": row[9],
+    }
+
+
+def _get_persona_or_404(persona_id: str, user_id: int) -> dict:
+    row = get_db().execute(
+        "SELECT id, name, personality, persona_tagline, persona_humour, "
+        "persona_warmth, persona_script_length, speaking_style, created_at, updated_at "
+        "FROM hosts WHERE id=? AND user_id=?",
+        (persona_id, user_id),
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, "Persona not found")
+    return _persona_row_to_dict(row)
+
+
+@app.get("/v1/personas")
+async def openai_personas(request: Request):
+    """List text/persona styles for OpenAI-compatible SUB/WAVE clients.
+
+    Personas are deliberately separate from TTS voices. OpenAI-compatible
+    speech still uses ``voice=default`` for the base voice; clients can use
+    persona fields to shape script text before sending it to TTS.
+    """
+    user = get_current_user(request, allow_anonymous=True)
+    rows = get_db().execute(
+        "SELECT id, name, personality, persona_tagline, persona_humour, "
+        "persona_warmth, persona_script_length, speaking_style, created_at, updated_at "
+        "FROM hosts WHERE user_id=? ORDER BY created_at",
+        (user["id"],),
+    ).fetchall()
+    return {"personas": [_persona_row_to_dict(row) for row in rows]}
+
+
+@app.post("/v1/personas")
+async def create_openai_persona(req: PersonaRequest, request: Request):
+    user = get_current_user(request, allow_anonymous=True)
+    name = _clean_persona_text(req.name, "name", required=True, max_chars=120)
+    soul = _clean_persona_text(req.soul, "soul")
+    tagline = _clean_persona_text(req.tagline, "tagline", max_chars=500)
+    humour = _clean_persona_text(req.humour, "humour", max_chars=500)
+    warmth = _clean_persona_text(req.warmth, "warmth", max_chars=500)
+    script_length = _clean_persona_text(req.scriptLength, "scriptLength", max_chars=64) or "medium"
+    persona_id = f"persona-{uuid.uuid4().hex}"
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ")
+    db = get_db()
+    db.execute(
+        "INSERT INTO hosts "
+        "(id, user_id, name, personality, speaking_style, persona_tagline, "
+        "persona_humour, persona_warmth, persona_script_length, voice_id, role, "
+        "created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'host', ?, ?)",
+        (
+            persona_id,
+            user["id"],
+            name,
+            soul,
+            warmth,
+            tagline,
+            humour,
+            warmth,
+            script_length,
+            now,
+            now,
+        ),
+    )
+    db.commit()
+    return _get_persona_or_404(persona_id, user["id"])
+
+
+@app.patch("/v1/personas/{persona_id}")
+async def update_openai_persona(
+    persona_id: str,
+    req: PersonaUpdate,
+    request: Request,
+):
+    user = get_current_user(request, allow_anonymous=True)
+    _get_persona_or_404(persona_id, user["id"])
+    fields = []
+    values = []
+    if req.name is not None:
+        fields.append("name=?")
+        values.append(_clean_persona_text(req.name, "name", required=True, max_chars=120))
+    if req.soul is not None:
+        fields.append("personality=?")
+        values.append(_clean_persona_text(req.soul, "soul"))
+    if req.tagline is not None:
+        fields.append("persona_tagline=?")
+        values.append(_clean_persona_text(req.tagline, "tagline", max_chars=500))
+    if req.humour is not None:
+        fields.append("persona_humour=?")
+        values.append(_clean_persona_text(req.humour, "humour", max_chars=500))
+    if req.warmth is not None:
+        warmth = _clean_persona_text(req.warmth, "warmth", max_chars=500)
+        fields.append("persona_warmth=?")
+        values.append(warmth)
+        fields.append("speaking_style=?")
+        values.append(warmth)
+    if req.scriptLength is not None:
+        script_length = _clean_persona_text(
+            req.scriptLength, "scriptLength", max_chars=64
+        ) or "medium"
+        fields.append("persona_script_length=?")
+        values.append(script_length)
+    if not fields:
+        return _get_persona_or_404(persona_id, user["id"])
+    fields.append("updated_at=?")
+    values.append(time.strftime("%Y-%m-%dT%H:%M:%SZ"))
+    values.extend([persona_id, user["id"]])
+    get_db().execute(
+        f"UPDATE hosts SET {', '.join(fields)} WHERE id=? AND user_id=?",
+        values,
+    )
+    get_db().commit()
+    return _get_persona_or_404(persona_id, user["id"])
+
+
+@app.delete("/v1/personas/{persona_id}")
+async def delete_openai_persona(persona_id: str, request: Request):
+    user = get_current_user(request, allow_anonymous=True)
+    _get_persona_or_404(persona_id, user["id"])
+    db = get_db()
+    db.execute("DELETE FROM hosts WHERE id=? AND user_id=?", (persona_id, user["id"]))
+    db.commit()
+    return {"status": "deleted", "id": persona_id}
 
 
 # ---------------------------------------------------------------------------
@@ -1590,15 +2568,47 @@ async def get_active_llm_provider(request: Request):
 async def create_llm_provider(req: LLMProviderCreate, request: Request):
     """Create a new LLM provider for the authenticated user."""
     user = get_current_user(request)
+    clean = _validate_llm_common(
+        name=req.name,
+        base_url=req.base_url,
+        model=req.model,
+        temperature=req.temperature,
+        max_tokens=req.max_tokens,
+        provider_type=req.provider_type,
+        require_name=True,
+        require_base_url=True,
+        require_model=True,
+    )
     provider_id = str(uuid.uuid4())
     db = get_db()
+    is_first_provider = db.execute(
+        "SELECT 1 FROM llm_providers WHERE user_id=? LIMIT 1",
+        (user["id"],),
+    ).fetchone() is None
     db.execute(
-        "INSERT INTO llm_providers (id, user_id, name, base_url, api_key, model, temperature, max_tokens, provider_type) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (provider_id, user["id"], req.name, req.base_url, req.api_key, req.model, req.temperature, req.max_tokens, req.provider_type),
+        "INSERT INTO llm_providers "
+        "(id, user_id, name, base_url, api_key, model, temperature, max_tokens, provider_type, is_active) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            provider_id,
+            user["id"],
+            clean["name"],
+            clean["base_url"],
+            (req.api_key or "").strip(),
+            clean["model"],
+            clean["temperature"],
+            clean["max_tokens"],
+            clean["provider_type"],
+            1 if is_first_provider else 0,
+        ),
     )
     db.commit()
-    return {"id": provider_id, "name": req.name, "status": "created"}
+    return {
+        "id": provider_id,
+        "name": clean["name"],
+        "status": "created",
+        "is_active": is_first_provider,
+    }
 
 
 @app.patch("/api/llm/providers/{provider_id}")
@@ -1610,24 +2620,32 @@ async def update_llm_provider(provider_id: str, req: LLMProviderUpdate, request:
     if not r:
         raise HTTPException(404, "Provider not found")
 
+    clean = _validate_llm_common(
+        name=req.name,
+        base_url=req.base_url,
+        model=req.model,
+        temperature=req.temperature,
+        max_tokens=req.max_tokens,
+        provider_type=req.provider_type,
+    )
     fields = []
     values = []
-    if req.name is not None:
-        fields.append("name=?"); values.append(req.name)
-    if req.base_url is not None:
-        fields.append("base_url=?"); values.append(req.base_url)
+    if "name" in clean:
+        fields.append("name=?"); values.append(clean["name"])
+    if "base_url" in clean:
+        fields.append("base_url=?"); values.append(clean["base_url"])
     if req.api_key is not None:
-        fields.append("api_key=?"); values.append(req.api_key)
-    if req.model is not None:
-        fields.append("model=?"); values.append(req.model)
-    if req.temperature is not None:
-        fields.append("temperature=?"); values.append(req.temperature)
-    if req.max_tokens is not None:
-        fields.append("max_tokens=?"); values.append(req.max_tokens)
+        fields.append("api_key=?"); values.append(req.api_key.strip())
+    if "model" in clean:
+        fields.append("model=?"); values.append(clean["model"])
+    if "temperature" in clean:
+        fields.append("temperature=?"); values.append(clean["temperature"])
+    if "max_tokens" in clean:
+        fields.append("max_tokens=?"); values.append(clean["max_tokens"])
     if req.is_active is not None:
         fields.append("is_active=?"); values.append(1 if req.is_active else 0)
-    if req.provider_type is not None:
-        fields.append("provider_type=?"); values.append(req.provider_type)
+    if "provider_type" in clean:
+        fields.append("provider_type=?"); values.append(clean["provider_type"])
 
     if not fields:
         return {"status": "no changes"}
@@ -1650,10 +2668,23 @@ async def update_llm_provider(provider_id: str, req: LLMProviderUpdate, request:
 async def delete_llm_provider(provider_id: str, request: Request):
     user = get_current_user(request)
     db = get_db()
-    r = db.execute("SELECT id FROM llm_providers WHERE id=? AND user_id=?", (provider_id, user["id"])).fetchone()
+    r = db.execute(
+        "SELECT id, is_active FROM llm_providers WHERE id=? AND user_id=?",
+        (provider_id, user["id"]),
+    ).fetchone()
     if not r:
         raise HTTPException(404, "Provider not found")
     db.execute("DELETE FROM llm_providers WHERE id=? AND user_id=?", (provider_id, user["id"]))
+    if r[1]:
+        fallback = db.execute(
+            "SELECT id FROM llm_providers WHERE user_id=? ORDER BY updated_at DESC, created_at DESC LIMIT 1",
+            (user["id"],),
+        ).fetchone()
+        if fallback:
+            db.execute(
+                "UPDATE llm_providers SET is_active=1, updated_at=? WHERE id=? AND user_id=?",
+                (time.strftime("%Y-%m-%dT%H:%M:%SZ"), fallback[0], user["id"]),
+            )
     db.commit()
     return {"status": "deleted", "provider_id": provider_id}
 
@@ -1667,7 +2698,10 @@ async def set_active_llm_provider(provider_id: str, request: Request):
     if not r:
         raise HTTPException(404, "Provider not found")
     db.execute("UPDATE llm_providers SET is_active=0 WHERE user_id=?", (user["id"],))
-    db.execute("UPDATE llm_providers SET is_active=1, updated_at=? WHERE id=?", (time.strftime("%Y-%m-%dT%H:%M:%SZ"), provider_id))
+    db.execute(
+        "UPDATE llm_providers SET is_active=1, updated_at=? WHERE id=? AND user_id=?",
+        (time.strftime("%Y-%m-%dT%H:%M:%SZ"), provider_id, user["id"]),
+    )
     db.commit()
     return {"status": "active", "provider_id": provider_id}
 
@@ -1675,12 +2709,20 @@ async def set_active_llm_provider(provider_id: str, request: Request):
 @app.post("/api/llm/test")
 async def test_llm_provider(request: Request, body: dict):
     """Test an LLM provider configuration by sending a simple completion."""
-    user = get_current_user(request)
+    get_current_user(request)
+    raw = await request.body()
+    if len(raw) > MAX_LLM_TEST_BODY_BYTES:
+        raise HTTPException(
+            413,
+            f"request body too large (max {_size_label(MAX_LLM_TEST_BODY_BYTES)})",
+        )
     base_url = body.get("base_url", "")
     api_key = body.get("api_key", "")
     model = body.get("model", "")
-    if not base_url or not model:
-        raise HTTPException(400, "base_url and model are required")
+    base_url = _normalize_http_base_url(base_url)
+    model = (model or "").strip()
+    if not model:
+        raise HTTPException(400, "model is required")
 
     import aiohttp
     payload = {
@@ -1696,15 +2738,19 @@ async def test_llm_provider(request: Request, body: dict):
 
     timeout = aiohttp.ClientTimeout(total=30)
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(f"{base_url}/chat/completions", headers=headers, json=payload) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                    return {"status": "ok", "response": content.strip()}
-                else:
-                    body_text = await resp.text()
-                    return {"status": "error", "code": resp.status, "detail": body_text[:200]}
+        async with _http_session().post(
+            f"{base_url}/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=timeout,
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                return {"status": "ok", "response": content.strip()}
+            else:
+                body_text = await resp.text()
+                return {"status": "error", "code": resp.status, "detail": body_text[:200]}
     except Exception as exc:
         return {"status": "error", "detail": str(exc)}
 

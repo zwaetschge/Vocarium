@@ -6,11 +6,12 @@ Generates sound effects from text prompts using MMAudio large_44k_v2.
 
 import io
 import gc
+import os
+import asyncio
 import threading
 import time
 
 import torch
-import torchaudio
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -30,43 +31,83 @@ last_activity = time.time()
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
 VARIANT = "large_44k_v2"
-IDLE_TIMEOUT = 600  # 10 min
+IDLE_TIMEOUT = int(os.environ.get("IDLE_TIMEOUT", "600"))  # seconds
+RESTART_ON_UNLOAD = os.environ.get("RESTART_ON_UNLOAD", "1").lower() not in {
+    "0",
+    "false",
+    "no",
+}
+exit_scheduled = False
+
+
+def _has_model_state() -> bool:
+    """Return true if any model object is still referenced by the process."""
+    return any(obj is not None for obj in (net, fm, feature_utils, seq_cfg, rng))
+
+
+async def _exit_after_response(reason: str):
+    await asyncio.sleep(0.5)
+    print(f"MMAudio process exiting after unload ({reason})", flush=True)
+    os._exit(0)
+
+
+def _schedule_process_exit(reason: str) -> bool:
+    """Restart the server process so CUDA contexts held by dependencies die."""
+    global exit_scheduled
+    if not RESTART_ON_UNLOAD or exit_scheduled:
+        return False
+    exit_scheduled = True
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_exit_after_response(reason))
+    except RuntimeError:
+        timer = threading.Timer(0.5, lambda: os._exit(0))
+        timer.daemon = True
+        timer.start()
+    return True
 
 
 def _load_model():
     """Load MMAudio model into GPU memory."""
     global net, fm, feature_utils, seq_cfg, rng, model_loaded
 
-    from mmaudio.eval_utils import all_model_cfg, setup_eval_logging
-    from mmaudio.model.networks import get_my_mmaudio
-    from mmaudio.model.flow_matching import FlowMatching
-    from mmaudio.model.utils.features_utils import FeaturesUtils
+    model_loaded = False
 
-    setup_eval_logging()
-    print(f"Loading MMAudio {VARIANT}...", flush=True)
+    try:
+        from mmaudio.eval_utils import all_model_cfg, setup_eval_logging
+        from mmaudio.model.networks import get_my_mmaudio
+        from mmaudio.model.flow_matching import FlowMatching
+        from mmaudio.model.utils.features_utils import FeaturesUtils
 
-    model_cfg = all_model_cfg[VARIANT]
-    model_cfg.download_if_needed()
-    seq_cfg = model_cfg.seq_cfg
+        setup_eval_logging()
+        print(f"Loading MMAudio {VARIANT}...", flush=True)
 
-    net = get_my_mmaudio(model_cfg.model_name).to(DEVICE, DTYPE).eval()
-    net.load_weights(torch.load(model_cfg.model_path, map_location=DEVICE, weights_only=True))
+        model_cfg = all_model_cfg[VARIANT]
+        model_cfg.download_if_needed()
+        seq_cfg = model_cfg.seq_cfg
 
-    fm = FlowMatching(min_sigma=0, inference_mode="euler", num_steps=25)
+        net = get_my_mmaudio(model_cfg.model_name).to(DEVICE, DTYPE).eval()
+        net.load_weights(torch.load(model_cfg.model_path, map_location=DEVICE, weights_only=True))
 
-    feature_utils = FeaturesUtils(
-        tod_vae_ckpt=model_cfg.vae_path,
-        synchformer_ckpt=model_cfg.synchformer_ckpt,
-        enable_conditions=True,
-        mode=model_cfg.mode,
-        bigvgan_vocoder_ckpt=model_cfg.bigvgan_16k_path,
-        need_vae_encoder=False,
-    )
-    feature_utils = feature_utils.to(DEVICE, DTYPE).eval()
+        fm = FlowMatching(min_sigma=0, inference_mode="euler", num_steps=25)
 
-    rng = torch.Generator(device=DEVICE)
-    model_loaded = True
-    print(f"MMAudio {VARIANT} loaded successfully", flush=True)
+        feature_utils = FeaturesUtils(
+            tod_vae_ckpt=model_cfg.vae_path,
+            synchformer_ckpt=model_cfg.synchformer_ckpt,
+            enable_conditions=True,
+            mode=model_cfg.mode,
+            bigvgan_vocoder_ckpt=model_cfg.bigvgan_16k_path,
+            need_vae_encoder=False,
+        )
+        feature_utils = feature_utils.to(DEVICE, DTYPE).eval()
+
+        rng = torch.Generator(device=DEVICE)
+        model_loaded = True
+        print(f"MMAudio {VARIANT} loaded successfully", flush=True)
+    except Exception:
+        _unload_model()
+        _schedule_process_exit("model load failed")
+        raise
 
 
 def _unload_model():
@@ -80,7 +121,12 @@ def _unload_model():
     model_loaded = False
     gc.collect()
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        try:
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        except Exception as exc:
+            print(f"MMAudio CUDA cache cleanup failed: {exc}", flush=True)
     print("MMAudio model unloaded, GPU memory freed", flush=True)
 
 
@@ -92,21 +138,16 @@ def _ensure_loaded():
         _load_model()
 
 
-# ---------------------------------------------------------------------------
-# Idle watcher
-# ---------------------------------------------------------------------------
-import asyncio
-
-
 async def idle_watcher():
     while True:
         await asyncio.sleep(60)
         if IDLE_TIMEOUT <= 0:
             continue
         with lock:
-            if model_loaded and time.time() - last_activity > IDLE_TIMEOUT:
+            if (model_loaded or _has_model_state()) and time.time() - last_activity > IDLE_TIMEOUT:
                 print(f"MMAudio idle for {IDLE_TIMEOUT}s, unloading to free GPU", flush=True)
                 _unload_model()
+                _schedule_process_exit("idle timeout")
 
 
 @app.on_event("startup")
@@ -127,26 +168,24 @@ class GenerateRequest(BaseModel):
     seed: int | None = None
 
 
-@app.post("/generate")
-async def generate_sfx(req: GenerateRequest):
-    """Generate a sound effect from a text prompt. Returns WAV audio."""
-    with lock:
-        _ensure_loaded()
-
-    if req.duration < 1 or req.duration > 30:
-        raise HTTPException(400, "Duration must be between 1 and 30 seconds")
-
+def _generate_sfx_blocking(req: GenerateRequest) -> tuple[bytes, float, int]:
+    """Load and run MMAudio off the FastAPI event loop."""
     from mmaudio.eval_utils import generate
+    import soundfile as sf
 
-    try:
-        with lock:
-            # Update duration
+    with lock:
+        try:
+            _ensure_loaded()
+        except Exception as exc:
+            _schedule_process_exit("model load failed")
+            raise RuntimeError(f"MMAudio model load failed: {exc}") from exc
+
+        try:
             seq_cfg.duration = req.duration
             net.update_seq_lengths(
                 seq_cfg.latent_seq_len, seq_cfg.clip_seq_len, seq_cfg.sync_seq_len
             )
 
-            # Set seed
             if req.seed is not None:
                 rng.manual_seed(req.seed)
             else:
@@ -166,33 +205,50 @@ async def generate_sfx(req: GenerateRequest):
                     cfg_strength=req.cfg_strength,
                 )
             gen_time = time.time() - start
+            sampling_rate = seq_cfg.sampling_rate
 
-        audio = audios.float().cpu()[0]  # may be 1D or 2D
+        except Exception as exc:
+            _unload_model()
+            _schedule_process_exit("generation failed")
+            raise RuntimeError(f"Generation failed: {exc}") from exc
+
+    audio = audios.float().detach().cpu()[0]  # may be 1D or 2D
+    if audio.dim() == 1:
+        audio = audio.unsqueeze(0)  # (1, samples)
+    elif audio.dim() > 2:
+        audio = audio.squeeze()
         if audio.dim() == 1:
-            audio = audio.unsqueeze(0)  # (1, samples)
-        elif audio.dim() > 2:
-            audio = audio.squeeze()
-            if audio.dim() == 1:
-                audio = audio.unsqueeze(0)
+            audio = audio.unsqueeze(0)
 
-        # Encode to WAV
-        buf = io.BytesIO()
-        torchaudio.save(buf, audio, seq_cfg.sampling_rate, format="wav")
-        wav_bytes = buf.getvalue()
+    buf = io.BytesIO()
+    sf.write(buf, audio.numpy().T, sampling_rate, format="WAV")
+    return buf.getvalue(), gen_time, sampling_rate
 
-        from fastapi.responses import Response
-        return Response(
-            content=wav_bytes,
-            media_type="audio/wav",
-            headers={
-                "X-Generation-Time": f"{gen_time:.2f}",
-                "X-Audio-Duration": f"{req.duration:.1f}",
-                "X-Sample-Rate": str(seq_cfg.sampling_rate),
-            },
+
+@app.post("/generate")
+async def generate_sfx(req: GenerateRequest):
+    """Generate a sound effect from a text prompt. Returns WAV audio."""
+    if req.duration < 1 or req.duration > 30:
+        raise HTTPException(400, "Duration must be between 1 and 30 seconds")
+
+    try:
+        wav_bytes, gen_time, sampling_rate = await asyncio.to_thread(
+            _generate_sfx_blocking, req
         )
+    except Exception as exc:
+        status = 503 if "model load failed" in str(exc).lower() else 500
+        raise HTTPException(status, str(exc)) from exc
 
-    except Exception as e:
-        raise HTTPException(500, f"Generation failed: {e}")
+    from fastapi.responses import Response
+    return Response(
+        content=wav_bytes,
+        media_type="audio/wav",
+        headers={
+            "X-Generation-Time": f"{gen_time:.2f}",
+            "X-Audio-Duration": f"{req.duration:.1f}",
+            "X-Sample-Rate": str(sampling_rate),
+        },
+    )
 
 
 @app.post("/unload")
@@ -200,14 +256,30 @@ async def unload():
     """Unload model to free GPU memory."""
     with lock:
         was_loaded = model_loaded
-        if model_loaded:
+        had_state = _has_model_state()
+        restart_scheduled = False
+        if was_loaded or had_state:
             _unload_model()
-    return {"status": "unloaded", "was_loaded": was_loaded}
+            restart_scheduled = _schedule_process_exit("manual unload")
+    return {
+        "status": "unloaded",
+        "was_loaded": was_loaded,
+        "had_state": had_state,
+        "restart_scheduled": restart_scheduled,
+    }
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model_loaded": model_loaded, "variant": VARIANT}
+    return {
+        "status": "ok",
+        "model_loaded": model_loaded,
+        "has_model_state": _has_model_state(),
+        "variant": VARIANT,
+        "idle_timeout": IDLE_TIMEOUT,
+        "restart_on_unload": RESTART_ON_UNLOAD,
+        "exit_scheduled": exit_scheduled,
+    }
 
 
 if __name__ == "__main__":

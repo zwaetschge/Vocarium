@@ -140,7 +140,12 @@ const sectionLabels: Record<NavItem['section'], string> = {
   tools: 'Tools',
 };
 
-export default function Sidebar() {
+interface SidebarProps {
+  open?: boolean;
+  onNavigate?: () => void;
+}
+
+export default function Sidebar({ open = false, onNavigate }: SidebarProps) {
   const location = useLocation();
   const [apiStatus, setApiStatus] = useState<'online' | 'offline' | 'loading'>('loading');
   const [user, setUser] = useState<User | null>(null);
@@ -148,7 +153,9 @@ export default function Sidebar() {
   useEffect(() => {
     const check = () => {
       getHealth()
-        .then(() => setApiStatus('online'))
+        .then((health) => {
+          setApiStatus(health.gpu_resources?.available === false ? 'offline' : 'online');
+        })
         .catch(() => setApiStatus('offline'));
     };
     check();
@@ -164,21 +171,8 @@ export default function Sidebar() {
 
   return (
     <aside
-      className="glass"
-      style={{
-        position: 'fixed',
-        left: 0,
-        top: 0,
-        bottom: 0,
-        width: '260px',
-        display: 'flex',
-        flexDirection: 'column',
-        zIndex: 30,
-        borderTop: 'none',
-        borderLeft: 'none',
-        borderBottom: 'none',
-        borderRadius: 0,
-      }}
+      className={`glass app-sidebar ${open ? 'app-sidebar-open' : ''}`}
+      aria-label="Primary navigation"
     >
       {/* Brand */}
       <div style={{ position: 'relative', padding: '26px 22px 22px', display: 'flex', alignItems: 'center', gap: '12px' }}>
@@ -189,7 +183,7 @@ export default function Sidebar() {
               fontSize: '19px',
               fontWeight: 600,
               fontFamily: 'var(--font-display)',
-              letterSpacing: '-0.035em',
+              letterSpacing: 0,
               color: 'var(--color-text)',
               lineHeight: 1,
             }}
@@ -216,7 +210,7 @@ export default function Sidebar() {
               {items.map((item) => {
                 const active = location.pathname === item.path;
                 return (
-                  <Link key={item.path} to={item.path} style={{ textDecoration: 'none' }}>
+                  <Link key={item.path} to={item.path} onClick={onNavigate} style={{ textDecoration: 'none' }}>
                     <motion.div
                       whileTap={{ scale: 0.98 }}
                       style={{
@@ -228,7 +222,7 @@ export default function Sidebar() {
                         borderRadius: '10px',
                         fontSize: '13.5px',
                         fontWeight: 500,
-                        letterSpacing: '-0.005em',
+                        letterSpacing: 0,
                         color: active ? 'var(--color-text)' : 'var(--color-text-secondary)',
                         background: active ? 'rgba(123, 97, 255, 0.14)' : 'transparent',
                         border: active ? '1px solid rgba(123, 97, 255, 0.28)' : '1px solid transparent',

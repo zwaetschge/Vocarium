@@ -41,6 +41,12 @@ export interface HealthStatus {
     voices_loaded: number;
     [key: string]: unknown;
   };
+  gpu_resources?: {
+    enabled?: boolean;
+    available?: boolean;
+    error?: string;
+    [key: string]: unknown;
+  };
 }
 
 export interface BenchmarkResult {
@@ -92,6 +98,7 @@ export type PodcastStatus =
   | 'script_ready'
   | 'generating_audio'
   | 'ready'
+  | 'cancelled'
   | 'error';
 
 export interface ScriptSegment {
@@ -140,6 +147,8 @@ export interface Podcast {
   audio_path?: string | null;
   audio_duration: number;
   audio_format: string;
+  audio_size: number;
+  audio_sha256: string;
   total_words: number;
   created_at: string;
   updated_at: string;
@@ -168,13 +177,35 @@ export interface PodcastProgressEvent {
   message: string;
   segment_id?: string | null;
   segment_position?: number | null;
+  job_id?: string | null;
+  request_id?: string | null;
 }
 
 export interface PodcastAudioResult {
   audio_path: string;
   duration: number;
   file_size: number;
+  audio_sha256?: string;
   audio_format: string;
+}
+
+export interface QueueJob {
+  job_id: string;
+  user_id?: number | null;
+  request_id?: string | null;
+  service_type: string;
+  description: string;
+  status: string;
+  position: number;
+  created_at: number;
+  started_at?: number | null;
+  finished_at?: number | null;
+  heartbeat_at?: number | null;
+  error?: string | null;
+  last_error?: string | null;
+  attempt_count?: number;
+  max_attempts?: number;
+  cancel_requested?: boolean;
 }
 
 // --- LLM Providers ---
