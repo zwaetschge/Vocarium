@@ -1216,7 +1216,10 @@ def _verify_voice_exists(voice_id: str, user_id: int | None = None):
         return
     db = get_db()
     if user_id is not None:
-        r = db.execute("SELECT id FROM voices WHERE id=? AND user_id=?", (voice_id, user_id)).fetchone()
+        r = db.execute(
+            "SELECT id FROM voices WHERE id=? AND (user_id=? OR user_id IS NULL)",
+            (voice_id, user_id),
+        ).fetchone()
     else:
         r = db.execute("SELECT id FROM voices WHERE id=?", (voice_id,)).fetchone()
     if not r:
@@ -1236,7 +1239,10 @@ def _verify_voice_source(voice_id: str, allowed_sources: tuple[str, ...], user_i
         raise HTTPException(403, "Default voice not allowed on this endpoint")
     db = get_db()
     if user_id is not None:
-        r = db.execute("SELECT source FROM voices WHERE id=? AND user_id=?", (voice_id, user_id)).fetchone()
+        r = db.execute(
+            "SELECT source FROM voices WHERE id=? AND (user_id=? OR user_id IS NULL)",
+            (voice_id, user_id),
+        ).fetchone()
     else:
         r = db.execute("SELECT source FROM voices WHERE id=?", (voice_id,)).fetchone()
     if not r:
@@ -1257,7 +1263,7 @@ def _voice_source(voice_id: str, user_id: int | None = None) -> str:
     db = get_db()
     if user_id is not None:
         row = db.execute(
-            "SELECT source FROM voices WHERE id=? AND user_id=?",
+            "SELECT source FROM voices WHERE id=? AND (user_id=? OR user_id IS NULL)",
             (voice_id, user_id),
         ).fetchone()
     else:
@@ -2133,15 +2139,37 @@ class OpenAISpeechRequest(BaseModel):
     speed: float = 1.0  # ignored, kept for compat
 
 
-def _normalize_openai_tts_voice(voice: str) -> str:
-    """Map SUB/WAVE persona labels to the only built-in OpenAI TTS voice.
+def _openai_voice_lookup_key(value: str) -> str:
+    return re.sub(r"[\s_-]+", " ", (value or "").strip()).casefold()
+
+
+def _resolve_openai_tts_voice(voice: str, user_id: int | None = None) -> str:
+    """Resolve OpenAI-compatible voice input to a concrete Vocarium voice id.
 
     Persona names belong in the caller's script/persona fields. The
-    OpenAI-compatible voice field stays a concrete Vocarium voice id.
+    OpenAI-compatible voice field should be a concrete Vocarium voice id, but
+    some clients send the displayed voice name back instead of the listed id.
+    Stored user voices win over persona aliases.
     """
     cleaned = (voice or "").strip()
     if not cleaned:
         return "default"
+
+    lookup_key = _openai_voice_lookup_key(cleaned)
+    db = get_db()
+    if user_id is not None:
+        rows = db.execute("SELECT id, name FROM voices WHERE user_id=?", (user_id,)).fetchall()
+        rows += db.execute("SELECT id, name FROM voices WHERE user_id IS NULL").fetchall()
+    else:
+        rows = db.execute("SELECT id, name FROM voices").fetchall()
+
+    for voice_id, name in rows:
+        if cleaned == (voice_id or ""):
+            return voice_id
+    for voice_id, name in rows:
+        if lookup_key == _openai_voice_lookup_key(name or ""):
+            return voice_id
+
     normalized = re.sub(r"[\s_-]+", " ", cleaned).casefold()
     compact = re.sub(r"[\s_-]+", "", cleaned).casefold()
     if (
@@ -2208,7 +2236,7 @@ async def openai_tts(req: OpenAISpeechRequest, request: Request):
     Designed voices live behind ``/v1/audio/speech/designed``.
     """
     user = get_current_user(request, allow_anonymous=True)
-    voice = _normalize_openai_tts_voice(req.voice)
+    voice = _resolve_openai_tts_voice(req.voice, user_id=user["id"])
     _verify_voice_source(voice, allowed_sources=("clone",), user_id=user["id"])
     return await _openai_speech_proxy(
         req,
@@ -2225,8 +2253,13 @@ async def openai_tts_designed(req: OpenAISpeechRequest, request: Request):
     OpenAI-compatible endpoint. Cloned and default base voices are rejected.
     """
     user = get_current_user(request, allow_anonymous=True)
-    _verify_voice_source(req.voice, allowed_sources=("design",), user_id=user["id"])
-    return await _openai_speech_proxy(req, "OpenAI TTS (designed)")
+    voice = _resolve_openai_tts_voice(req.voice, user_id=user["id"])
+    _verify_voice_source(voice, allowed_sources=("design",), user_id=user["id"])
+    return await _openai_speech_proxy(
+        req,
+        "OpenAI TTS (designed)",
+        voice_override=voice,
+    )
 
 
 @app.post("/v1/audio/transcriptions")
@@ -2283,6 +2316,13 @@ async def openai_models():
     }
 
 
+@app.get("/v1/audio/models")
+async def openai_audio_models():
+    """Open WebUI-compatible TTS model listing."""
+    data = await openai_models()
+    return {"models": data["data"]}
+
+
 @app.get("/v1/voices")
 async def openai_voices(request: Request, source: str | None = Query(default=None)):
     """List available TTS voices. Optional source filter: clone, design, or custom."""
@@ -2309,6 +2349,8 @@ async def openai_voices(request: Request, source: str | None = Query(default=Non
             "source": "clone",
         })
     for r in rows:
+        if r[0] == "default" and source in (None, "clone"):
+            continue
         voices.append({
             "voice_id": r[0],
             "name": r[1],
@@ -2316,6 +2358,23 @@ async def openai_voices(request: Request, source: str | None = Query(default=Non
             "source": r[3],
         })
     return {"voices": voices}
+
+
+@app.get("/v1/audio/voices")
+async def openai_audio_voices(request: Request):
+    """Open WebUI-compatible voice listing for the base /speech endpoint."""
+    data = await openai_voices(request, source="clone")
+    return {
+        "voices": [
+            {
+                "id": voice["voice_id"],
+                "name": voice["name"],
+                "language": voice.get("language"),
+                "source": voice.get("source"),
+            }
+            for voice in data.get("voices", [])
+        ]
+    }
 
 
 class PersonaRequest(BaseModel):

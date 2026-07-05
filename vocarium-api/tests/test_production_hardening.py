@@ -576,6 +576,37 @@ class PodcastProductionHardeningTest(unittest.TestCase):
         self.assertIn("def _validate_response_format", source)
         self.assertIn("Streaming speech returns base64 WAV chunks", source)
 
+    def test_qwen_clone_generation_is_voice_stable_by_default(self):
+        source = (REPO_ROOT / "qwen3-tts" / "server.py").read_text()
+        self.assertIn("TTS_CLONE_DO_SAMPLE", source)
+        self.assertIn('"do_sample": CLONE_DO_SAMPLE', source)
+        self.assertIn('"temperature": CLONE_TEMPERATURE', source)
+        self.assertIn("TTS_CLONE_XVEC_ONLY", source)
+        self.assertIn('xvec_only = CLONE_XVEC_ONLY or not (ref_text or "").strip()', source)
+        self.assertIn('"xvec_only": xvec_only', source)
+        self.assertIn('"x_vector_only_mode": xvec_only', source)
+        self.assertIn("def _normalize_reference_wav", source)
+        self.assertIn("ref_audio_normalization", source)
+        self.assertIn("TTS_REF_NORMALIZE_PEAK", source)
+        self.assertIn("Unknown voice", source)
+        self.assertNotIn("voice_id = available[0]", source)
+        self.assertLess(source.index("voice_id = request.voice"), source.index("ensure_model(target_model)"))
+        self.assertIn("inference_lock = threading.RLock()", source)
+        self.assertIn("with inference_lock:\n                for i, chunk in enumerate(chunks):", source)
+        self.assertIn("def _run_stream_request", source)
+        self.assertIn("loop.run_in_executor(None, _run_stream_request)", source)
+        self.assertIn("voice_clone_prompt_cache", source)
+        self.assertIn("create_voice_clone_prompt", source)
+        self.assertIn("voice_clone_prompt", source)
+        self.assertIn("_clear_voice_clone_prompt(voice_id)", source)
+
+    def test_neutts_experiment_is_not_in_stack(self):
+        compose = (REPO_ROOT / "docker-compose.yml").read_text()
+        main_source = (API_ROOT / "main.py").read_text()
+        self.assertNotIn("neutts-tts", compose)
+        self.assertNotIn("NEUTTS_URL", main_source)
+        self.assertFalse((REPO_ROOT / "neutts-tts" / "Dockerfile").exists())
+
     def test_chunk_text_uses_requested_overlap(self):
         from podcast.helpers import chunk_text
 
@@ -590,9 +621,15 @@ class PodcastProductionHardeningTest(unittest.TestCase):
 
     def test_openai_tts_persona_aliases_route_to_default_voice(self):
         source = (API_ROOT / "main.py").read_text()
-        self.assertIn("def _normalize_openai_tts_voice", source)
+        self.assertIn("def _resolve_openai_tts_voice", source)
+        self.assertIn("def _openai_voice_lookup_key", source)
+        self.assertIn("SELECT id, name FROM voices WHERE user_id=?", source)
+        self.assertIn("SELECT id, name FROM voices WHERE user_id IS NULL", source)
+        self.assertIn("WHERE id=? AND (user_id=? OR user_id IS NULL)", source)
+        self.assertIn("Stored user voices win over persona aliases", source)
         self.assertIn('"michael scott"', source)
-        self.assertIn("voice = _normalize_openai_tts_voice(req.voice)", source)
+        self.assertIn('if r[0] == "default" and source in (None, "clone"):', source)
+        self.assertIn("voice = _resolve_openai_tts_voice(req.voice, user_id=user[\"id\"])", source)
         self.assertIn("voice_override=voice", source)
         self.assertIn('"voice": voice', source)
 

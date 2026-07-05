@@ -98,6 +98,26 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return normalized in {"1", "true", "yes", "on"}
 
 
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
 def _voice_dir_for(voice_id: str) -> Path:
     cleaned = (voice_id or "").strip()
     if not VOICE_ID_RE.fullmatch(cleaned):
@@ -134,6 +154,17 @@ def _default_cuda_graphs_enabled() -> bool:
 ENABLE_CUDA_GRAPHS = _env_bool("TTS_ENABLE_CUDA_GRAPHS", _default_cuda_graphs_enabled())
 CUDA_GRAPH_MODELS = {"1.7b-base"} if ENABLE_CUDA_GRAPHS else set()
 
+# Clone/base voice identity gets unstable when each sentence is sampled as a
+# fresh generation. Keep clone generation deterministic by default; deployments
+# that prefer more variation can opt back in via TTS_CLONE_DO_SAMPLE=true.
+CLONE_DO_SAMPLE = _env_bool("TTS_CLONE_DO_SAMPLE", False)
+CLONE_TEMPERATURE = _env_float("TTS_CLONE_TEMPERATURE", 0.7)
+CLONE_TOP_K = _env_int("TTS_CLONE_TOP_K", 20)
+CLONE_TOP_P = _env_float("TTS_CLONE_TOP_P", 0.8)
+CLONE_XVEC_ONLY = _env_bool("TTS_CLONE_XVEC_ONLY", False)
+REF_NORMALIZATION_VERSION = 2
+REF_NORMALIZE_PEAK = _env_float("TTS_REF_NORMALIZE_PEAK", 0.85)
+
 # ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
@@ -142,9 +173,10 @@ model: Optional[FasterQwen3TTS] = None
 use_cuda_graphs: bool = False  # whether current model uses CUDA graph path
 voice_prompts: dict = {}       # legacy compat — kept for health endpoint
 voice_refs: dict = {}          # {voice_id: {"ref_audio": path, "ref_text": str}}
+voice_clone_prompt_cache: dict = {}  # {(model_id, voice_id, xvec_only): prompt}
 last_used: float = 0.0
 model_lock = threading.Lock()
-inference_lock = threading.Lock()
+inference_lock = threading.RLock()
 active_requests: int = 0       # concurrent inference counter
 idle_timer: Optional[threading.Timer] = None
 
@@ -175,6 +207,7 @@ def _do_unload_model():
     if model is None:
         return
     print(f"Unloading model {current_model_id} ...", flush=True)
+    voice_clone_prompt_cache.clear()
     del model
     model = None
     gc.collect()
@@ -203,26 +236,126 @@ def _trim_silence(audio: np.ndarray, sr: int, threshold: float = 0.03, tail_sile
     return (np.concatenate([audio, silence]), sr)
 
 
-def _generate_voice_clone(text: str, language: str, ref_audio: str, ref_text: str,
+def _normalize_reference_wav(audio_path: Path) -> dict:
+    """Normalize clone reference audio for stable speaker conditioning."""
+    tmp_path = audio_path.with_name(f".{audio_path.stem}.normalize.tmp.wav")
+    result = subprocess.run(
+        [
+            "ffmpeg", "-y", "-i", str(audio_path),
+            "-ar", "24000", "-ac", "1", "-acodec", "pcm_s16le",
+            str(tmp_path),
+        ],
+        capture_output=True,
+        timeout=300,
+    )
+    if result.returncode != 0:
+        tmp_path.unlink(missing_ok=True)
+        raise RuntimeError(result.stderr.decode(errors="replace")[:500])
+    tmp_path.replace(audio_path)
+
+    audio, sr = sf.read(str(audio_path), dtype="float32", always_2d=False)
+    if audio.ndim > 1:
+        audio = np.mean(audio, axis=1)
+    audio = np.asarray(audio, dtype=np.float32)
+    audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
+    if audio.size == 0:
+        raise ValueError("reference audio is empty")
+
+    audio = audio - float(np.mean(audio))
+    peak_before = float(np.max(np.abs(audio))) if audio.size else 0.0
+    if peak_before <= 1e-5:
+        raise ValueError("reference audio is silent")
+
+    trim_threshold = max(0.004, min(0.03, peak_before * 0.025))
+    audio, sr = _trim_silence(audio, sr, threshold=trim_threshold, tail_silence=0.25)
+    peak_after_trim = float(np.max(np.abs(audio))) if audio.size else 0.0
+    if peak_after_trim > 1e-5:
+        audio = audio * min(4.0, REF_NORMALIZE_PEAK / peak_after_trim)
+    audio = np.clip(audio, -0.98, 0.98).astype(np.float32)
+    sf.write(str(audio_path), audio, sr, format="WAV", subtype="PCM_16")
+    return {
+        "version": REF_NORMALIZATION_VERSION,
+        "duration_s": round(float(len(audio) / sr), 3),
+        "sample_rate": sr,
+        "peak_before": round(peak_before, 5),
+        "peak_after": round(float(np.max(np.abs(audio))) if audio.size else 0.0, 5),
+    }
+
+
+def _voice_clone_prompt_for(voice_id: str, ref_audio: str, ref_text: str):
+    """Build and cache stable speaker conditioning for the current Base model."""
+    if model is None or current_model_id is None:
+        raise RuntimeError("Model not ready")
+    xvec_only = CLONE_XVEC_ONLY or not (ref_text or "").strip()
+    key = (current_model_id, voice_id, xvec_only)
+    cached = voice_clone_prompt_cache.get(key)
+    if cached is not None:
+        return cached
+    if not hasattr(model.model, "create_voice_clone_prompt"):
+        return None
+    prompt = model.model.create_voice_clone_prompt(
+        ref_audio=ref_audio,
+        ref_text=ref_text,
+        x_vector_only_mode=xvec_only,
+    )
+    voice_clone_prompt_cache[key] = prompt
+    return prompt
+
+
+def _clear_voice_clone_prompt(voice_id: str | None = None) -> None:
+    if voice_id is None:
+        voice_clone_prompt_cache.clear()
+        return
+    for key in list(voice_clone_prompt_cache.keys()):
+        if key[1] == voice_id:
+            voice_clone_prompt_cache.pop(key, None)
+
+
+def _generate_voice_clone(text: str, language: str, voice_id: str,
+                          ref_audio: str, ref_text: str,
                           max_new_tokens: int = 800) -> tuple:
     """Generate voice clone using CUDA graphs (fast) or fallback (compatible)."""
     with inference_lock:
+        voice_clone_prompt = _voice_clone_prompt_for(voice_id, ref_audio, ref_text)
+        xvec_only = CLONE_XVEC_ONLY or not (ref_text or "").strip()
         if use_cuda_graphs:
-            return model.generate_voice_clone(
-                text=text, language=language,
-                ref_audio=ref_audio, ref_text=ref_text,
-                max_new_tokens=max_new_tokens,
-                non_streaming_mode=True,
-                repetition_penalty=1.05,
-            )
-        return model.model.generate_voice_clone(
-            text=text, language=language,
-            ref_audio=ref_audio, ref_text=ref_text,
-            max_new_tokens=max_new_tokens,
-            non_streaming_mode=True,
-            eos_token_id=[2150, 2157],
-            repetition_penalty=1.05,
-        )
+            kwargs = {
+                "text": text,
+                "language": language,
+                "max_new_tokens": max_new_tokens,
+                "non_streaming_mode": True,
+                "temperature": CLONE_TEMPERATURE,
+                "top_k": CLONE_TOP_K,
+                "top_p": CLONE_TOP_P,
+                "do_sample": CLONE_DO_SAMPLE,
+                "repetition_penalty": 1.05,
+                "xvec_only": xvec_only,
+            }
+            if voice_clone_prompt is not None:
+                kwargs["voice_clone_prompt"] = voice_clone_prompt
+            else:
+                kwargs["ref_audio"] = ref_audio
+                kwargs["ref_text"] = ref_text
+            return model.generate_voice_clone(**kwargs)
+        kwargs = {
+            "text": text,
+            "language": language,
+            "max_new_tokens": max_new_tokens,
+            "non_streaming_mode": True,
+            "eos_token_id": [2150, 2157],
+            "temperature": CLONE_TEMPERATURE,
+            "top_k": CLONE_TOP_K,
+            "top_p": CLONE_TOP_P,
+            "do_sample": CLONE_DO_SAMPLE,
+            "repetition_penalty": 1.05,
+            "x_vector_only_mode": xvec_only,
+        }
+        if voice_clone_prompt is not None:
+            kwargs["voice_clone_prompt"] = voice_clone_prompt
+        else:
+            kwargs["ref_audio"] = ref_audio
+            kwargs["ref_text"] = ref_text
+        return model.model.generate_voice_clone(**kwargs)
 
 
 def _sanitize_ref_text(ref_text: str | None) -> str:
@@ -237,15 +370,32 @@ def _write_metadata(meta_file: Path, meta: dict) -> None:
     meta_file.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
 
-def _convert_audio_bytes_to_wav(audio_bytes: bytes, audio_path: Path) -> None:
+def _convert_audio_bytes_to_wav(audio_bytes: bytes, audio_path: Path) -> dict:
     result = subprocess.run(
-        ["ffmpeg", "-y", "-i", "pipe:0", "-ar", "24000", "-ac", "1", str(audio_path)],
+        [
+            "ffmpeg", "-y", "-i", "pipe:0",
+            "-ar", "24000", "-ac", "1", "-acodec", "pcm_s16le",
+            str(audio_path),
+        ],
         input=audio_bytes,
         capture_output=True,
         timeout=300,
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.decode(errors="replace")[:500])
+    return _normalize_reference_wav(audio_path)
+
+
+def _normalize_voice_ref_if_needed(voice_dir: Path, meta: dict) -> dict:
+    norm = meta.get("ref_audio_normalization") or {}
+    if norm.get("version") == REF_NORMALIZATION_VERSION:
+        return meta
+    ref_audio = voice_dir / "ref_audio.wav"
+    stats = _normalize_reference_wav(ref_audio)
+    meta["ref_audio_normalization"] = stats
+    _write_metadata(voice_dir / "metadata.json", meta)
+    print(f"  Normalized ref_audio for voice '{voice_dir.name}'", flush=True)
+    return meta
 
 
 def _load_all_voice_refs():
@@ -270,6 +420,10 @@ def _load_all_voice_refs():
             meta["ref_text"] = ref_text
             _write_metadata(meta_file, meta)
             print(f"  Sanitized ref_text for voice '{voice_dir.name}'", flush=True)
+        try:
+            meta = _normalize_voice_ref_if_needed(voice_dir, meta)
+        except Exception as exc:
+            print(f"  Warning: failed to normalize voice '{voice_dir.name}': {exc}", flush=True)
         vid = voice_dir.name
         voice_refs[vid] = {
             "ref_audio": str(ref_audio),
@@ -434,6 +588,17 @@ async def health():
         "idle_timeout": IDLE_TIMEOUT,
         "cuda_graphs_enabled": ENABLE_CUDA_GRAPHS,
         "cuda_graph_models": sorted(CUDA_GRAPH_MODELS),
+        "clone_sampling": {
+            "do_sample": CLONE_DO_SAMPLE,
+            "temperature": CLONE_TEMPERATURE,
+            "top_k": CLONE_TOP_K,
+            "top_p": CLONE_TOP_P,
+            "xvec_only": CLONE_XVEC_ONLY,
+        },
+        "voice_clone_prompt_cache": [
+            {"model": key[0], "voice": key[1], "xvec_only": key[2]}
+            for key in voice_clone_prompt_cache.keys()
+        ],
     }
 
 
@@ -547,25 +712,23 @@ async def register_voice(
         ref_audio, MAX_VOICE_UPLOAD_BYTES, "Reference audio"
     )
 
-    # Convert to WAV if needed
-    if ref_audio.filename and not ref_audio.filename.lower().endswith(".wav"):
-        try:
-            await asyncio.to_thread(_convert_audio_bytes_to_wav, audio_bytes, audio_path)
-        except Exception as exc:
-            raise HTTPException(500, f"Audio conversion failed: {exc}") from exc
-    else:
-        await asyncio.to_thread(audio_path.write_bytes, audio_bytes)
+    try:
+        normalization = await asyncio.to_thread(_convert_audio_bytes_to_wav, audio_bytes, audio_path)
+    except Exception as exc:
+        raise HTTPException(500, f"Audio conversion failed: {exc}") from exc
 
     meta = {
         "name": name or voice_id,
         "ref_text": ref_text,
         "language": language,
         "source": "clone",
+        "ref_audio_normalization": normalization,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     await asyncio.to_thread(_write_metadata, voice_dir / "metadata.json", meta)
 
     # Index the voice ref for generation
+    _clear_voice_clone_prompt(voice_id)
     voice_refs[voice_id] = {"ref_audio": str(audio_path), "ref_text": ref_text}
     voice_prompts[voice_id] = True
 
@@ -590,7 +753,10 @@ async def register_designed_voice(
     audio_bytes = await _read_upload_limited(
         ref_audio, MAX_VOICE_UPLOAD_BYTES, "Reference audio"
     )
-    await asyncio.to_thread(audio_path.write_bytes, audio_bytes)
+    try:
+        normalization = await asyncio.to_thread(_convert_audio_bytes_to_wav, audio_bytes, audio_path)
+    except Exception as exc:
+        raise HTTPException(500, f"Audio conversion failed: {exc}") from exc
 
     meta = {
         "name": name or voice_id,
@@ -598,11 +764,13 @@ async def register_designed_voice(
         "language": language,
         "source": "design",
         "design_prompt": design_prompt,
+        "ref_audio_normalization": normalization,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     await asyncio.to_thread(_write_metadata, voice_dir / "metadata.json", meta)
 
     # Index the voice ref for generation
+    _clear_voice_clone_prompt(voice_id)
     voice_refs[voice_id] = {"ref_audio": str(audio_path), "ref_text": ref_text}
     voice_prompts[voice_id] = True
 
@@ -617,6 +785,7 @@ async def delete_voice(voice_id: str):
     shutil.rmtree(voice_dir)
     voice_prompts.pop(voice_id, None)
     voice_refs.pop(voice_id, None)
+    _clear_voice_clone_prompt(voice_id)
     return {"status": "deleted", "voice_id": voice_id}
 
 
@@ -725,14 +894,17 @@ async def create_speech(request: SpeechRequest):
     if AVAILABLE_MODELS.get(target_model, {}).get("type") != "base":
         raise HTTPException(400, "Speech generation requires a Base model (1.7b-base)")
 
-    ensure_model(target_model)
-
     voice_id = request.voice
     if voice_id not in voice_refs:
         available = list(voice_refs.keys())
         if not available:
             raise HTTPException(400, "No voices loaded. Register a voice first.")
-        voice_id = available[0]
+        raise HTTPException(
+            404,
+            f"Unknown voice {voice_id!r}. Available voices: {available}",
+        )
+
+    ensure_model(target_model)
 
     # Resolve language
     language = "English"
@@ -765,20 +937,24 @@ async def create_speech(request: SpeechRequest):
             # Half-second silence between chunks
             silence = np.zeros(int(sr * 0.4), dtype=np.float32)
 
-            for i, chunk in enumerate(chunks):
-                chunk_len = len(chunk)
-                token_limit = _clone_token_limit(chunk, request.max_new_tokens)
-                print(f"[chunk {i+1}/{n_chunks}] {chunk_len} chars → {token_limit} tokens: "
-                      f"{chunk[:60]}{'…' if len(chunk) > 60 else ''}", flush=True)
-                wavs, sr = _generate_voice_clone(
-                    text=chunk, language=language,
-                    ref_audio=vref["ref_audio"],
-                    ref_text=vref["ref_text"],
-                    max_new_tokens=token_limit,
-                )
-                audio_parts.append(wavs[0])
-                if i < n_chunks - 1:
-                    audio_parts.append(silence)
+            # Voice cloning uses shared model-side conditioning state. Keep all
+            # chunks for one request contiguous so concurrent requests cannot
+            # swap speakers between sentences.
+            with inference_lock:
+                for i, chunk in enumerate(chunks):
+                    chunk_len = len(chunk)
+                    token_limit = _clone_token_limit(chunk, request.max_new_tokens)
+                    print(f"[chunk {i+1}/{n_chunks}] {chunk_len} chars → {token_limit} tokens: "
+                          f"{chunk[:60]}{'…' if len(chunk) > 60 else ''}", flush=True)
+                    wavs, sr = _generate_voice_clone(
+                        text=chunk, language=language, voice_id=voice_id,
+                        ref_audio=vref["ref_audio"],
+                        ref_text=vref["ref_text"],
+                        max_new_tokens=token_limit,
+                    )
+                    audio_parts.append(wavs[0])
+                    if i < n_chunks - 1:
+                        audio_parts.append(silence)
 
             gen_time = time.time() - t0
             audio = np.concatenate(audio_parts)
@@ -831,14 +1007,17 @@ async def create_speech_stream(request: SpeechRequest):
     if AVAILABLE_MODELS.get(target_model, {}).get("type") != "base":
         raise HTTPException(400, "Speech generation requires a Base model")
 
-    ensure_model(target_model)
-
     voice_id = request.voice
     if voice_id not in voice_refs:
         available = list(voice_refs.keys())
         if not available:
             raise HTTPException(400, "No voices loaded. Register a voice first.")
-        voice_id = available[0]
+        raise HTTPException(
+            404,
+            f"Unknown voice {voice_id!r}. Available voices: {available}",
+        )
+
+    ensure_model(target_model)
 
     language = "English"
     if request.language:
@@ -867,7 +1046,7 @@ async def create_speech_stream(request: SpeechRequest):
             if model is None:
                 raise RuntimeError("Model not ready")
         return _generate_voice_clone(
-            text=chunk, language=language,
+            text=chunk, language=language, voice_id=voice_id,
             ref_audio=vref["ref_audio"],
             ref_text=vref["ref_text"],
             max_new_tokens=token_limit,
@@ -876,57 +1055,78 @@ async def create_speech_stream(request: SpeechRequest):
     async def generate_sse():
         global active_requests, last_used
         t0 = time.time()
-        total_audio_dur = 0.0
-        sr = 24000
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
+        event_queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+        def _run_stream_request():
+            total_audio_dur = 0.0
+            sr = 24000
+            try:
+                # Keep one streaming request's clone chunks contiguous for the same
+                # reason as non-streaming generation: the model-side speaker state
+                # is not safe to interleave between cloned voices.
+                with inference_lock:
+                    for i, chunk in enumerate(chunks):
+                        chunk_len = len(chunk)
+                        token_limit = _clone_token_limit(chunk, request.max_new_tokens)
+                        print(f"[stream chunk {i+1}/{n_chunks}] {chunk_len} chars → {token_limit} tokens", flush=True)
+
+                        wavs, sr = _gen_chunk(i, chunk, token_limit)
+                        audio = wavs[0]
+                        audio_dur = len(audio) / sr
+                        total_audio_dur += audio_dur
+
+                        # Encode chunk as WAV bytes → base64
+                        buf = io.BytesIO()
+                        sf.write(buf, audio, sr, format="WAV", subtype="PCM_16")
+                        b64 = base64.b64encode(buf.getvalue()).decode()
+
+                        event_data = {
+                            "index": i,
+                            "total": n_chunks,
+                            "audio": b64,
+                            "duration": round(audio_dur, 2),
+                            "text": chunk[:80],
+                        }
+                        loop.call_soon_threadsafe(
+                            event_queue.put_nowait,
+                            f"event: chunk\ndata: {json.dumps(event_data)}\n\n",
+                        )
+
+                gen_time = time.time() - t0
+                rtf = gen_time / total_audio_dur if total_audio_dur > 0 else 0
+                cg = "CG" if use_cuda_graphs else "fallback"
+                print(f"[stream/{voice_id}] {total_audio_dur:.1f}s in {gen_time:.1f}s "
+                      f"(RTF {rtf:.2f}x) chunks={n_chunks} [{cg}]", flush=True)
+
+                done_data = {
+                    "total_duration": round(total_audio_dur, 2),
+                    "generation_time": round(gen_time, 2),
+                    "rtf": round(rtf, 4),
+                    "model": current_model_id or "",
+                    "voice": voice_id,
+                    "chunks": n_chunks,
+                }
+                loop.call_soon_threadsafe(
+                    event_queue.put_nowait,
+                    f"event: done\ndata: {json.dumps(done_data)}\n\n",
+                )
+            except Exception as e:
+                loop.call_soon_threadsafe(
+                    event_queue.put_nowait,
+                    f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n",
+                )
+            finally:
+                loop.call_soon_threadsafe(event_queue.put_nowait, None)
 
         try:
-            for i, chunk in enumerate(chunks):
-                chunk_len = len(chunk)
-                token_limit = _clone_token_limit(chunk, request.max_new_tokens)
-                print(f"[stream chunk {i+1}/{n_chunks}] {chunk_len} chars → {token_limit} tokens", flush=True)
-
-                # Run generation in executor — keeps CUDA context stable
-                # by not suspending the thread mid-generation on yield.
-                wavs, sr = await loop.run_in_executor(
-                    None, _gen_chunk, i, chunk, token_limit
-                )
-
-                audio = wavs[0]
-                audio_dur = len(audio) / sr
-                total_audio_dur += audio_dur
-
-                # Encode chunk as WAV bytes → base64
-                buf = io.BytesIO()
-                sf.write(buf, audio, sr, format="WAV", subtype="PCM_16")
-                b64 = base64.b64encode(buf.getvalue()).decode()
-
-                event_data = {
-                    "index": i,
-                    "total": n_chunks,
-                    "audio": b64,
-                    "duration": round(audio_dur, 2),
-                    "text": chunk[:80],
-                }
-                yield f"event: chunk\ndata: {json.dumps(event_data)}\n\n"
-
-            gen_time = time.time() - t0
-            rtf = gen_time / total_audio_dur if total_audio_dur > 0 else 0
-            cg = "CG" if use_cuda_graphs else "fallback"
-            print(f"[stream/{voice_id}] {total_audio_dur:.1f}s in {gen_time:.1f}s "
-                  f"(RTF {rtf:.2f}x) chunks={n_chunks} [{cg}]", flush=True)
-
-            done_data = {
-                "total_duration": round(total_audio_dur, 2),
-                "generation_time": round(gen_time, 2),
-                "rtf": round(rtf, 4),
-                "model": current_model_id or "",
-                "voice": voice_id,
-                "chunks": n_chunks,
-            }
-            yield f"event: done\ndata: {json.dumps(done_data)}\n\n"
-        except Exception as e:
-            yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+            task = loop.run_in_executor(None, _run_stream_request)
+            while True:
+                event = await event_queue.get()
+                if event is None:
+                    break
+                yield event
+            await task
         finally:
             with model_lock:
                 active_requests -= 1
