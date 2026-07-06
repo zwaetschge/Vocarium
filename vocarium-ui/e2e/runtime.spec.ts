@@ -29,6 +29,7 @@ async function mockApi(page: Page) {
         models: [
           { id: '1.7b-base', path: 'Qwen/Qwen3-TTS-12Hz-1.7B-Base', type: 'base', params: '1.7B', loaded: false },
           { id: '1.7b-custom', path: 'Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice', type: 'custom', params: '1.7B', loaded: true },
+          { id: 'f5-german', path: 'hvoss-techfak/F5-TTS-German', type: 'clone', params: 'German', loaded: false },
         ],
       });
     }
@@ -174,4 +175,13 @@ test('lazy route chunks are requested after navigation', async ({ page }) => {
 
   expect(scriptRequests.some((url) => /PodcastPage|podcast/i.test(url))).toBeTruthy();
   expect(scriptRequests.length).toBeGreaterThanOrEqual(2);
+});
+
+test('shows F5 German as a speech engine when the backend advertises it', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.getByRole('heading', { name: 'Text to Speech' })).toBeVisible();
+
+  const engine = page.getByLabel('Engine');
+  await expect(engine).toBeVisible();
+  await expect(engine.getByRole('option', { name: /F5-TTS German/ })).toBeAttached();
 });

@@ -902,6 +902,13 @@ class F5TTSGatewayRoutingTest(unittest.TestCase):
         self.assertIn('headers["X-TTS-Engine"] = selected_engine', source)
         self.assertIn('"model": "f5-german"', source)
 
+    def test_webui_models_endpoint_advertises_f5_when_enabled(self):
+        source = (API_ROOT / "main.py").read_text()
+        self.assertIn("async def _list_tts_models_for_webui", source)
+        self.assertIn("models.append({", source)
+        self.assertIn('"id": "f5-german"', source)
+        self.assertIn("return await _list_tts_models_for_webui()", source)
+
     def test_clone_registration_and_unload_include_f5_when_enabled(self):
         source = (API_ROOT / "main.py").read_text()
         self.assertIn("def _tts_registration_urls", source)

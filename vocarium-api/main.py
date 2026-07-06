@@ -555,13 +555,13 @@ async def tts_json(method: str, path: str, **kwargs) -> dict:
     return json.loads(body)
 
 
-async def _run_tts_job(description: str, work_maker):
+async def _run_tts_job(description: str, work_maker, *, tts_url: str = TTS_URL):
     """Run a TTS job on the GPU TTS service via the shared GPU queue.
 
     work_maker(tts_url) → coroutine that performs the actual TTS work.
     """
     async def work():
-        return await work_maker(TTS_URL)
+        return await work_maker(tts_url)
 
     _, future = await gpu_queue.submit("tts", description, work)
     return await future
@@ -767,7 +767,21 @@ async def _sync_voices_from_tts():
 @app.get("/api/models")
 async def list_models(request: Request):
     get_current_user(request)
-    return await tts_json("GET", "/v1/models")
+    return await _list_tts_models_for_webui()
+
+
+async def _list_tts_models_for_webui() -> dict:
+    data = await tts_json("GET", "/v1/models")
+    models = data.setdefault("models", [])
+    if _f5_enabled() and not any(model.get("id") == "f5-german" for model in models):
+        models.append({
+            "id": "f5-german",
+            "path": "hvoss-techfak/F5-TTS-German",
+            "type": "clone",
+            "params": "German",
+            "loaded": False,
+        })
+    return data
 
 
 @app.get("/api/models/current")
@@ -1289,6 +1303,7 @@ class GenerateRequest(BaseModel):
     text: str
     voice_id: str = "default"
     model_id: str | None = None
+    engine: str | None = None
     language: str | None = None
     response_format: str = "wav"
 
@@ -1431,6 +1446,8 @@ async def generate_speech_stream(req: GenerateRequest, request: Request):
     """Stream speech generation via SSE while the GPU queue job is running."""
     user = get_current_user(request)
     _require_text_limit(req.text)
+    if (req.engine or "").strip().lower() == "f5" or (req.model_id or "").strip().lower() == "f5-german":
+        raise HTTPException(400, "F5-TTS streaming is not supported")
     _verify_voice_exists(req.voice_id, user_id=user["id"])
     source = _voice_source(req.voice_id, user_id=user["id"])
     event_queue: asyncio.Queue[str | None] = asyncio.Queue()
@@ -1537,6 +1554,9 @@ async def generate_speech(req: GenerateRequest, request: Request):
     _require_text_limit(req.text)
     _verify_voice_exists(req.voice_id, user_id=user["id"])
     source = _voice_source(req.voice_id, user_id=user["id"])
+    selected_url, selected_engine = _select_tts_backend(req.model_id, req.engine)
+    if selected_engine == "f5" and source == "custom":
+        raise HTTPException(400, "F5-TTS supports base, cloned, and designed voices")
 
     async def work_maker(tts_url):
         status, headers, body = await _tts_generate_for_voice(
@@ -1555,7 +1575,7 @@ async def generate_speech(req: GenerateRequest, request: Request):
         content_type = headers.get("Content-Type", headers.get("content-type", "audio/wav"))
         return {"body": body, "media_type": content_type, "headers": resp_headers}
 
-    result = await _run_tts_job("TTS Generate", work_maker)
+    result = await _run_tts_job("TTS Generate", work_maker, tts_url=selected_url)
     return Response(content=result["body"], media_type=result["media_type"], headers=result["headers"])
 
 
