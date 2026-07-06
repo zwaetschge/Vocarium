@@ -162,6 +162,7 @@ services:
     ports:
       - "127.0.0.1:${SFX_PORT:-8204}:8004"
     volumes:
+      - ./mmaudio/server.py:/app/server.py:ro
       - mmaudio-cache:/root/.cache
     shm_size: "4g"
     restart: unless-stopped

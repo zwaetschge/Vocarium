@@ -477,7 +477,12 @@ class VocariumSFXGenerator:
             "cfg_strength": 4.5,
             "num_steps": 25,
         }
-        timeout = aiohttp.ClientTimeout(total=300, sock_connect=30, sock_read=300)
+        timeout_seconds = int(os.environ.get("SFX_GENERATE_TIMEOUT_SECONDS", "900"))
+        timeout = aiohttp.ClientTimeout(
+            total=timeout_seconds,
+            sock_connect=30,
+            sock_read=timeout_seconds,
+        )
 
         async def work():
             async with self._session.post(

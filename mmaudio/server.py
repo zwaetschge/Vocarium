@@ -271,19 +271,30 @@ async def generate_sfx(req: GenerateRequest):
 @app.post("/unload")
 async def unload():
     """Unload model to free GPU memory."""
-    with lock:
+    acquired = lock.acquire(blocking=False)
+    if not acquired:
+        return {
+            "status": "busy",
+            "was_loaded": model_loaded,
+            "had_state": _has_model_state(),
+            "model_loading": model_loading,
+            "restart_scheduled": False,
+        }
+    try:
         was_loaded = model_loaded
         had_state = _has_model_state()
         restart_scheduled = False
         if was_loaded or had_state:
             _unload_model()
             restart_scheduled = _schedule_process_exit("manual unload")
-    return {
-        "status": "unloaded",
-        "was_loaded": was_loaded,
-        "had_state": had_state,
-        "restart_scheduled": restart_scheduled,
-    }
+        return {
+            "status": "unloaded",
+            "was_loaded": was_loaded,
+            "had_state": had_state,
+            "restart_scheduled": restart_scheduled,
+        }
+    finally:
+        lock.release()
 
 
 @app.get("/health")

@@ -742,6 +742,23 @@ class PodcastProductionHardeningTest(unittest.TestCase):
         self.assertIn("_validate_fade_ms(fade_ms)", source)
         self.assertIn('"vocarium_options"', source)
 
+    def test_sfx_generation_uses_cold_start_timeout_and_translates_client_errors(self):
+        source = (API_ROOT / "main.py").read_text()
+        self.assertIn("SFX_GENERATE_TIMEOUT_SECONDS", source)
+        self.assertIn('os.environ.get("SFX_GENERATE_TIMEOUT_SECONDS", "900")', source)
+        self.assertIn("sock_read=timeout_seconds", source)
+        self.assertIn("except asyncio.TimeoutError as exc:", source)
+        self.assertIn("SFX backend timed out", source)
+        self.assertIn("except aiohttp.ClientError as exc:", source)
+        self.assertIn("SFX backend connection failed", source)
+
+    def test_mmaudio_unload_reports_busy_while_lock_is_held(self):
+        source = (REPO_ROOT / "mmaudio" / "server.py").read_text()
+        self.assertIn("lock.acquire(blocking=False)", source)
+        self.assertIn('"status": "busy"', source)
+        self.assertIn("try:\n        was_loaded = model_loaded", source)
+        self.assertIn("finally:\n        lock.release()", source)
+
     def test_audio_generation_services_report_first_load_download_status(self):
         ace_source = (REPO_ROOT / "acestep" / "proxy.py").read_text()
         mmaudio_source = (REPO_ROOT / "mmaudio" / "server.py").read_text()

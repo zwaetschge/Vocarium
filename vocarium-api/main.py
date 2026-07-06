@@ -67,6 +67,7 @@ EXTRA_TTS_URLS = [TTS_URL_2] if TTS_URL_2 else []
 ASR_URL = os.environ.get("ASR_URL", "http://qwen3-asr:8000")
 MUSIC_URL = os.environ.get("MUSIC_URL", "http://acestep:8003")
 SFX_URL = os.environ.get("SFX_URL", "http://mmaudio:8004")
+SFX_GENERATE_TIMEOUT_SECONDS = int(os.environ.get("SFX_GENERATE_TIMEOUT_SECONDS", "900"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 VOICES_DIR = Path(os.environ.get("VOICES_DIR", "/app/voices"))
 MAX_VOICE_UPLOAD_BYTES = int(os.environ.get("MAX_VOICE_UPLOAD_BYTES", str(50 * 1024 * 1024)))
@@ -504,7 +505,7 @@ async def _unload_music():
 
 async def _unload_sfx():
     """Tell MMAudio to unload model, freeing shared GPU VRAM."""
-    await _post_unload(SFX_URL, "MMAudio", "was_loaded")
+    await _post_unload(SFX_URL, "MMAudio", "was_loaded", wait_if_busy=True)
 
 
 async def tts_request(method: str, path: str, *, url: str | None = None, **kwargs) -> tuple[int, dict, bytes]:
@@ -2147,7 +2148,12 @@ async def music_health():
 # Sound Effects (MMAudio)
 # ---------------------------------------------------------------------------
 async def _sfx_request(method: str, path: str, **kwargs) -> tuple[int, bytes]:
-    timeout = aiohttp.ClientTimeout(total=300, sock_connect=30, sock_read=300)
+    timeout_seconds = SFX_GENERATE_TIMEOUT_SECONDS if path == "/generate" else 30
+    timeout = aiohttp.ClientTimeout(
+        total=timeout_seconds,
+        sock_connect=30,
+        sock_read=timeout_seconds,
+    )
     start = time.perf_counter()
     status = 0
     try:
@@ -2230,7 +2236,18 @@ async def sfx_generate(request: Request):
     }
 
     async def work():
-        status, resp_body = await _sfx_request("POST", "/generate", json=sfx_params)
+        try:
+            status, resp_body = await _sfx_request("POST", "/generate", json=sfx_params)
+        except asyncio.TimeoutError as exc:
+            raise HTTPException(
+                504,
+                f"SFX backend timed out after {SFX_GENERATE_TIMEOUT_SECONDS}s while loading or generating audio",
+            ) from exc
+        except aiohttp.ClientError as exc:
+            raise HTTPException(
+                502,
+                f"SFX backend connection failed: {exc}",
+            ) from exc
         if status >= 400:
             raise HTTPException(status, detail=resp_body.decode(errors="replace"))
         return resp_body
