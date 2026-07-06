@@ -148,10 +148,10 @@ def _default_cuda_graphs_enabled() -> bool:
     return not re.search(r"(blackwell|rtx\s*50|5060|5070|5080|5090)", gpu_name)
 
 
-# The CUDA-graph clone path is the practical default on RTX 30/40 GPUs. The
-# important quality fix is non_streaming_mode=True in _generate_voice_clone();
-# without it, short German Base/Clone prompts can repeat or stop early.
-ENABLE_CUDA_GRAPHS = _env_bool("TTS_ENABLE_CUDA_GRAPHS", _default_cuda_graphs_enabled())
+# Keep Base/Clone on the conservative non-CUDA-graph path by default. Long
+# German multi-chunk runs have shown CUDA graph replay can drift into garbled
+# speech while still returning HTTP 200. Opt in only after listening tests.
+ENABLE_CUDA_GRAPHS = _env_bool("TTS_ENABLE_CUDA_GRAPHS", False)
 CUDA_GRAPH_MODELS = {"1.7b-base"} if ENABLE_CUDA_GRAPHS else set()
 
 # Clone/base voice identity gets unstable when each sentence is sampled as a
@@ -169,6 +169,10 @@ CUSTOM_TOP_P = _env_float("TTS_CUSTOM_TOP_P", 0.8)
 TOKEN_BUDGET_TOKENS_PER_CHAR = _env_float("TTS_TOKEN_BUDGET_TOKENS_PER_CHAR", 1.05)
 TOKEN_BUDGET_MIN = _env_int("TTS_TOKEN_BUDGET_MIN", 80)
 TOKEN_BUDGET_MAX = _env_int("TTS_TOKEN_BUDGET_MAX", 260)
+CHUNK_MAX_SECONDS = _env_float("TTS_CHUNK_MAX_SECONDS", 16.0)
+CHUNK_SECONDS_PER_CHAR = _env_float("TTS_CHUNK_SECONDS_PER_CHAR", 0.13)
+CHUNK_MIN_SECONDS = _env_float("TTS_CHUNK_MIN_SECONDS", 2.5)
+CHUNK_RETRY_TOKEN_FACTOR = _env_float("TTS_CHUNK_RETRY_TOKEN_FACTOR", 0.72)
 REF_NORMALIZATION_VERSION = 2
 REF_NORMALIZE_PEAK = _env_float("TTS_REF_NORMALIZE_PEAK", 0.85)
 
@@ -614,6 +618,12 @@ async def health():
             "max": TOKEN_BUDGET_MAX,
             "max_chunk_chars": MAX_CHUNK_CHARS,
         },
+        "chunk_guard": {
+            "max_seconds": CHUNK_MAX_SECONDS,
+            "seconds_per_char": CHUNK_SECONDS_PER_CHAR,
+            "min_seconds": CHUNK_MIN_SECONDS,
+            "retry_token_factor": CHUNK_RETRY_TOKEN_FACTOR,
+        },
         "voice_clone_prompt_cache": [
             {"model": key[0], "voice": key[1], "xvec_only": key[2]}
             for key in voice_clone_prompt_cache.keys()
@@ -908,6 +918,70 @@ def _clone_token_limit(text: str, override: int | None = None) -> int:
     return _tts_token_limit(text, override)
 
 
+def _chunk_max_duration(text: str) -> float:
+    estimated = max(CHUNK_MIN_SECONDS, len(text) * CHUNK_SECONDS_PER_CHAR)
+    return min(CHUNK_MAX_SECONDS, estimated)
+
+
+def _is_suspicious_chunk(audio: np.ndarray, sr: int, text: str) -> bool:
+    if sr <= 0 or audio is None:
+        return True
+    audio = np.asarray(audio, dtype=np.float32)
+    if audio.size == 0 or not np.isfinite(audio).all():
+        return True
+    duration = len(audio) / sr
+    if duration <= 0.15:
+        return True
+    if duration > _chunk_max_duration(text):
+        return True
+    peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+    return peak <= 1e-4
+
+
+def _generate_guarded_voice_clone(
+    *,
+    text: str,
+    language: str,
+    voice_id: str,
+    ref_audio: str,
+    ref_text: str,
+    token_limit: int,
+) -> tuple:
+    wavs, sr = _generate_voice_clone(
+        text=text,
+        language=language,
+        voice_id=voice_id,
+        ref_audio=ref_audio,
+        ref_text=ref_text,
+        max_new_tokens=token_limit,
+    )
+    audio = wavs[0]
+    if not _is_suspicious_chunk(audio, sr, text):
+        return wavs, sr
+
+    retry_tokens = max(TOKEN_BUDGET_MIN, int(token_limit * CHUNK_RETRY_TOKEN_FACTOR))
+    print(
+        f"[chunk guard] suspicious output for {len(text)} chars "
+        f"({len(audio) / sr:.1f}s > {_chunk_max_duration(text):.1f}s); "
+        f"retrying with {retry_tokens} tokens",
+        flush=True,
+    )
+    wavs, sr = _generate_voice_clone(
+        text=text,
+        language=language,
+        voice_id=voice_id,
+        ref_audio=ref_audio,
+        ref_text=ref_text,
+        max_new_tokens=retry_tokens,
+    )
+    audio = wavs[0]
+    if _is_suspicious_chunk(audio, sr, text):
+        raise RuntimeError(
+            "Qwen TTS produced a suspicious chunk twice; aborting instead of returning garbled audio"
+        )
+    return wavs, sr
+
+
 @app.post("/v1/audio/speech")
 async def create_speech(request: SpeechRequest):
     if not request.input.strip():
@@ -970,11 +1044,11 @@ async def create_speech(request: SpeechRequest):
                     token_limit = _clone_token_limit(chunk, request.max_new_tokens)
                     print(f"[chunk {i+1}/{n_chunks}] {chunk_len} chars → {token_limit} tokens: "
                           f"{chunk[:60]}{'…' if len(chunk) > 60 else ''}", flush=True)
-                    wavs, sr = _generate_voice_clone(
+                    wavs, sr = _generate_guarded_voice_clone(
                         text=chunk, language=language, voice_id=voice_id,
                         ref_audio=vref["ref_audio"],
                         ref_text=vref["ref_text"],
-                        max_new_tokens=token_limit,
+                        token_limit=token_limit,
                     )
                     audio_parts.append(wavs[0])
                     if i < n_chunks - 1:
@@ -1069,11 +1143,11 @@ async def create_speech_stream(request: SpeechRequest):
         with model_lock:
             if model is None:
                 raise RuntimeError("Model not ready")
-        return _generate_voice_clone(
+        return _generate_guarded_voice_clone(
             text=chunk, language=language, voice_id=voice_id,
             ref_audio=vref["ref_audio"],
             ref_text=vref["ref_text"],
-            max_new_tokens=token_limit,
+            token_limit=token_limit,
         )
 
     async def generate_sse():

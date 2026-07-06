@@ -612,6 +612,27 @@ class PodcastProductionHardeningTest(unittest.TestCase):
         self.assertNotIn("int(len(text) * 2.0)", source)
         self.assertNotIn("MAX_CHUNK_CHARS = 200", source)
 
+    def test_qwen_clone_generation_disables_cuda_graphs_by_default(self):
+        source = (REPO_ROOT / "qwen3-tts" / "server.py").read_text()
+        compose = (REPO_ROOT / "docker-compose.yml").read_text()
+        env_example = (REPO_ROOT / ".env.example").read_text()
+
+        self.assertIn('ENABLE_CUDA_GRAPHS = _env_bool("TTS_ENABLE_CUDA_GRAPHS", False)', source)
+        self.assertIn('TTS_ENABLE_CUDA_GRAPHS=${TTS_ENABLE_CUDA_GRAPHS:-false}', compose)
+        self.assertIn("TTS_ENABLE_CUDA_GRAPHS=false", env_example)
+
+    def test_qwen_clone_generation_retries_suspicious_chunks(self):
+        source = (REPO_ROOT / "qwen3-tts" / "server.py").read_text()
+
+        self.assertIn("TTS_CHUNK_MAX_SECONDS", source)
+        self.assertIn("TTS_CHUNK_RETRY_TOKEN_FACTOR", source)
+        self.assertIn("def _chunk_max_duration", source)
+        self.assertIn("def _is_suspicious_chunk", source)
+        self.assertIn("def _generate_guarded_voice_clone", source)
+        self.assertIn("retry_tokens = max(TOKEN_BUDGET_MIN, int(token_limit * CHUNK_RETRY_TOKEN_FACTOR))", source)
+        self.assertIn("raise RuntimeError(", source)
+        self.assertIn("_generate_guarded_voice_clone(", source)
+
     def test_qwen_custom_voice_generation_is_voice_stable_by_default(self):
         source = (REPO_ROOT / "qwen3-tts" / "server.py").read_text()
         custom_start = source.index("@app.post(\"/v1/audio/speech/custom\")")
