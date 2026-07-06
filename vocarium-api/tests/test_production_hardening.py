@@ -712,6 +712,18 @@ class PodcastProductionHardeningTest(unittest.TestCase):
         self.assertIn("SELECT 1 FROM music_task_files WHERE user_id=? AND path=? LIMIT 1", source)
         self.assertNotIn("SELECT file_paths FROM music_tasks WHERE user_id=?", source)
 
+    def test_music_audio_prefers_local_acestep_output_file(self):
+        source = (API_ROOT / "main.py").read_text()
+        self.assertIn("MUSIC_OUTPUT_DIR", source)
+        self.assertIn('Path(os.environ.get("MUSIC_OUTPUT_DIR", "/app/acestep/.cache/acestep"))', source)
+        self.assertIn("def _music_audio_local_path(path: str) -> Path | None:", source)
+        self.assertIn("local_path = _music_audio_local_path(path)", source)
+        self.assertIn("return FileResponse(", source)
+
+    def test_api_mounts_acestep_output_read_only(self):
+        compose = (REPO_ROOT / "docker-compose.yml").read_text()
+        self.assertIn("acestep-output:/app/acestep/.cache/acestep:ro", compose)
+
     def test_music_generation_exposes_engine_and_client_audio_options(self):
         source = (API_ROOT / "main.py").read_text()
         self.assertIn('SUPPORTED_MUSIC_ENGINES = {"acestep"}', source)
@@ -770,6 +782,15 @@ class PodcastProductionHardeningTest(unittest.TestCase):
         self.assertIn("model_loading", mmaudio_source)
         self.assertIn("last_load_error", mmaudio_source)
         self.assertIn('"first_load"', mmaudio_source)
+
+    def test_acestep_query_result_timeout_allows_first_load(self):
+        ace_source = (REPO_ROOT / "acestep" / "proxy.py").read_text()
+        self.assertIn("QUERY_RESULT_TIMEOUT_SECONDS", ace_source)
+        self.assertIn(
+            'os.environ.get("ACESTEP_QUERY_RESULT_TIMEOUT_SECONDS", "600")',
+            ace_source,
+        )
+        self.assertIn("aiohttp.ClientTimeout(total=QUERY_RESULT_TIMEOUT_SECONDS)", ace_source)
 
     def test_audio_generation_benchmark_script_documents_preload_costs(self):
         script = REPO_ROOT / "scripts" / "benchmark-audio-generation.py"

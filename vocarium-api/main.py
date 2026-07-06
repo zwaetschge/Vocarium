@@ -69,6 +69,7 @@ MUSIC_URL = os.environ.get("MUSIC_URL", "http://acestep:8003")
 SFX_URL = os.environ.get("SFX_URL", "http://mmaudio:8004")
 SFX_GENERATE_TIMEOUT_SECONDS = int(os.environ.get("SFX_GENERATE_TIMEOUT_SECONDS", "900"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
+MUSIC_OUTPUT_DIR = Path(os.environ.get("MUSIC_OUTPUT_DIR", "/app/acestep/.cache/acestep"))
 VOICES_DIR = Path(os.environ.get("VOICES_DIR", "/app/voices"))
 MAX_VOICE_UPLOAD_BYTES = int(os.environ.get("MAX_VOICE_UPLOAD_BYTES", str(50 * 1024 * 1024)))
 MAX_TRANSCRIBE_UPLOAD_BYTES = int(
@@ -1882,6 +1883,32 @@ def _extract_music_audio_paths(payload: object) -> list[str]:
     return sorted(set(paths))
 
 
+def _music_audio_content_type(path: str) -> str:
+    if path.endswith(".mp3"):
+        return "audio/mpeg"
+    if path.endswith(".wav"):
+        return "audio/wav"
+    if path.endswith(".flac"):
+        return "audio/flac"
+    return "audio/mpeg"
+
+
+def _music_audio_local_path(path: str) -> Path | None:
+    backend_root = Path("/app/acestep/.cache/acestep").resolve()
+    output_root = MUSIC_OUTPUT_DIR.resolve()
+    raw = Path(path)
+    try:
+        if raw.is_absolute():
+            relative = raw.resolve().relative_to(backend_root)
+        else:
+            relative = raw
+        local_path = (output_root / relative).resolve()
+        local_path.relative_to(output_root)
+    except (OSError, ValueError):
+        return None
+    return local_path if local_path.is_file() else None
+
+
 def _record_music_task(
     user_id: int,
     task_id: str,
@@ -2100,19 +2127,16 @@ async def music_audio(path: str, request: Request):
     path = _normalize_music_audio_path(path)
     assert path is not None
     _require_owned_music_audio_path(user["id"], path)
+    local_path = _music_audio_local_path(path)
+    if local_path is not None:
+        return FileResponse(
+            str(local_path),
+            media_type=_music_audio_content_type(path),
+        )
     status, body = await _music_request("GET", "/v1/audio", params={"path": path})
     if status >= 400:
         raise HTTPException(status, body.decode(errors="replace"))
-    # Guess content type from path
-    if path.endswith(".mp3"):
-        ct = "audio/mpeg"
-    elif path.endswith(".wav"):
-        ct = "audio/wav"
-    elif path.endswith(".flac"):
-        ct = "audio/flac"
-    else:
-        ct = "audio/mpeg"
-    return Response(content=body, media_type=ct)
+    return Response(content=body, media_type=_music_audio_content_type(path))
 
 
 @app.post("/api/music/enhance")

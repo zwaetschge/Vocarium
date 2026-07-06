@@ -29,6 +29,7 @@ CONFIG_PATH = os.environ.get("ACESTEP_CONFIG_PATH", "acestep-v15-turbo")
 LM_MODEL_PATH = os.environ.get("ACESTEP_LM_MODEL_PATH", "acestep-5Hz-lm-0.6B")
 LM_BACKEND = os.environ.get("ACESTEP_LM_BACKEND", "pt")
 STARTUP_TIMEOUT_SECONDS = int(os.environ.get("ACESTEP_STARTUP_TIMEOUT_SECONDS", "120"))
+QUERY_RESULT_TIMEOUT_SECONDS = int(os.environ.get("ACESTEP_QUERY_RESULT_TIMEOUT_SECONDS", "600"))
 MODEL_WEIGHT_HINTS = [
     {
         "name": "Qwen3 Embedding",
@@ -219,7 +220,7 @@ async def query_result(request: Request):
     if process is None or process.poll() is not None:
         raise HTTPException(503, "ACE-Step backend not running")
     body = await request.body()
-    timeout = aiohttp.ClientTimeout(total=30)
+    timeout = aiohttp.ClientTimeout(total=QUERY_RESULT_TIMEOUT_SECONDS)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.post(f"{BACKEND_URL}/query_result", data=body,
                                 headers={"Content-Type": "application/json"}) as resp:

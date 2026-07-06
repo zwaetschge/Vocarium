@@ -224,6 +224,7 @@ services:
         target: /app/__pycache__
       - type: tmpfs
         target: /app/podcast/__pycache__
+      - acestep-output:/app/acestep/.cache/acestep:ro
       - vocarium-data:/app/data
       - voices-data:/app/voices
     restart: unless-stopped
@@ -289,6 +290,7 @@ services:
         target: /app/__pycache__
       - type: tmpfs
         target: /app/podcast/__pycache__
+      - acestep-output:/app/acestep/.cache/acestep:ro
       - vocarium-data:/app/data
       - voices-data:/app/voices
     restart: unless-stopped
