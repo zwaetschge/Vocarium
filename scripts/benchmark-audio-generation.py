@@ -41,9 +41,9 @@ MODEL_WEIGHT_HINTS = {
     ],
     "tts": [
         {
-            "name": "Qwen3-TTS or F5-TTS",
-            "approx_size": "depends on selected engine",
-            "purpose": "German speech synthesis and clone comparison",
+            "name": "Qwen3-TTS",
+            "approx_size": "depends on selected Qwen model",
+            "purpose": "German speech synthesis benchmark",
         }
     ],
 }
@@ -148,9 +148,8 @@ def _generate_sfx(api_url: str, duration: int, user: str) -> tuple[int, bytes]:
 
 
 def _generate_tts(api_url: str, engine: str, user: str) -> tuple[int, bytes]:
-    model = "f5-german" if engine == "f5" else "tts-1"
     payload = {
-        "model": model,
+        "model": "tts-1",
         "engine": engine,
         "input": (
             "Dies ist ein deutscher Benchmark-Satz. "
@@ -279,7 +278,7 @@ def main() -> int:
     parser.add_argument("--api-url", default="http://localhost:8280")
     parser.add_argument("--user", default="api")
     parser.add_argument("--kind", choices=("music", "sfx", "tts", "both"), default="both")
-    parser.add_argument("--tts-engine", choices=("qwen", "f5", "both"), default="both")
+    parser.add_argument("--tts-engine", choices=("qwen",), default="qwen")
     parser.add_argument("--duration", type=int, default=10)
     parser.add_argument("--preload", action="store_true")
     parser.add_argument("--force-generate", action="store_true")
@@ -290,9 +289,9 @@ def main() -> int:
 
     if args.kind == "both":
         kinds = ["music", "sfx"]
-        kinds.extend(["tts:qwen", "tts:f5"] if args.tts_engine == "both" else [f"tts:{args.tts_engine}"])
+        kinds.append(f"tts:{args.tts_engine}")
     elif args.kind == "tts":
-        kinds = ["tts:qwen", "tts:f5"] if args.tts_engine == "both" else [f"tts:{args.tts_engine}"]
+        kinds = [f"tts:{args.tts_engine}"]
     else:
         kinds = [args.kind]
     results = [probe_kind(args, kind) for kind in kinds]

@@ -64,7 +64,6 @@ TTS_URL = os.environ.get("TTS_URL", "http://qwen3-tts:8880")
 # Empty/unset means single-GPU mode — all TTS goes through TTS_URL.
 TTS_URL_2 = os.environ.get("TTS_URL_2", "").strip()
 EXTRA_TTS_URLS = [TTS_URL_2] if TTS_URL_2 else []
-F5_TTS_URL = os.environ.get("F5_TTS_URL", "").strip()
 ASR_URL = os.environ.get("ASR_URL", "http://qwen3-asr:8000")
 MUSIC_URL = os.environ.get("MUSIC_URL", "http://acestep:8003")
 SFX_URL = os.environ.get("SFX_URL", "http://mmaudio:8004")
@@ -81,7 +80,7 @@ MAX_MUSIC_ENHANCE_BODY_BYTES = int(
 )
 TTS_RESPONSE_FORMATS = {"wav", "mp3", "flac", "opus", "aac", "pcm"}
 MUSIC_RESPONSE_FORMATS = {"wav", "mp3", "flac"}
-SUPPORTED_TTS_ENGINES = {"qwen", "f5"}
+SUPPORTED_TTS_ENGINES = {"qwen"}
 SUPPORTED_MUSIC_ENGINES = {"acestep"}
 SUPPORTED_SFX_ENGINES = {"mmaudio"}
 VOICE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
@@ -318,24 +317,13 @@ def _validate_engine(engine: str, supported: set[str], field: str = "engine") ->
     return value
 
 
-def _f5_enabled() -> bool:
-    return bool(F5_TTS_URL)
-
-
 def _select_tts_backend(req_model: str | None, req_engine: str | None) -> tuple[str, str]:
     engine = (req_engine or "").strip().lower()
-    model = (req_model or "").strip().lower()
     if engine:
         engine = _validate_engine(engine, SUPPORTED_TTS_ENGINES)
-    elif model == "f5-german":
-        engine = "f5"
     else:
         engine = "qwen"
 
-    if engine == "f5":
-        if not _f5_enabled():
-            raise HTTPException(503, "F5-TTS is not configured")
-        return F5_TTS_URL, "f5"
     return TTS_URL, "qwen"
 
 
@@ -502,12 +490,6 @@ async def _unload_extra_tts():
     """Unload the optional secondary TTS model if configured and idle."""
     if TTS_URL_2:
         await _post_unload(TTS_URL_2, "Qwen3-TTS-2", "was_loaded", wait_if_busy=True)
-
-
-async def _unload_f5_tts():
-    """Unload the optional F5-TTS model if configured and idle."""
-    if _f5_enabled():
-        await _post_unload(F5_TTS_URL, "F5-TTS", "was_loaded", wait_if_busy=True)
 
 
 async def _unload_asr():
@@ -701,8 +683,6 @@ async def startup():
     }
     if TTS_URL_2:
         unloaders["tts_extra"] = _unload_extra_tts
-    if _f5_enabled():
-        unloaders["tts_f5"] = _unload_f5_tts
     register_unloaders(unloaders)
     gpu_queue.start()
     try:
@@ -767,21 +747,7 @@ async def _sync_voices_from_tts():
 @app.get("/api/models")
 async def list_models(request: Request):
     get_current_user(request)
-    return await _list_tts_models_for_webui()
-
-
-async def _list_tts_models_for_webui() -> dict:
-    data = await tts_json("GET", "/v1/models")
-    models = data.setdefault("models", [])
-    if _f5_enabled() and not any(model.get("id") == "f5-german" for model in models):
-        models.append({
-            "id": "f5-german",
-            "path": "hvoss-techfak/F5-TTS-German",
-            "type": "clone",
-            "params": "German",
-            "loaded": False,
-        })
-    return data
+    return await tts_json("GET", "/v1/models")
 
 
 @app.get("/api/models/current")
@@ -915,10 +881,7 @@ async def _register_voice_on_tts(
 
 
 def _tts_registration_urls() -> list[str]:
-    urls = [TTS_URL, *EXTRA_TTS_URLS]
-    if _f5_enabled():
-        urls.append(F5_TTS_URL)
-    return urls
+    return [TTS_URL, *EXTRA_TTS_URLS]
 
 
 def _convert_reference_audio_to_wav(audio_bytes: bytes, audio_path: Path) -> None:
@@ -1446,8 +1409,6 @@ async def generate_speech_stream(req: GenerateRequest, request: Request):
     """Stream speech generation via SSE while the GPU queue job is running."""
     user = get_current_user(request)
     _require_text_limit(req.text)
-    if (req.engine or "").strip().lower() == "f5" or (req.model_id or "").strip().lower() == "f5-german":
-        raise HTTPException(400, "F5-TTS streaming is not supported")
     _verify_voice_exists(req.voice_id, user_id=user["id"])
     source = _voice_source(req.voice_id, user_id=user["id"])
     event_queue: asyncio.Queue[str | None] = asyncio.Queue()
@@ -1555,8 +1516,6 @@ async def generate_speech(req: GenerateRequest, request: Request):
     _verify_voice_exists(req.voice_id, user_id=user["id"])
     source = _voice_source(req.voice_id, user_id=user["id"])
     selected_url, selected_engine = _select_tts_backend(req.model_id, req.engine)
-    if selected_engine == "f5" and source == "custom":
-        raise HTTPException(400, "F5-TTS supports base, cloned, and designed voices")
 
     async def work_maker(tts_url):
         status, headers, body = await _tts_generate_for_voice(
@@ -2376,8 +2335,6 @@ async def _openai_speech_proxy(
     model_map = {"tts-1": "1.7b-base", "tts-1-hd": "1.7b-base"}
     if req.model in model_map:
         payload["model_id"] = model_map[req.model]
-    elif req.model == "f5-german":
-        payload.update({"model": "f5-german"})
     elif req.model not in ("qwen3-tts", ""):
         payload["model_id"] = req.model
 
@@ -2490,13 +2447,6 @@ async def openai_models():
         {"id": "whisper-1", "object": "model", "owned_by": "vocarium",
          "description": "Qwen3-ASR 0.6B"},
     ]
-    if _f5_enabled():
-        models.append({
-            "id": "f5-german",
-            "object": "model",
-            "owned_by": "vocarium",
-            "description": "F5-TTS German voice cloning",
-        })
     return {"object": "list", "data": models}
 
 

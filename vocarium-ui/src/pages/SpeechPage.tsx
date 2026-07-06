@@ -1,21 +1,19 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { getVoices, generate, generateStream, getLanguages, getModels } from '../api';
+import { getVoices, generate, generateStream, getLanguages } from '../api';
 import type { StreamChunk, StreamDone } from '../api';
 import { useAudio } from '../hooks/useAudio';
 import AudioPlayer from '../components/AudioPlayer';
 import WaveformBars from '../components/WaveformBars';
-import type { Voice, GenerationMeta, Model } from '../types';
+import type { Voice, GenerationMeta } from '../types';
 import { getRandomSample } from '../sampleTexts';
 import { voiceSourceLabel, withDefaultVoice } from '../voiceUtils';
 
 export default function SpeechPage() {
   const [voices, setVoices] = useState<Voice[]>([]);
-  const [models, setModels] = useState<Model[]>([]);
   const [languages, setLanguages] = useState<string[]>([]);
   const [selectedVoice, setSelectedVoice] = useState('default');
   const [selectedLang, setSelectedLang] = useState('');
-  const [selectedEngine, setSelectedEngine] = useState<'qwen' | 'f5'>('qwen');
   const [text, setText] = useState('');
   const [generating, setGenerating] = useState(false);
   const [genStartTime, setGenStartTime] = useState(0);
@@ -29,8 +27,7 @@ export default function SpeechPage() {
   const audioChunksRef = useRef<Uint8Array[]>([]);
   const audio = useAudio();
   const generationVoices = useMemo(() => withDefaultVoice(voices), [voices]);
-  const hasF5Engine = useMemo(() => models.some((model) => model.id === 'f5-german'), [models]);
-  const selectedModel = selectedEngine === 'f5' ? 'f5-german' : '1.7b-base';
+  const selectedModel = '1.7b-base';
 
   useEffect(() => {
     if (!generating) return;
@@ -42,21 +39,8 @@ export default function SpeechPage() {
     getVoices().then((v) => {
       setVoices(v);
     }).catch(() => {});
-    getModels().then(setModels).catch(() => setModels([]));
     getLanguages().then(setLanguages).catch(() => setLanguages(['English', 'Chinese', 'German']));
   }, []);
-
-  useEffect(() => {
-    if (selectedEngine === 'f5' && !hasF5Engine) {
-      setSelectedEngine('qwen');
-    }
-  }, [hasF5Engine, selectedEngine]);
-
-  useEffect(() => {
-    if (selectedEngine === 'f5' && streaming) {
-      setStreaming(false);
-    }
-  }, [selectedEngine, streaming]);
 
   const base64ToBytes = useCallback((b64: string): Uint8Array => {
     const binary = atob(b64);
@@ -145,7 +129,7 @@ export default function SpeechPage() {
 
   const handleGenerate = async () => {
     if (!text.trim() || !selectedVoice) return;
-    if (streaming && selectedEngine !== 'f5') return handleGenerateStream();
+    if (streaming) return handleGenerateStream();
 
     setGenerating(true);
     setGenStartTime(Date.now());
@@ -159,7 +143,6 @@ export default function SpeechPage() {
         text: text.trim(),
         voice_id: selectedVoice,
         model_id: selectedModel,
-        engine: selectedEngine,
         language: selectedLang || undefined,
       });
       setMeta(result.meta);
@@ -191,7 +174,6 @@ export default function SpeechPage() {
           text: text.trim(),
           voice_id: selectedVoice,
           model_id: selectedModel,
-          engine: selectedEngine,
           language: selectedLang || undefined,
         },
         (chunk: StreamChunk) => {
@@ -352,35 +334,19 @@ export default function SpeechPage() {
           </select>
         </Field>
 
-        <Field label="Engine">
-          <select
-            aria-label="Engine"
-            value={selectedEngine}
-            onChange={(e) => setSelectedEngine(e.target.value as 'qwen' | 'f5')}
-            className="input-field"
-            style={selectStyle}
-          >
-            <option value="qwen">Qwen3-TTS</option>
-            {hasF5Engine && <option value="f5">F5-TTS German</option>}
-          </select>
-        </Field>
-
         <Field label="Stream">
           <button
             type="button"
-            onClick={() => {
-              if (selectedEngine !== 'f5') setStreaming(!streaming);
-            }}
+            onClick={() => setStreaming(!streaming)}
             aria-pressed={streaming}
-            disabled={selectedEngine === 'f5'}
             title="Stream long texts chunk by chunk for faster first audio"
             style={{
               height: '42px',
               padding: '0 14px',
               borderRadius: '10px',
-              border: `1px solid ${streaming && selectedEngine !== 'f5' ? 'rgba(123,97,255,0.4)' : 'rgba(255,255,255,0.08)'}`,
-              background: streaming && selectedEngine !== 'f5' ? 'var(--color-accent-dim)' : 'rgba(255,255,255,0.03)',
-              color: streaming && selectedEngine !== 'f5' ? 'var(--color-accent-hover)' : 'var(--color-text-secondary)',
+              border: `1px solid ${streaming ? 'rgba(123,97,255,0.4)' : 'rgba(255,255,255,0.08)'}`,
+              background: streaming ? 'var(--color-accent-dim)' : 'rgba(255,255,255,0.03)',
+              color: streaming ? 'var(--color-accent-hover)' : 'var(--color-text-secondary)',
               fontSize: '12.5px',
               fontWeight: 500,
               display: 'inline-flex',
@@ -388,15 +354,13 @@ export default function SpeechPage() {
               gap: '8px',
               whiteSpace: 'nowrap',
               transition: 'all 0.18s ease',
-              cursor: selectedEngine === 'f5' ? 'not-allowed' : 'pointer',
-              opacity: selectedEngine === 'f5' ? 0.55 : 1,
             }}
           >
             <span
-              className={streaming && selectedEngine !== 'f5' ? 'status-dot status-dot-online' : 'status-dot'}
-              style={streaming && selectedEngine !== 'f5' ? undefined : { background: 'var(--color-text-dim)' }}
+              className={streaming ? 'status-dot status-dot-online' : 'status-dot'}
+              style={streaming ? undefined : { background: 'var(--color-text-dim)' }}
             />
-            {streaming && selectedEngine !== 'f5' ? 'On' : 'Off'}
+            {streaming ? 'On' : 'Off'}
           </button>
         </Field>
 

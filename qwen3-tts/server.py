@@ -162,6 +162,10 @@ CLONE_TEMPERATURE = _env_float("TTS_CLONE_TEMPERATURE", 0.7)
 CLONE_TOP_K = _env_int("TTS_CLONE_TOP_K", 20)
 CLONE_TOP_P = _env_float("TTS_CLONE_TOP_P", 0.8)
 CLONE_XVEC_ONLY = _env_bool("TTS_CLONE_XVEC_ONLY", False)
+CUSTOM_DO_SAMPLE = _env_bool("TTS_CUSTOM_DO_SAMPLE", False)
+CUSTOM_TEMPERATURE = _env_float("TTS_CUSTOM_TEMPERATURE", 0.7)
+CUSTOM_TOP_K = _env_int("TTS_CUSTOM_TOP_K", 20)
+CUSTOM_TOP_P = _env_float("TTS_CUSTOM_TOP_P", 0.8)
 REF_NORMALIZATION_VERSION = 2
 REF_NORMALIZE_PEAK = _env_float("TTS_REF_NORMALIZE_PEAK", 0.85)
 
@@ -594,6 +598,12 @@ async def health():
             "top_k": CLONE_TOP_K,
             "top_p": CLONE_TOP_P,
             "xvec_only": CLONE_XVEC_ONLY,
+        },
+        "custom_sampling": {
+            "do_sample": CUSTOM_DO_SAMPLE,
+            "temperature": CUSTOM_TEMPERATURE,
+            "top_k": CUSTOM_TOP_K,
+            "top_p": CUSTOM_TOP_P,
         },
         "voice_clone_prompt_cache": [
             {"model": key[0], "voice": key[1], "xvec_only": key[2]}
@@ -1256,7 +1266,12 @@ async def custom_voice(request: CustomVoiceRequest):
             language=request.language,
             max_new_tokens=token_limit,
             eos_token_id=[2150, 2157],
-            repetition_penalty=1.05,
+            non_streaming_mode=True,
+            do_sample=CUSTOM_DO_SAMPLE,
+            temperature=CUSTOM_TEMPERATURE,
+            top_k=CUSTOM_TOP_K,
+            top_p=CUSTOM_TOP_P,
+            repetition_penalty=1.08,
         )
         if request.instruct and request.instruct.strip():
             kwargs["instruct"] = request.instruct.strip()
