@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark Vocarium music/SFX generation without surprising first-load downloads."""
+"""Benchmark Vocarium TTS/music/SFX generation without surprise downloads."""
 
 from __future__ import annotations
 
@@ -37,6 +37,13 @@ MODEL_WEIGHT_HINTS = {
             "name": "mmaudio_large_44k_v2.pth",
             "approx_size": "4.12 GB",
             "purpose": "MMAudio large 44 kHz SFX generation model",
+        }
+    ],
+    "tts": [
+        {
+            "name": "Qwen3-TTS or F5-TTS",
+            "approx_size": "depends on selected engine",
+            "purpose": "German speech synthesis and clone comparison",
         }
     ],
 }
@@ -82,6 +89,8 @@ def _json_request(api_url: str, path: str, *, user: str) -> dict[str, Any]:
 
 
 def _is_loaded(kind: str, health: dict[str, Any]) -> bool:
+    if kind.startswith("tts"):
+        return bool(health.get("tts_models_listed"))
     if kind == "music":
         return bool(health.get("backend_running"))
     return bool(health.get("model_loaded"))
@@ -138,7 +147,62 @@ def _generate_sfx(api_url: str, duration: int, user: str) -> tuple[int, bytes]:
     return status, body
 
 
+def _generate_tts(api_url: str, engine: str, user: str) -> tuple[int, bytes]:
+    model = "f5-german" if engine == "f5" else "tts-1"
+    payload = {
+        "model": model,
+        "engine": engine,
+        "input": (
+            "Dies ist ein deutscher Benchmark-Satz. "
+            "Die Stimme soll ueber mehrere Saetze stabil bleiben."
+        ),
+        "voice": "default",
+        "response_format": "wav",
+    }
+    status, body, _ = _request(
+        "POST",
+        f"{api_url}/v1/audio/speech",
+        payload=payload,
+        user=user,
+        timeout=900,
+    )
+    return status, body
+
+
 def probe_kind(args: argparse.Namespace, kind: str) -> ProbeResult:
+    if kind.startswith("tts:"):
+        engine = kind.split(":", 1)[1]
+        health = _json_request(args.api_url, "/v1/models", user=args.user)
+        health["tts_models_listed"] = True
+        if not args.force_generate:
+            return ProbeResult(kind=kind, health=health, generated=False)
+        start = time.perf_counter()
+        status, body = _generate_tts(args.api_url, engine, args.user)
+        elapsed = time.perf_counter() - start
+        if status >= 400:
+            return ProbeResult(
+                kind=kind,
+                health=health,
+                generated=True,
+                elapsed_seconds=elapsed,
+                error=body.decode(errors="replace"),
+            )
+        output_path = None
+        if args.out_dir:
+            out_dir = Path(args.out_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            output = out_dir / f"vocarium-tts-{engine}-benchmark.wav"
+            output.write_bytes(body)
+            output_path = str(output)
+        return ProbeResult(
+            kind=kind,
+            health=health,
+            generated=True,
+            elapsed_seconds=elapsed,
+            bytes_received=len(body),
+            output_path=output_path,
+        )
+
     health_path = "/api/music/health" if kind == "music" else "/api/sfx/health"
     health = _json_request(args.api_url, health_path, user=args.user)
     if args.preload and not _is_loaded(kind, health) and not args.force_generate:
@@ -214,7 +278,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--api-url", default="http://localhost:8280")
     parser.add_argument("--user", default="api")
-    parser.add_argument("--kind", choices=["music", "sfx", "both"], default="both")
+    parser.add_argument("--kind", choices=("music", "sfx", "tts", "both"), default="both")
+    parser.add_argument("--tts-engine", choices=("qwen", "f5", "both"), default="both")
     parser.add_argument("--duration", type=int, default=10)
     parser.add_argument("--preload", action="store_true")
     parser.add_argument("--force-generate", action="store_true")
@@ -223,7 +288,13 @@ def main() -> int:
     args = parser.parse_args()
     args.api_url = args.api_url.rstrip("/")
 
-    kinds = ["music", "sfx"] if args.kind == "both" else [args.kind]
+    if args.kind == "both":
+        kinds = ["music", "sfx"]
+        kinds.extend(["tts:qwen", "tts:f5"] if args.tts_engine == "both" else [f"tts:{args.tts_engine}"])
+    elif args.kind == "tts":
+        kinds = ["tts:qwen", "tts:f5"] if args.tts_engine == "both" else [f"tts:{args.tts_engine}"]
+    else:
+        kinds = [args.kind]
     results = [probe_kind(args, kind) for kind in kinds]
     if args.json:
         print(json.dumps([r.__dict__ for r in results], indent=2, ensure_ascii=False))

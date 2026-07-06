@@ -887,6 +887,75 @@ class RuntimeScriptTest(unittest.TestCase):
         self.assertIn("loads core routes without a blank screen", spec.read_text())
 
 
+class F5TTSGatewayRoutingTest(unittest.TestCase):
+    def test_gateway_defines_f5_backend_selection_contract(self):
+        source = (API_ROOT / "main.py").read_text()
+        self.assertIn('F5_TTS_URL = os.environ.get("F5_TTS_URL"', source)
+        self.assertIn('SUPPORTED_TTS_ENGINES = {"qwen", "f5"}', source)
+        self.assertIn("def _select_tts_backend", source)
+        self.assertIn('"f5-german"', source)
+        self.assertIn("F5-TTS is not configured", source)
+
+    def test_openai_speech_proxy_uses_selected_backend(self):
+        source = (API_ROOT / "main.py").read_text()
+        self.assertIn("_select_tts_backend(req.model, req.engine)", source)
+        self.assertIn('headers["X-TTS-Engine"] = selected_engine', source)
+        self.assertIn('"model": "f5-german"', source)
+
+    def test_clone_registration_and_unload_include_f5_when_enabled(self):
+        source = (API_ROOT / "main.py").read_text()
+        self.assertIn("def _tts_registration_urls", source)
+        self.assertIn("if _f5_enabled():", source)
+        self.assertIn("urls.append(F5_TTS_URL)", source)
+        self.assertIn("async def _unload_f5_tts", source)
+        self.assertIn('unloaders["tts_f5"] = _unload_f5_tts', source)
+
+
+class F5TTSWorkerContractTest(unittest.TestCase):
+    def test_f5_worker_exposes_lazy_health_and_inference_contract(self):
+        server = REPO_ROOT / "f5-tts" / "server.py"
+        self.assertTrue(server.exists())
+        source = server.read_text()
+        self.assertIn('F5_MODEL_REPO = os.environ.get("F5_MODEL_REPO"', source)
+        self.assertIn("def _load_f5_model", source)
+        self.assertIn('@app.get("/health")', source)
+        self.assertIn('@app.post("/v1/audio/speech")', source)
+        self.assertIn("f5_tts.api", source)
+        self.assertIn("F5-TTS dependencies are not installed", source)
+        self.assertIn("model_weight_hints", source)
+        self.assertIn("def _resolve_hf_path", source)
+        self.assertIn("hf_hub_download", source)
+
+    def test_f5_worker_validates_voice_paths_and_formats(self):
+        server = REPO_ROOT / "f5-tts" / "server.py"
+        self.assertTrue(server.exists())
+        source = server.read_text()
+        self.assertIn("VOICE_ID_RE", source)
+        self.assertIn("def _voice_dir_for", source)
+        self.assertIn("SUPPORTED_OUTPUT_FORMATS", source)
+        self.assertIn('"mp3"', source)
+        self.assertIn("ffmpeg", source)
+
+
+class F5TTSDockerBenchmarkTest(unittest.TestCase):
+    def test_compose_contains_opt_in_f5_tts_service(self):
+        compose = (REPO_ROOT / "docker-compose.yml").read_text()
+        self.assertIn("f5-tts:", compose)
+        self.assertIn("profiles:", compose)
+        self.assertIn("- f5", compose)
+        self.assertIn("F5_TTS_URL", compose)
+        self.assertIn("${F5_TTS_PORT:-8205}:8885", compose)
+        self.assertIn("GPU_F5_TTS", compose)
+
+    def test_audio_benchmark_script_supports_tts_engine_comparison(self):
+        script = (REPO_ROOT / "scripts" / "benchmark-audio-generation.py").read_text()
+        self.assertIn("choices=(\"music\", \"sfx\", \"tts\", \"both\")", script)
+        self.assertIn("--tts-engine", script)
+        self.assertIn("choices=(\"qwen\", \"f5\", \"both\")", script)
+        self.assertIn("f5-german", script)
+        self.assertIn("/v1/audio/speech", script)
+
+
 def _tiny_wav() -> bytes:
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wav:

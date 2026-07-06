@@ -117,6 +117,43 @@ services:
     networks:
       - voice-network
 
+  # --- F5-TTS German (opt-in: enable with COMPOSE_PROFILES=f5) -------------
+  f5-tts:
+    profiles:
+      - f5
+    build:
+      context: ./f5-tts
+      dockerfile: Dockerfile
+      args:
+        F5_TTS_PACKAGE: ${F5_TTS_PACKAGE:-f5-tts}
+    container_name: f5-tts
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${GPU_F5_TTS:-0}
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - DEVICE=${F5_DEVICE:-cuda}
+      - MODELS_DIR=/app/models
+      - VOICES_DIR=/app/voices
+      - F5_MODEL_REPO=${F5_MODEL_REPO:-hvoss-techfak/F5-TTS-German}
+      - F5_MODEL_NAME=${F5_MODEL_NAME:-F5TTS_Base}
+      - F5_CKPT_FILE=${F5_CKPT_FILE:-hf://hvoss-techfak/F5-TTS-German/model_f5tts_german.pt}
+      - F5_VOCAB_FILE=${F5_VOCAB_FILE:-hf://hvoss-techfak/F5-TTS-German/vocab.txt}
+      - F5_PACKAGE_HINT=${F5_PACKAGE_HINT:-pin if German checkpoint requires it}
+      - F5_DEFAULT_SEED=${F5_DEFAULT_SEED:-12345}
+      - MAX_VOICE_UPLOAD_BYTES=${MAX_VOICE_UPLOAD_BYTES:-52428800}
+      - PYTHONDONTWRITEBYTECODE=1
+      - PYTHONUNBUFFERED=1
+    ports:
+      - "127.0.0.1:${F5_TTS_PORT:-8205}:8885"
+    volumes:
+      - ./f5-tts/models:/app/models
+      - ./f5-tts/server.py:/app/server.py:ro
+      - voices-data:/app/voices
+    shm_size: "4g"
+    restart: unless-stopped
+    networks:
+      - voice-network
+
   # --- ACE-Step (music) ------------------------------------------------------
   acestep:
     build:
@@ -172,6 +209,7 @@ services:
       <<: *podcast-env
       TTS_URL: http://qwen3-tts:8880
       TTS_URL_2: ${TTS_URL_2:-}
+      F5_TTS_URL: ${F5_TTS_URL:-}
       ASR_URL: http://qwen3-asr:8000
       MUSIC_URL: http://acestep:8003
       SFX_URL: http://mmaudio:8004
@@ -237,6 +275,7 @@ services:
       <<: *podcast-env
       TTS_URL: http://qwen3-tts-2:8880
       TTS_URL_2: http://qwen3-tts:8880
+      F5_TTS_URL: ${F5_TTS_URL:-}
       ASR_URL: http://qwen3-asr:8000
       MUSIC_URL: http://acestep:8003
       SFX_URL: http://mmaudio:8004
