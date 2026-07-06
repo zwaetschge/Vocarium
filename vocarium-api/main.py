@@ -1335,6 +1335,15 @@ def _voice_source(voice_id: str, user_id: int | None = None) -> str:
     return (row[0] or "clone").lower()
 
 
+def _require_custom_generation_voice(source: str) -> None:
+    if source != "custom":
+        raise HTTPException(
+            403,
+            "Speech generation only supports custom voices. "
+            "Qwen Base/Clone voices are disabled for generation because they are unstable on German longform output.",
+        )
+
+
 def _custom_tts_payload(
     *,
     text: str,
@@ -1411,6 +1420,7 @@ async def generate_speech_stream(req: GenerateRequest, request: Request):
     _require_text_limit(req.text)
     _verify_voice_exists(req.voice_id, user_id=user["id"])
     source = _voice_source(req.voice_id, user_id=user["id"])
+    _require_custom_generation_voice(source)
     event_queue: asyncio.Queue[str | None] = asyncio.Queue()
 
     async def work_maker(tts_url):
@@ -1515,6 +1525,7 @@ async def generate_speech(req: GenerateRequest, request: Request):
     _require_text_limit(req.text)
     _verify_voice_exists(req.voice_id, user_id=user["id"])
     source = _voice_source(req.voice_id, user_id=user["id"])
+    _require_custom_generation_voice(source)
     selected_url, selected_engine = _select_tts_backend(req.model_id, req.engine)
 
     async def work_maker(tts_url):

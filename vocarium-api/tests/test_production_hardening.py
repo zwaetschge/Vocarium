@@ -652,6 +652,26 @@ class PodcastProductionHardeningTest(unittest.TestCase):
         self.assertIn("custom_sampling", source)
         self.assertIn("token_limit = _tts_token_limit(request.text, request.max_new_tokens)", custom_source)
 
+    def test_webui_speech_generation_uses_custom_voices_only(self):
+        main_source = (API_ROOT / "main.py").read_text()
+        speech_page = (REPO_ROOT / "vocarium-ui" / "src" / "pages" / "SpeechPage.tsx").read_text()
+
+        generate_start = main_source.index("@app.post(\"/api/generate\")")
+        generate_end = main_source.index("# ---------------------------------------------------------------------------\n# Benchmark", generate_start)
+        generate_source = main_source[generate_start:generate_end]
+        stream_start = main_source.index("@app.post(\"/api/generate/stream\")")
+        stream_end = main_source.index("@app.post(\"/api/generate\")", stream_start)
+        stream_source = main_source[stream_start:stream_end]
+
+        self.assertIn("_require_custom_generation_voice(source)", main_source)
+        self.assertIn("_require_custom_generation_voice(source)", generate_source)
+        self.assertIn("_require_custom_generation_voice(source)", stream_source)
+        self.assertIn("Speech generation only supports custom voices", main_source)
+        self.assertIn("speechVoices = useMemo", speech_page)
+        self.assertIn("voices.filter((voice) => voice.source === 'custom')", speech_page)
+        self.assertNotIn("withDefaultVoice(voices)", speech_page)
+        self.assertNotIn("const selectedModel = '1.7b-base'", speech_page)
+
     def test_f5_experiment_is_not_in_stack(self):
         compose = (REPO_ROOT / "docker-compose.yml").read_text()
         env_example = (REPO_ROOT / ".env.example").read_text()
