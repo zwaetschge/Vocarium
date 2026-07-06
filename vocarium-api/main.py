@@ -80,6 +80,8 @@ MAX_MUSIC_ENHANCE_BODY_BYTES = int(
 )
 TTS_RESPONSE_FORMATS = {"wav", "mp3", "flac", "opus", "aac", "pcm"}
 MUSIC_RESPONSE_FORMATS = {"wav", "mp3", "flac"}
+SUPPORTED_MUSIC_ENGINES = {"acestep"}
+SUPPORTED_SFX_ENGINES = {"mmaudio"}
 VOICE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 REQUEST_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
 TRACE_HEADER = "X-Request-ID"
@@ -302,6 +304,50 @@ def _validate_audio_format(
             f"{field} must be one of: {', '.join(sorted(allowed))}",
         )
     return fmt
+
+
+def _validate_engine(engine: str, supported: set[str], field: str = "engine") -> str:
+    value = (engine or "").strip().lower()
+    if value not in supported:
+        raise HTTPException(
+            400,
+            f"{field} must be one of: {', '.join(sorted(supported))}",
+        )
+    return value
+
+
+def _validate_lufs(normalize_lufs: float | None) -> float | None:
+    if normalize_lufs is None:
+        return None
+    if normalize_lufs < -40 or normalize_lufs > 0:
+        raise HTTPException(400, "normalize_lufs must be between -40 and 0")
+    return normalize_lufs
+
+
+def _validate_fade_ms(fade_ms: int) -> int:
+    if fade_ms < 0 or fade_ms > 10000:
+        raise HTTPException(400, "fade_ms must be between 0 and 10000")
+    return fade_ms
+
+
+def _coerce_bool(value: object, field: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off", ""}:
+            return False
+    raise HTTPException(400, f"{field} must be a boolean")
+
+
+def _merge_negative_prompt(base: str, *parts: str) -> str:
+    values = [base.strip()] if base and base.strip() else []
+    values.extend(part for part in parts if part)
+    return ", ".join(values)
 
 
 def _sse_event(event: str, data: dict) -> str:
@@ -1735,7 +1781,9 @@ async def health():
 # ---------------------------------------------------------------------------
 class MusicGenerateRequest(BaseModel):
     prompt: str
+    engine: str = "acestep"
     lyrics: str = ""
+    negative_prompt: str = ""
     audio_duration: int = 60
     bpm: int | None = None
     key_scale: str | None = None
@@ -1744,6 +1792,10 @@ class MusicGenerateRequest(BaseModel):
     audio_format: str = "wav"
     batch_size: int = 1
     seed: int | None = None
+    instrumental: bool = False
+    loopable: bool = False
+    normalize_lufs: float | None = None
+    fade_ms: int = 0
 
 
 async def _music_request(method: str, path: str, **kwargs) -> tuple[int, bytes]:
@@ -1894,12 +1946,15 @@ def _require_owned_music_audio_path(user_id: int, path: str) -> None:
 async def music_generate(req: MusicGenerateRequest, request: Request):
     """Submit music generation, hold GPU lock until complete, return result."""
     user = get_current_user(request)
+    engine = _validate_engine(req.engine, SUPPORTED_MUSIC_ENGINES)
     if not req.prompt.strip():
         raise HTTPException(400, "prompt is required")
     if len(req.prompt) > 2000:
         raise HTTPException(413, "prompt too long (max 2000 characters)")
     if len(req.lyrics) > 10000:
         raise HTTPException(413, "lyrics too long (max 10000 characters)")
+    if len(req.negative_prompt) > 2000:
+        raise HTTPException(413, "negative_prompt too long (max 2000 characters)")
     if req.audio_duration < 10 or req.audio_duration > 300:
         raise HTTPException(400, "audio_duration must be between 10 and 300 seconds")
     if req.batch_size < 1 or req.batch_size > 4:
@@ -1907,9 +1962,29 @@ async def music_generate(req: MusicGenerateRequest, request: Request):
     audio_format = _validate_audio_format(
         req.audio_format, allowed=MUSIC_RESPONSE_FORMATS, field="audio_format"
     )
+    normalize_lufs = _validate_lufs(req.normalize_lufs)
+    fade_ms = _validate_fade_ms(req.fade_ms)
+
+    prompt = req.prompt
+    if req.instrumental and "instrumental" not in prompt.casefold():
+        prompt = f"{prompt}, instrumental"
+    if req.loopable and "loop" not in prompt.casefold():
+        prompt = f"{prompt}, seamless loop"
+    negative_prompt = _merge_negative_prompt(
+        req.negative_prompt,
+        "vocals, singing, speech" if req.instrumental else "",
+    )
+    vocarium_options = {
+        "engine": engine,
+        "negative_prompt": req.negative_prompt,
+        "instrumental": req.instrumental,
+        "loopable": req.loopable,
+        "normalize_lufs": normalize_lufs,
+        "fade_ms": fade_ms,
+    }
 
     payload = {
-        "prompt": req.prompt,
+        "prompt": prompt,
         "lyrics": req.lyrics,
         "audio_duration": req.audio_duration,
         "thinking": req.thinking,
@@ -1924,6 +1999,8 @@ async def music_generate(req: MusicGenerateRequest, request: Request):
         payload["key_scale"] = req.key_scale
     if req.time_signature is not None:
         payload["time_signature"] = req.time_signature
+    if negative_prompt:
+        payload["negative_prompt"] = negative_prompt
     if req.seed is not None:
         payload["seed"] = req.seed
         payload["use_random_seed"] = False
@@ -1938,7 +2015,10 @@ async def music_generate(req: MusicGenerateRequest, request: Request):
         submit_result = json.loads(body)
         task_id = submit_result.get("data", {}).get("task_id")
         if not task_id:
-            return submit_result  # no task_id means immediate result or error
+            return {
+                "submit": submit_result,
+                "vocarium_options": vocarium_options,
+            }  # no task_id means immediate result or error
         _record_music_task(user["id"], task_id, "submitted")
 
         # Poll until complete (holds GPU lock)
@@ -1954,7 +2034,11 @@ async def music_generate(req: MusicGenerateRequest, request: Request):
             task = tasks[0]
             if task.get("status") == 1:  # success
                 _sync_music_tasks_from_poll(user["id"], poll)
-                return {"submit": submit_result, "result": poll}
+                return {
+                    "submit": submit_result,
+                    "result": poll,
+                    "vocarium_options": vocarium_options,
+                }
             if task.get("status") == 2:  # failed
                 _record_music_task(user["id"], task_id, "failed")
                 raise HTTPException(500, "Music generation failed")
@@ -2075,22 +2159,49 @@ async def sfx_generate(request: Request):
         raise HTTPException(400, "prompt is required")
     if len(prompt) > 1000:
         raise HTTPException(413, "prompt too long (max 1000 characters)")
+    engine = (body.get("engine") or "mmaudio").strip().lower()
+    engine = _validate_engine(engine, SUPPORTED_SFX_ENGINES)
     negative_prompt = (body.get("negative_prompt") or "").strip()
     if len(negative_prompt) > 1000:
         raise HTTPException(413, "negative_prompt too long (max 1000 characters)")
+    no_speech = _coerce_bool(body.get("no_speech", False), "no_speech")
+    no_music = _coerce_bool(body.get("no_music", False), "no_music")
 
     try:
         duration = float(body.get("duration", 8.0))
         cfg_strength = float(body.get("cfg_strength", 4.5))
         num_steps = int(body.get("num_steps", 25))
+        normalize_lufs = (
+            None
+            if body.get("normalize_lufs") is None
+            else float(body.get("normalize_lufs"))
+        )
+        fade_ms = int(body.get("fade_ms", 0))
     except (TypeError, ValueError):
-        raise HTTPException(400, "duration, cfg_strength, and num_steps must be numeric")
+        raise HTTPException(
+            400,
+            "duration, cfg_strength, num_steps, normalize_lufs, and fade_ms must be numeric",
+        )
     if duration < 1 or duration > 30:
         raise HTTPException(400, "duration must be between 1 and 30 seconds")
     if cfg_strength < 1 or cfg_strength > 10:
         raise HTTPException(400, "cfg_strength must be between 1 and 10")
     if num_steps < 1 or num_steps > 100:
         raise HTTPException(400, "num_steps must be between 1 and 100")
+    normalize_lufs = _validate_lufs(normalize_lufs)
+    fade_ms = _validate_fade_ms(fade_ms)
+    negative_prompt = _merge_negative_prompt(
+        negative_prompt,
+        "speech, voice, vocals, talking" if no_speech else "",
+        "music, melody, song, vocals" if no_music else "",
+    )
+    vocarium_options = {
+        "engine": engine,
+        "no_speech": no_speech,
+        "no_music": no_music,
+        "normalize_lufs": normalize_lufs,
+        "fade_ms": fade_ms,
+    }
 
     sfx_params = {
         "prompt": prompt,
@@ -2112,7 +2223,10 @@ async def sfx_generate(request: Request):
     return Response(
         content=wav_bytes,
         media_type="audio/wav",
-        headers={"Content-Disposition": "attachment; filename=sfx.wav"},
+        headers={
+            "Content-Disposition": "attachment; filename=sfx.wav",
+            "X-Vocarium-Options": json.dumps(vocarium_options),
+        },
     )
 
 

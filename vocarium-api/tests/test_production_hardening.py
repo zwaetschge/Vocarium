@@ -619,6 +619,59 @@ class PodcastProductionHardeningTest(unittest.TestCase):
         self.assertIn("SELECT 1 FROM music_task_files WHERE user_id=? AND path=? LIMIT 1", source)
         self.assertNotIn("SELECT file_paths FROM music_tasks WHERE user_id=?", source)
 
+    def test_music_generation_exposes_engine_and_client_audio_options(self):
+        source = (API_ROOT / "main.py").read_text()
+        self.assertIn('SUPPORTED_MUSIC_ENGINES = {"acestep"}', source)
+        self.assertIn('engine: str = "acestep"', source)
+        self.assertIn('negative_prompt: str = ""', source)
+        self.assertIn("instrumental: bool = False", source)
+        self.assertIn("loopable: bool = False", source)
+        self.assertIn("normalize_lufs: float | None = None", source)
+        self.assertIn("fade_ms: int = 0", source)
+        self.assertIn("_validate_engine(req.engine, SUPPORTED_MUSIC_ENGINES", source)
+        self.assertIn("_validate_lufs(req.normalize_lufs)", source)
+        self.assertIn("_validate_fade_ms(req.fade_ms)", source)
+        self.assertIn('"negative_prompt": req.negative_prompt', source)
+        self.assertIn('"instrumental": req.instrumental', source)
+        self.assertIn('"loopable": req.loopable', source)
+        self.assertIn('"vocarium_options"', source)
+
+    def test_sfx_generation_exposes_engine_and_negative_prompt_controls(self):
+        source = (API_ROOT / "main.py").read_text()
+        self.assertIn('SUPPORTED_SFX_ENGINES = {"mmaudio"}', source)
+        self.assertIn("_validate_engine(engine, SUPPORTED_SFX_ENGINES", source)
+        self.assertIn('no_speech = _coerce_bool(body.get("no_speech", False), "no_speech")', source)
+        self.assertIn('no_music = _coerce_bool(body.get("no_music", False), "no_music")', source)
+        self.assertIn("_merge_negative_prompt(", source)
+        self.assertIn('"speech, voice, vocals, talking"', source)
+        self.assertIn('"music, melody, song, vocals"', source)
+        self.assertIn("_validate_lufs(normalize_lufs)", source)
+        self.assertIn("_validate_fade_ms(fade_ms)", source)
+        self.assertIn('"vocarium_options"', source)
+
+    def test_audio_generation_services_report_first_load_download_status(self):
+        ace_source = (REPO_ROOT / "acestep" / "proxy.py").read_text()
+        mmaudio_source = (REPO_ROOT / "mmaudio" / "server.py").read_text()
+        self.assertIn("MODEL_WEIGHT_HINTS", ace_source)
+        self.assertIn("backend_starting", ace_source)
+        self.assertIn("last_start_error", ace_source)
+        self.assertIn('"first_load"', ace_source)
+        self.assertIn("MODEL_WEIGHT_HINTS", mmaudio_source)
+        self.assertIn("model_loading", mmaudio_source)
+        self.assertIn("last_load_error", mmaudio_source)
+        self.assertIn('"first_load"', mmaudio_source)
+
+    def test_audio_generation_benchmark_script_documents_preload_costs(self):
+        script = REPO_ROOT / "scripts" / "benchmark-audio-generation.py"
+        self.assertTrue(script.exists())
+        source = script.read_text()
+        self.assertIn("MODEL_WEIGHT_HINTS", source)
+        self.assertIn("--kind", source)
+        self.assertIn("--preload", source)
+        self.assertIn("--json", source)
+        self.assertIn("--force-generate", source)
+        self.assertIn("Remote-User", source)
+
     def test_openai_tts_persona_aliases_route_to_default_voice(self):
         source = (API_ROOT / "main.py").read_text()
         self.assertIn("def _resolve_openai_tts_voice", source)

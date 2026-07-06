@@ -28,15 +28,36 @@ IDLE_TIMEOUT = int(os.environ.get("IDLE_TIMEOUT", "600"))  # 10 min default
 CONFIG_PATH = os.environ.get("ACESTEP_CONFIG_PATH", "acestep-v15-turbo")
 LM_MODEL_PATH = os.environ.get("ACESTEP_LM_MODEL_PATH", "acestep-5Hz-lm-0.6B")
 LM_BACKEND = os.environ.get("ACESTEP_LM_BACKEND", "pt")
+STARTUP_TIMEOUT_SECONDS = int(os.environ.get("ACESTEP_STARTUP_TIMEOUT_SECONDS", "120"))
+MODEL_WEIGHT_HINTS = [
+    {
+        "name": "Qwen3 Embedding",
+        "approx_size": "1.19 GB",
+        "purpose": "text conditioning",
+    },
+    {
+        "name": CONFIG_PATH,
+        "approx_size": "4.79 GB",
+        "purpose": "ACE-Step diffusion model",
+    },
+    {
+        "name": LM_MODEL_PATH,
+        "approx_size": "3.71 GB for 1.7B, smaller for 0.6B",
+        "purpose": "lyrics/prompt language model",
+    },
+]
 
 process: subprocess.Popen | None = None
 lock = threading.Lock()
 last_activity = time.time()
+backend_starting = False
+backend_started_at: float | None = None
+last_start_error: str | None = None
 
 
 def start_backend():
     """Start the ACE-Step API server as a subprocess."""
-    global process
+    global process, backend_started_at, last_start_error
     if process is not None and process.poll() is None:
         return  # already running
 
@@ -49,6 +70,8 @@ def start_backend():
     ]
 
     print(f"Starting ACE-Step backend: {' '.join(cmd)}", flush=True)
+    backend_started_at = time.time()
+    last_start_error = None
     process = subprocess.Popen(
         cmd,
         cwd="/app/acestep",
@@ -67,7 +90,7 @@ def start_backend():
 
 def stop_backend():
     """Stop the ACE-Step API server to free GPU memory."""
-    global process
+    global process, backend_started_at
     if process is None:
         return
     if process.poll() is None:
@@ -79,6 +102,7 @@ def stop_backend():
             process.kill()
             process.wait(timeout=5)
     process = None
+    backend_started_at = None
     print("ACE-Step backend stopped, GPU memory freed", flush=True)
 
 
@@ -98,17 +122,27 @@ async def wait_for_backend(timeout: float = 120):
         except Exception:
             pass
         await asyncio.sleep(2)
-    raise RuntimeError("ACE-Step backend did not start in time")
+    raise RuntimeError(
+        "ACE-Step backend did not start in time. First run may still be "
+        f"downloading model weights: {MODEL_WEIGHT_HINTS}"
+    )
 
 
 async def ensure_backend():
     """Ensure the backend is running. Start it if not."""
-    global last_activity
+    global backend_starting, last_activity, last_start_error
     last_activity = time.time()
-    with lock:
-        if process is None or process.poll() is not None:
-            start_backend()
-    await wait_for_backend()
+    backend_starting = True
+    try:
+        with lock:
+            if process is None or process.poll() is not None:
+                start_backend()
+        await wait_for_backend(STARTUP_TIMEOUT_SECONDS)
+    except Exception as exc:
+        last_start_error = str(exc)
+        raise
+    finally:
+        backend_starting = False
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +183,18 @@ async def unload():
 async def health():
     """Health check — reports if backend is running."""
     running = process is not None and process.poll() is None
-    return {"status": "ok", "backend_running": running}
+    return {
+        "status": "ok",
+        "backend_running": running,
+        "backend_starting": backend_starting,
+        "backend_started_at": backend_started_at,
+        "last_start_error": last_start_error,
+        "first_load": {
+            "may_download": not running,
+            "startup_timeout_seconds": STARTUP_TIMEOUT_SECONDS,
+            "model_weight_hints": MODEL_WEIGHT_HINTS,
+        },
+    }
 
 
 @app.post("/release_task")

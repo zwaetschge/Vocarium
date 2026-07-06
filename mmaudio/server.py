@@ -32,12 +32,22 @@ DEVICE = "cuda"
 DTYPE = torch.bfloat16
 VARIANT = "large_44k_v2"
 IDLE_TIMEOUT = int(os.environ.get("IDLE_TIMEOUT", "600"))  # seconds
+MODEL_WEIGHT_HINTS = [
+    {
+        "name": "mmaudio_large_44k_v2.pth",
+        "approx_size": "4.12 GB",
+        "purpose": "MMAudio large 44 kHz SFX generation model",
+    }
+]
 RESTART_ON_UNLOAD = os.environ.get("RESTART_ON_UNLOAD", "1").lower() not in {
     "0",
     "false",
     "no",
 }
 exit_scheduled = False
+model_loading = False
+model_load_started_at: float | None = None
+last_load_error: str | None = None
 
 
 def _has_model_state() -> bool:
@@ -69,8 +79,12 @@ def _schedule_process_exit(reason: str) -> bool:
 
 def _load_model():
     """Load MMAudio model into GPU memory."""
-    global net, fm, feature_utils, seq_cfg, rng, model_loaded
+    global last_load_error, model_load_started_at, model_loaded, model_loading
+    global net, fm, feature_utils, seq_cfg, rng
 
+    model_loading = True
+    model_load_started_at = time.time()
+    last_load_error = None
     model_loaded = False
 
     try:
@@ -104,10 +118,13 @@ def _load_model():
         rng = torch.Generator(device=DEVICE)
         model_loaded = True
         print(f"MMAudio {VARIANT} loaded successfully", flush=True)
-    except Exception:
+    except Exception as exc:
+        last_load_error = str(exc)
         _unload_model()
         _schedule_process_exit("model load failed")
         raise
+    finally:
+        model_loading = False
 
 
 def _unload_model():
@@ -274,11 +291,18 @@ async def health():
     return {
         "status": "ok",
         "model_loaded": model_loaded,
+        "model_loading": model_loading,
+        "model_load_started_at": model_load_started_at,
+        "last_load_error": last_load_error,
         "has_model_state": _has_model_state(),
         "variant": VARIANT,
         "idle_timeout": IDLE_TIMEOUT,
         "restart_on_unload": RESTART_ON_UNLOAD,
         "exit_scheduled": exit_scheduled,
+        "first_load": {
+            "may_download": not model_loaded,
+            "model_weight_hints": MODEL_WEIGHT_HINTS,
+        },
     }
 
 
