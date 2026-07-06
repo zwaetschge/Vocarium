@@ -600,6 +600,18 @@ class PodcastProductionHardeningTest(unittest.TestCase):
         self.assertIn("voice_clone_prompt", source)
         self.assertIn("_clear_voice_clone_prompt(voice_id)", source)
 
+    def test_qwen_clone_generation_caps_chunk_and_token_budget(self):
+        source = (REPO_ROOT / "qwen3-tts" / "server.py").read_text()
+        self.assertIn('MAX_CHUNK_CHARS = _env_int("TTS_MAX_CHUNK_CHARS", 140)', source)
+        self.assertIn('TOKEN_BUDGET_TOKENS_PER_CHAR = _env_float("TTS_TOKEN_BUDGET_TOKENS_PER_CHAR", 1.05)', source)
+        self.assertIn('TOKEN_BUDGET_MIN = _env_int("TTS_TOKEN_BUDGET_MIN", 80)', source)
+        self.assertIn('TOKEN_BUDGET_MAX = _env_int("TTS_TOKEN_BUDGET_MAX", 260)', source)
+        self.assertIn("def _tts_token_limit", source)
+        self.assertIn("return min(TOKEN_BUDGET_MAX, max(TOKEN_BUDGET_MIN, estimated))", source)
+        self.assertIn("return _tts_token_limit(text, override)", source)
+        self.assertNotIn("int(len(text) * 2.0)", source)
+        self.assertNotIn("MAX_CHUNK_CHARS = 200", source)
+
     def test_qwen_custom_voice_generation_is_voice_stable_by_default(self):
         source = (REPO_ROOT / "qwen3-tts" / "server.py").read_text()
         custom_start = source.index("@app.post(\"/v1/audio/speech/custom\")")
@@ -617,6 +629,7 @@ class PodcastProductionHardeningTest(unittest.TestCase):
         self.assertIn("top_p=CUSTOM_TOP_P", custom_source)
         self.assertIn("repetition_penalty=1.08", custom_source)
         self.assertIn("custom_sampling", source)
+        self.assertIn("token_limit = _tts_token_limit(request.text, request.max_new_tokens)", custom_source)
 
     def test_f5_experiment_is_not_in_stack(self):
         compose = (REPO_ROOT / "docker-compose.yml").read_text()

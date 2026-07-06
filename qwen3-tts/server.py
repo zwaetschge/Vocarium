@@ -166,6 +166,9 @@ CUSTOM_DO_SAMPLE = _env_bool("TTS_CUSTOM_DO_SAMPLE", False)
 CUSTOM_TEMPERATURE = _env_float("TTS_CUSTOM_TEMPERATURE", 0.7)
 CUSTOM_TOP_K = _env_int("TTS_CUSTOM_TOP_K", 20)
 CUSTOM_TOP_P = _env_float("TTS_CUSTOM_TOP_P", 0.8)
+TOKEN_BUDGET_TOKENS_PER_CHAR = _env_float("TTS_TOKEN_BUDGET_TOKENS_PER_CHAR", 1.05)
+TOKEN_BUDGET_MIN = _env_int("TTS_TOKEN_BUDGET_MIN", 80)
+TOKEN_BUDGET_MAX = _env_int("TTS_TOKEN_BUDGET_MAX", 260)
 REF_NORMALIZATION_VERSION = 2
 REF_NORMALIZE_PEAK = _env_float("TTS_REF_NORMALIZE_PEAK", 0.85)
 
@@ -605,6 +608,12 @@ async def health():
             "top_k": CUSTOM_TOP_K,
             "top_p": CUSTOM_TOP_P,
         },
+        "token_budget": {
+            "tokens_per_char": TOKEN_BUDGET_TOKENS_PER_CHAR,
+            "min": TOKEN_BUDGET_MIN,
+            "max": TOKEN_BUDGET_MAX,
+            "max_chunk_chars": MAX_CHUNK_CHARS,
+        },
         "voice_clone_prompt_cache": [
             {"model": key[0], "voice": key[1], "xvec_only": key[2]}
             for key in voice_clone_prompt_cache.keys()
@@ -819,8 +828,8 @@ class SpeechRequest(BaseModel):
     max_new_tokens: int | None = None
 
 
-CHUNK_CHAR_THRESHOLD = 200  # texts longer than this get chunked
-MAX_CHUNK_CHARS = 200       # target max chars per chunk
+MAX_CHUNK_CHARS = _env_int("TTS_MAX_CHUNK_CHARS", 140)
+CHUNK_CHAR_THRESHOLD = _env_int("TTS_CHUNK_CHAR_THRESHOLD", MAX_CHUNK_CHARS)
 
 
 def _split_at_clause(text: str, max_len: int) -> list[str]:
@@ -888,10 +897,15 @@ def _split_text_to_chunks(text: str) -> list[str]:
     return final if final else [text]
 
 
-def _clone_token_limit(text: str, override: int | None = None) -> int:
+def _tts_token_limit(text: str, override: int | None = None) -> int:
     if override is not None:
         return override
-    return min(800, max(180, int(len(text) * 2.0)))
+    estimated = int(len(text) * TOKEN_BUDGET_TOKENS_PER_CHAR)
+    return min(TOKEN_BUDGET_MAX, max(TOKEN_BUDGET_MIN, estimated))
+
+
+def _clone_token_limit(text: str, override: int | None = None) -> int:
+    return _tts_token_limit(text, override)
 
 
 @app.post("/v1/audio/speech")
@@ -1181,8 +1195,7 @@ async def design_voice(request: DesignRequest):
         active_requests += 1
     try:
         t0 = time.time()
-        text_len = len(request.text.strip())
-        token_limit = request.max_new_tokens or min(800, max(150, int(text_len * 1.5)))
+        token_limit = _tts_token_limit(request.text, request.max_new_tokens)
         loop = asyncio.get_event_loop()
 
         def _gen():
@@ -1258,8 +1271,7 @@ async def custom_voice(request: CustomVoiceRequest):
         active_requests += 1
     try:
         t0 = time.time()
-        text_len = len(request.text.strip())
-        token_limit = request.max_new_tokens or min(800, max(150, int(text_len * 1.5)))
+        token_limit = _tts_token_limit(request.text, request.max_new_tokens)
         kwargs = dict(
             text=request.text,
             speaker=request.speaker,
