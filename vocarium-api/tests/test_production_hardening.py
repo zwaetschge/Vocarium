@@ -578,10 +578,19 @@ class PodcastProductionHardeningTest(unittest.TestCase):
 
     def test_qwen_clone_generation_is_voice_stable_by_default(self):
         source = (REPO_ROOT / "qwen3-tts" / "server.py").read_text()
+        compose = (REPO_ROOT / "docker-compose.yml").read_text()
+        env_example = (REPO_ROOT / ".env.example").read_text()
         self.assertIn("TTS_CLONE_DO_SAMPLE", source)
         self.assertIn('"do_sample": CLONE_DO_SAMPLE', source)
         self.assertIn('"temperature": CLONE_TEMPERATURE', source)
         self.assertIn("TTS_CLONE_XVEC_ONLY", source)
+        self.assertIn('CLONE_XVEC_ONLY = _env_bool("TTS_CLONE_XVEC_ONLY", True)', source)
+        self.assertIn("TTS_CLONE_XVEC_ONLY=${TTS_CLONE_XVEC_ONLY:-true}", compose)
+        self.assertIn("TTS_CLONE_XVEC_ONLY=true", env_example)
+        self.assertIn('CLONE_NON_STREAMING_MODE = _env_bool("TTS_CLONE_NON_STREAMING_MODE", False)', source)
+        self.assertIn('"non_streaming_mode": CLONE_NON_STREAMING_MODE', source)
+        self.assertIn("TTS_CLONE_NON_STREAMING_MODE=${TTS_CLONE_NON_STREAMING_MODE:-false}", compose)
+        self.assertIn("TTS_CLONE_NON_STREAMING_MODE=false", env_example)
         self.assertIn('xvec_only = CLONE_XVEC_ONLY or not (ref_text or "").strip()', source)
         self.assertIn('"xvec_only": xvec_only', source)
         self.assertIn('"x_vector_only_mode": xvec_only', source)
@@ -604,7 +613,8 @@ class PodcastProductionHardeningTest(unittest.TestCase):
         source = (REPO_ROOT / "qwen3-tts" / "server.py").read_text()
         self.assertIn('MAX_CHUNK_CHARS = _env_int("TTS_MAX_CHUNK_CHARS", 140)', source)
         self.assertIn('TOKEN_BUDGET_TOKENS_PER_CHAR = _env_float("TTS_TOKEN_BUDGET_TOKENS_PER_CHAR", 1.05)', source)
-        self.assertIn('TOKEN_BUDGET_MIN = _env_int("TTS_TOKEN_BUDGET_MIN", 80)', source)
+        self.assertIn('TOKEN_BUDGET_MIN = _env_int("TTS_TOKEN_BUDGET_MIN", 40)', source)
+        self.assertIn("TTS_TOKEN_BUDGET_MIN=${TTS_TOKEN_BUDGET_MIN:-40}", (REPO_ROOT / "docker-compose.yml").read_text())
         self.assertIn('TOKEN_BUDGET_MAX = _env_int("TTS_TOKEN_BUDGET_MAX", 260)', source)
         self.assertIn("def _tts_token_limit", source)
         self.assertIn("return min(TOKEN_BUDGET_MAX, max(TOKEN_BUDGET_MIN, estimated))", source)
@@ -652,7 +662,7 @@ class PodcastProductionHardeningTest(unittest.TestCase):
         self.assertIn("custom_sampling", source)
         self.assertIn("token_limit = _tts_token_limit(request.text, request.max_new_tokens)", custom_source)
 
-    def test_webui_speech_generation_uses_custom_voices_only(self):
+    def test_webui_speech_generation_keeps_cloned_voices_available(self):
         main_source = (API_ROOT / "main.py").read_text()
         speech_page = (REPO_ROOT / "vocarium-ui" / "src" / "pages" / "SpeechPage.tsx").read_text()
 
@@ -663,14 +673,14 @@ class PodcastProductionHardeningTest(unittest.TestCase):
         stream_end = main_source.index("@app.post(\"/api/generate\")", stream_start)
         stream_source = main_source[stream_start:stream_end]
 
-        self.assertIn("_require_custom_generation_voice(source)", main_source)
-        self.assertIn("_require_custom_generation_voice(source)", generate_source)
-        self.assertIn("_require_custom_generation_voice(source)", stream_source)
-        self.assertIn("Speech generation only supports custom voices", main_source)
-        self.assertIn("speechVoices = useMemo", speech_page)
-        self.assertIn("voices.filter((voice) => voice.source === 'custom')", speech_page)
-        self.assertNotIn("withDefaultVoice(voices)", speech_page)
-        self.assertNotIn("const selectedModel = '1.7b-base'", speech_page)
+        self.assertNotIn("_require_custom_generation_voice(source)", main_source)
+        self.assertNotIn("Speech generation only supports custom voices", main_source)
+        self.assertNotIn("_require_custom_generation_voice(source)", generate_source)
+        self.assertNotIn("_require_custom_generation_voice(source)", stream_source)
+        self.assertIn("generationVoices = useMemo(() => withDefaultVoice(voices), [voices])", speech_page)
+        self.assertIn("const selectedModel = '1.7b-base'", speech_page)
+        self.assertIn("model_id: selectedModel", speech_page)
+        self.assertNotIn("voices.filter((voice) => voice.source === 'custom')", speech_page)
 
     def test_f5_experiment_is_not_in_stack(self):
         compose = (REPO_ROOT / "docker-compose.yml").read_text()

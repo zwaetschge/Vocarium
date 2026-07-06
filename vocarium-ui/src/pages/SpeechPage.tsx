@@ -7,7 +7,7 @@ import AudioPlayer from '../components/AudioPlayer';
 import WaveformBars from '../components/WaveformBars';
 import type { Voice, GenerationMeta } from '../types';
 import { getRandomSample } from '../sampleTexts';
-import { voiceSourceLabel } from '../voiceUtils';
+import { voiceSourceLabel, withDefaultVoice } from '../voiceUtils';
 
 export default function SpeechPage() {
   const [voices, setVoices] = useState<Voice[]>([]);
@@ -26,10 +26,8 @@ export default function SpeechPage() {
   const [streamTotal, setStreamTotal] = useState(0);
   const audioChunksRef = useRef<Uint8Array[]>([]);
   const audio = useAudio();
-  const speechVoices = useMemo(
-    () => voices.filter((voice) => voice.source === 'custom'),
-    [voices],
-  );
+  const generationVoices = useMemo(() => withDefaultVoice(voices), [voices]);
+  const selectedModel = '1.7b-base';
 
   useEffect(() => {
     if (!generating) return;
@@ -40,21 +38,9 @@ export default function SpeechPage() {
   useEffect(() => {
     getVoices().then((v) => {
       setVoices(v);
-      const firstCustom = v.find((voice) => voice.source === 'custom');
-      if (firstCustom) setSelectedVoice(firstCustom.id);
     }).catch(() => {});
     getLanguages().then(setLanguages).catch(() => setLanguages(['English', 'Chinese', 'German']));
   }, []);
-
-  useEffect(() => {
-    if (speechVoices.length === 0) {
-      if (selectedVoice) setSelectedVoice('');
-      return;
-    }
-    if (!speechVoices.some((voice) => voice.id === selectedVoice)) {
-      setSelectedVoice(speechVoices[0].id);
-    }
-  }, [speechVoices, selectedVoice]);
 
   const base64ToBytes = useCallback((b64: string): Uint8Array => {
     const binary = atob(b64);
@@ -156,6 +142,7 @@ export default function SpeechPage() {
       const result = await generate({
         text: text.trim(),
         voice_id: selectedVoice,
+        model_id: selectedModel,
         language: selectedLang || undefined,
       });
       setMeta(result.meta);
@@ -186,6 +173,7 @@ export default function SpeechPage() {
         {
           text: text.trim(),
           voice_id: selectedVoice,
+          model_id: selectedModel,
           language: selectedLang || undefined,
         },
         (chunk: StreamChunk) => {
@@ -232,7 +220,7 @@ export default function SpeechPage() {
   };
 
   const canGenerate = text.trim() && selectedVoice && !generating;
-  const selectedVoiceObj = speechVoices.find((v) => v.id === selectedVoice);
+  const selectedVoiceObj = generationVoices.find((v) => v.id === selectedVoice);
 
   return (
     <motion.div
@@ -326,7 +314,7 @@ export default function SpeechPage() {
             className="input-field"
             style={selectStyle}
           >
-            {speechVoices.map((v) => (
+            {generationVoices.map((v) => (
               <option key={v.id} value={v.id}>
                 {v.name} · {voiceSourceLabel(v)}
               </option>

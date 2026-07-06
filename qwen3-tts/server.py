@@ -157,17 +157,22 @@ CUDA_GRAPH_MODELS = {"1.7b-base"} if ENABLE_CUDA_GRAPHS else set()
 # Clone/base voice identity gets unstable when each sentence is sampled as a
 # fresh generation. Keep clone generation deterministic by default; deployments
 # that prefer more variation can opt back in via TTS_CLONE_DO_SAMPLE=true.
+#
+# Use x-vector speaker conditioning by default for multilingual/German cloned
+# voices. Full ICL mode requires an accurate reference transcript and can drift
+# or continue the reference audio when refs are short or ASR text is imperfect.
 CLONE_DO_SAMPLE = _env_bool("TTS_CLONE_DO_SAMPLE", False)
 CLONE_TEMPERATURE = _env_float("TTS_CLONE_TEMPERATURE", 0.7)
 CLONE_TOP_K = _env_int("TTS_CLONE_TOP_K", 20)
 CLONE_TOP_P = _env_float("TTS_CLONE_TOP_P", 0.8)
-CLONE_XVEC_ONLY = _env_bool("TTS_CLONE_XVEC_ONLY", False)
+CLONE_XVEC_ONLY = _env_bool("TTS_CLONE_XVEC_ONLY", True)
+CLONE_NON_STREAMING_MODE = _env_bool("TTS_CLONE_NON_STREAMING_MODE", False)
 CUSTOM_DO_SAMPLE = _env_bool("TTS_CUSTOM_DO_SAMPLE", False)
 CUSTOM_TEMPERATURE = _env_float("TTS_CUSTOM_TEMPERATURE", 0.7)
 CUSTOM_TOP_K = _env_int("TTS_CUSTOM_TOP_K", 20)
 CUSTOM_TOP_P = _env_float("TTS_CUSTOM_TOP_P", 0.8)
 TOKEN_BUDGET_TOKENS_PER_CHAR = _env_float("TTS_TOKEN_BUDGET_TOKENS_PER_CHAR", 1.05)
-TOKEN_BUDGET_MIN = _env_int("TTS_TOKEN_BUDGET_MIN", 80)
+TOKEN_BUDGET_MIN = _env_int("TTS_TOKEN_BUDGET_MIN", 40)
 TOKEN_BUDGET_MAX = _env_int("TTS_TOKEN_BUDGET_MAX", 260)
 CHUNK_MAX_SECONDS = _env_float("TTS_CHUNK_MAX_SECONDS", 16.0)
 CHUNK_SECONDS_PER_CHAR = _env_float("TTS_CHUNK_SECONDS_PER_CHAR", 0.13)
@@ -334,7 +339,7 @@ def _generate_voice_clone(text: str, language: str, voice_id: str,
                 "text": text,
                 "language": language,
                 "max_new_tokens": max_new_tokens,
-                "non_streaming_mode": True,
+                "non_streaming_mode": CLONE_NON_STREAMING_MODE,
                 "temperature": CLONE_TEMPERATURE,
                 "top_k": CLONE_TOP_K,
                 "top_p": CLONE_TOP_P,
@@ -352,7 +357,7 @@ def _generate_voice_clone(text: str, language: str, voice_id: str,
             "text": text,
             "language": language,
             "max_new_tokens": max_new_tokens,
-            "non_streaming_mode": True,
+            "non_streaming_mode": CLONE_NON_STREAMING_MODE,
             "eos_token_id": [2150, 2157],
             "temperature": CLONE_TEMPERATURE,
             "top_k": CLONE_TOP_K,
@@ -605,6 +610,7 @@ async def health():
             "top_k": CLONE_TOP_K,
             "top_p": CLONE_TOP_P,
             "xvec_only": CLONE_XVEC_ONLY,
+            "non_streaming_mode": CLONE_NON_STREAMING_MODE,
         },
         "custom_sampling": {
             "do_sample": CUSTOM_DO_SAMPLE,
