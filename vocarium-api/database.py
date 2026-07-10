@@ -572,11 +572,16 @@ def _backfill_podcast_embedding_blobs() -> None:
         )
 
 
-def seed_prebuilt_custom_voices(user_id: int) -> int:
+def seed_prebuilt_custom_voices(
+    user_id: int,
+    *,
+    db: sqlite3.Connection | None = None,
+    commit: bool = True,
+) -> int:
     """Insert one saved custom-voice preset per built-in speaker for a user.
     Idempotent: skips speakers that already exist as saved voices for this user.
     Returns the number of rows inserted."""
-    db = get_db()
+    db = db if db is not None else get_db()
     existing = {
         row[0]
         for row in db.execute(
@@ -596,7 +601,7 @@ def seed_prebuilt_custom_voices(user_id: int) -> int:
             (str(uuid.uuid4()), user_id, name, language, speaker_id, instruct),
         )
         inserted += 1
-    if inserted:
+    if commit and inserted:
         db.commit()
     return inserted
 
@@ -629,11 +634,16 @@ _BUILTIN_HOST_PROFILES: dict[str, tuple[str, str, str]] = {
 }
 
 
-def seed_prebuilt_hosts(user_id: int) -> int:
+def seed_prebuilt_hosts(
+    user_id: int,
+    *,
+    db: sqlite3.Connection | None = None,
+    commit: bool = True,
+) -> int:
     """Create a preset podcast host for every custom-voice speaker a user owns.
     Idempotent: skips if a host with the same name already exists for this user.
     Returns the number of hosts inserted."""
-    db = get_db()
+    db = db if db is not None else get_db()
     # Find this user's custom voices that correspond to built-in speakers
     rows = db.execute(
         "SELECT id, name, speaker FROM voices WHERE user_id=? AND source='custom'",
@@ -670,7 +680,7 @@ def seed_prebuilt_hosts(user_id: int) -> int:
         )
         inserted += 1
 
-    if inserted or db.total_changes > 0:
+    if commit and (inserted or db.total_changes > 0):
         db.commit()
     return inserted
 
@@ -704,21 +714,25 @@ def get_or_create_user(username: str) -> dict:
     row = db.execute("SELECT id, username, display_name, created_at FROM users WHERE username=?", (username,)).fetchone()
     if row:
         return {"id": row[0], "username": row[1], "display_name": row[2] or row[1], "created_at": row[3]}
-    cursor = db.execute(
-        "INSERT OR IGNORE INTO users (username, display_name) VALUES (?, ?)",
-        (username, username),
-    )
-    created = cursor.rowcount == 1
-    db.commit()
-    row = db.execute(
-        "SELECT id, username, display_name, created_at FROM users WHERE username=?",
-        (username,),
-    ).fetchone()
-    if row is None:
-        raise RuntimeError("User insert completed without a readable row")
-    if created:
-        seed_prebuilt_custom_voices(row[0])
-        seed_prebuilt_hosts(row[0])
+    try:
+        cursor = db.execute(
+            "INSERT OR IGNORE INTO users (username, display_name) VALUES (?, ?)",
+            (username, username),
+        )
+        created = cursor.rowcount == 1
+        row = db.execute(
+            "SELECT id, username, display_name, created_at FROM users WHERE username=?",
+            (username,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("User insert completed without a readable row")
+        if created:
+            seed_prebuilt_custom_voices(row[0], db=db, commit=False)
+            seed_prebuilt_hosts(row[0], db=db, commit=False)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     return {
         "id": row[0],
         "username": row[1],
