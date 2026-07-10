@@ -51,6 +51,7 @@ from gpu_queue import (
     register_quota_checker,
     register_unloaders,
 )
+from health_public import build_public_health
 from metrics import inc, observe, render_prometheus
 from podcast.routes import create_podcast_router
 from request_context import request_id_var, user_id_var
@@ -1792,7 +1793,7 @@ async def health():
     except Exception:
         tts_health = {"status": "unreachable"}
     gpu_resources = await get_resource_status()
-    return {"api": "ok", "tts": tts_health, "gpu_resources": gpu_resources}
+    return build_public_health(tts_health, gpu_resources)
 
 
 # ---------------------------------------------------------------------------

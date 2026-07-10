@@ -216,6 +216,7 @@ services:
       - ./vocarium-api/database.py:/app/database.py:ro
       - ./vocarium-api/gpu_queue.py:/app/gpu_queue.py:ro
       - ./vocarium-api/metrics.py:/app/metrics.py:ro
+      - ./vocarium-api/health_public.py:/app/health_public.py:ro
       - ./vocarium-api/request_context.py:/app/request_context.py:ro
       - ./vocarium-api/artifact_cleanup.py:/app/artifact_cleanup.py:ro
       - ./vocarium-api/url_security.py:/app/url_security.py:ro
@@ -282,6 +283,7 @@ services:
       - ./vocarium-api/database.py:/app/database.py:ro
       - ./vocarium-api/gpu_queue.py:/app/gpu_queue.py:ro
       - ./vocarium-api/metrics.py:/app/metrics.py:ro
+      - ./vocarium-api/health_public.py:/app/health_public.py:ro
       - ./vocarium-api/request_context.py:/app/request_context.py:ro
       - ./vocarium-api/artifact_cleanup.py:/app/artifact_cleanup.py:ro
       - ./vocarium-api/url_security.py:/app/url_security.py:ro
