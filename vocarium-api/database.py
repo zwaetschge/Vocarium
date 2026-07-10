@@ -704,12 +704,27 @@ def get_or_create_user(username: str) -> dict:
     row = db.execute("SELECT id, username, display_name, created_at FROM users WHERE username=?", (username,)).fetchone()
     if row:
         return {"id": row[0], "username": row[1], "display_name": row[2] or row[1], "created_at": row[3]}
-    db.execute("INSERT INTO users (username, display_name) VALUES (?, ?)", (username, username))
+    cursor = db.execute(
+        "INSERT OR IGNORE INTO users (username, display_name) VALUES (?, ?)",
+        (username, username),
+    )
+    created = cursor.rowcount == 1
     db.commit()
-    row = db.execute("SELECT id, username, display_name, created_at FROM users WHERE username=?", (username,)).fetchone()
-    seed_prebuilt_custom_voices(row[0])
-    seed_prebuilt_hosts(row[0])
-    return {"id": row[0], "username": row[1], "display_name": row[2] or row[1], "created_at": row[3]}
+    row = db.execute(
+        "SELECT id, username, display_name, created_at FROM users WHERE username=?",
+        (username,),
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("User insert completed without a readable row")
+    if created:
+        seed_prebuilt_custom_voices(row[0])
+        seed_prebuilt_hosts(row[0])
+    return {
+        "id": row[0],
+        "username": row[1],
+        "display_name": row[2] or row[1],
+        "created_at": row[3],
+    }
 
 
 def backfill_hosts_for_all_users() -> int:

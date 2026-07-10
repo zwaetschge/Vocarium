@@ -379,3 +379,50 @@ class MetricsCardinalityTest(unittest.TestCase):
         self.assertEqual(route_path_label(Matched()), "/api/voices/{voice_id}")
         self.assertEqual(route_path_label(None), "__unmatched__")
         self.assertEqual(route_path_label(object()), "__unmatched__")
+
+
+class UserCreationRaceTest(unittest.TestCase):
+    def test_unique_insert_loser_reads_the_winning_user(self):
+        import database
+
+        class Cursor:
+            def __init__(self, row=None, rowcount=-1):
+                self._row = row
+                self.rowcount = rowcount
+
+            def fetchone(self):
+                return self._row
+
+        class RaceConnection:
+            def __init__(self):
+                self.selects = 0
+
+            def execute(self, sql, params=()):
+                if sql.startswith("SELECT id, username"):
+                    self.selects += 1
+                    if self.selects == 1:
+                        return Cursor(None)
+                    return Cursor((7, "race-user", "race-user", "2026-07-10"))
+                if sql.startswith("INSERT OR IGNORE INTO users"):
+                    return Cursor(rowcount=0)
+                if sql.startswith("INSERT INTO users"):
+                    raise database.sqlite3.IntegrityError("UNIQUE constraint failed")
+                raise AssertionError(sql)
+
+            def commit(self):
+                return None
+
+        original_get_db = database.get_db
+        original_voices = database.seed_prebuilt_custom_voices
+        original_hosts = database.seed_prebuilt_hosts
+        try:
+            database.get_db = lambda: RaceConnection()
+            database.seed_prebuilt_custom_voices = lambda user_id: 0
+            database.seed_prebuilt_hosts = lambda user_id: 0
+            user = database.get_or_create_user("race-user")
+        finally:
+            database.get_db = original_get_db
+            database.seed_prebuilt_custom_voices = original_voices
+            database.seed_prebuilt_hosts = original_hosts
+
+        self.assertEqual(user["id"], 7)
