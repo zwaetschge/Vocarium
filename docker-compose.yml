@@ -209,6 +209,7 @@ services:
       CORS_ORIGINS: ${CORS_ORIGINS:-*}
       VOCARIUM_INSTANCE_ID: vocarium-api
       PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONPYCACHEPREFIX: /tmp/vocarium-pycache
       PYTHONUNBUFFERED: "1"
     ports:
       - "127.0.0.1:${VOCARIUM_API_PORT:-8280}:8280"
@@ -224,9 +225,7 @@ services:
       - ./vocarium-api/url_security.py:/app/url_security.py:ro
       - ./vocarium-api/podcast:/app/podcast:ro
       - type: tmpfs
-        target: /app/__pycache__
-      - type: tmpfs
-        target: /app/podcast/__pycache__
+        target: /tmp/vocarium-pycache
       - acestep-output:/app/acestep/.cache/acestep:ro
       - vocarium-data:/app/data
       - voices-data:/app/voices
@@ -278,6 +277,7 @@ services:
       CORS_ORIGINS: ${CORS_ORIGINS:-*}
       VOCARIUM_INSTANCE_ID: vocarium-api-2
       PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONPYCACHEPREFIX: /tmp/vocarium-pycache
       PYTHONUNBUFFERED: "1"
     ports:
       - "127.0.0.1:${VOCARIUM_API_PORT_2:-8281}:8280"
@@ -293,9 +293,7 @@ services:
       - ./vocarium-api/url_security.py:/app/url_security.py:ro
       - ./vocarium-api/podcast:/app/podcast:ro
       - type: tmpfs
-        target: /app/__pycache__
-      - type: tmpfs
-        target: /app/podcast/__pycache__
+        target: /tmp/vocarium-pycache
       - acestep-output:/app/acestep/.cache/acestep:ro
       - vocarium-data:/app/data
       - voices-data:/app/voices

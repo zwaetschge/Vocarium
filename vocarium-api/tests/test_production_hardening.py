@@ -1,9 +1,11 @@
 import asyncio
 import io
 import os
+import py_compile
 import re
 import ast
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -429,6 +431,136 @@ class SourceSecurityTest(unittest.TestCase):
         self.assertIn("ports: !reset []", prod)
         self.assertIn("ALLOW_ANONYMOUS: ${ALLOW_ANONYMOUS:-false}", prod)
         self.assertIn("CORS_ORIGINS: ${CORS_ORIGINS:?", prod)
+
+    def test_api_cache_mounts_avoid_read_only_source_bind_mountpoints(self):
+        compose = (REPO_ROOT / "docker-compose.yml").read_text()
+        strategies: dict[str, tuple[str, tuple[str, ...]]] = {}
+
+        for service in ("vocarium-api", "vocarium-api-2"):
+            match = re.search(
+                rf"(?ms)^  {re.escape(service)}:\n(?P<body>.*?)(?=^  [a-zA-Z0-9_-]+:\n|\Z)",
+                compose,
+            )
+            self.assertIsNotNone(match, f"missing Compose service {service}")
+            block = match.group("body")
+            read_only_targets = re.findall(
+                r"(?m)^      - [^:\n]+:(/[^:\n]+):ro$", block
+            )
+            tmpfs_targets = tuple(
+                re.findall(
+                    r"(?m)^      - type: tmpfs\n        target: (/\S+)$", block
+                )
+            )
+            nested_targets = [
+                (tmpfs_target, source_target)
+                for tmpfs_target in tmpfs_targets
+                for source_target in read_only_targets
+                if tmpfs_target == source_target
+                or tmpfs_target.startswith(source_target.rstrip("/") + "/")
+            ]
+            self.assertEqual(
+                nested_targets,
+                [],
+                f"{service} tmpfs targets must not require mountpoints below "
+                "read-only sources",
+            )
+
+            prefix_match = re.search(
+                r"(?m)^      PYTHONPYCACHEPREFIX:[ \t]*(\S+)[ \t]*$", block
+            )
+            self.assertIsNotNone(
+                prefix_match, f"{service} must configure PYTHONPYCACHEPREFIX"
+            )
+            prefix = prefix_match.group(1).strip("\"'")
+            self.assertTrue(prefix.startswith("/"))
+            self.assertFalse(prefix == "/app" or prefix.startswith("/app/"))
+            self.assertIn(prefix, tmpfs_targets)
+            self.assertFalse(
+                any("__pycache__" in Path(target).parts for target in tmpfs_targets)
+            )
+            strategies[service] = (prefix, tmpfs_targets)
+
+        self.assertEqual(strategies["vocarium-api"], strategies["vocarium-api-2"])
+
+    def test_api_cache_prefix_ignores_colocated_stale_bytecode(self):
+        compose = (REPO_ROOT / "docker-compose.yml").read_text()
+        prefixes: list[str] = []
+        for service in ("vocarium-api", "vocarium-api-2"):
+            match = re.search(
+                rf"(?ms)^  {re.escape(service)}:\n(?P<body>.*?)(?=^  [a-zA-Z0-9_-]+:\n|\Z)",
+                compose,
+            )
+            self.assertIsNotNone(match, f"missing Compose service {service}")
+            prefix_match = re.search(
+                r"(?m)^      PYTHONPYCACHEPREFIX:[ \t]*(\S+)[ \t]*$",
+                match.group("body"),
+            )
+            self.assertIsNotNone(
+                prefix_match, f"{service} must configure PYTHONPYCACHEPREFIX"
+            )
+            prefixes.append(prefix_match.group(1).strip("\"'"))
+        self.assertEqual(prefixes[0], prefixes[1])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source_root = Path(tmp) / "source"
+            source_root.mkdir()
+            module_path = source_root / "cache_probe.py"
+            module_path.write_text("VALUE = 'stale'\n")
+            colocated_cache = (
+                module_path.parent
+                / "__pycache__"
+                / f"{module_path.stem}.{sys.implementation.cache_tag}.pyc"
+            )
+            colocated_cache.parent.mkdir()
+            py_compile.compile(
+                str(module_path),
+                cfile=str(colocated_cache),
+                doraise=True,
+                invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+            )
+            module_path.write_text("VALUE = 'fresh'\n")
+
+            probe = (
+                "import importlib.util, pathlib, sys\n"
+                f"source_root = pathlib.Path({str(source_root)!r})\n"
+                "sys.path.insert(0, str(source_root))\n"
+                "import cache_probe\n"
+                "print(cache_probe.VALUE)\n"
+                "print(sys.pycache_prefix)\n"
+                "print(importlib.util.cache_from_source(str(source_root / 'cache_probe.py')))\n"
+            )
+            baseline_env = os.environ.copy()
+            baseline_env.pop("PYTHONPYCACHEPREFIX", None)
+            baseline_env["PYTHONDONTWRITEBYTECODE"] = "1"
+            baseline = subprocess.run(
+                [sys.executable, "-c", probe],
+                capture_output=True,
+                check=False,
+                env=baseline_env,
+                text=True,
+            )
+            self.assertEqual(baseline.returncode, 0, baseline.stderr)
+            baseline_output = baseline.stdout.splitlines()
+            self.assertEqual(baseline_output[0], "stale")
+            self.assertEqual(baseline_output[1], "None")
+            self.assertEqual(Path(baseline_output[2]), colocated_cache)
+
+            prefixed_env = baseline_env.copy()
+            prefixed_env["PYTHONPYCACHEPREFIX"] = prefixes[0]
+            prefixed = subprocess.run(
+                [sys.executable, "-c", probe],
+                capture_output=True,
+                check=False,
+                env=prefixed_env,
+                text=True,
+            )
+            self.assertEqual(prefixed.returncode, 0, prefixed.stderr)
+            prefixed_output = prefixed.stdout.splitlines()
+            self.assertEqual(prefixed_output[0], "fresh")
+            self.assertEqual(prefixed_output[1], prefixes[0])
+            redirected_cache = Path(prefixed_output[2])
+            self.assertTrue(redirected_cache.is_relative_to(Path(prefixes[0])))
+            self.assertNotEqual(redirected_cache, colocated_cache)
 
     def test_local_auth_default_allows_shared_api_user(self):
         main_source = (API_ROOT / "main.py").read_text()
