@@ -381,12 +381,37 @@ class MetricsCardinalityTest(unittest.TestCase):
         self.assertEqual(route_path_label(object()), "__unmatched__")
 
 
-class UserCreationRaceTest(unittest.TestCase):
-    def test_wal_race_converges_and_only_creator_seeds(self):
+class _A5DatabaseTestCase(unittest.TestCase):
+    def setUp(self):
         import database
         import tempfile
+
+        self.database = database
+        self._original_db = database._db
+        self._db_path_existed = hasattr(database, "_db_path")
+        self._original_db_path = getattr(database, "_db_path", None)
+        self._temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self._temp_dir.name) / "a5.db"
+        database.init_db(self.db_path)
+        self.db = database.get_db()
+
+    def tearDown(self):
+        current_db = self.database._db
+        if current_db is not None and current_db is not self._original_db:
+            current_db.close()
+        self.database._db = self._original_db
+        if self._db_path_existed:
+            self.database._db_path = self._original_db_path
+        elif hasattr(self.database, "_db_path"):
+            del self.database._db_path
+        self._temp_dir.cleanup()
+
+
+class UserCreationRaceTest(_A5DatabaseTestCase):
+    def test_wal_race_converges_and_only_creator_seeds(self):
         import threading
 
+        database = self.database
         initial_reads = threading.Barrier(2)
 
         class BufferedCursor:
@@ -422,196 +447,443 @@ class UserCreationRaceTest(unittest.TestCase):
             def total_changes(self):
                 return self._connection.total_changes
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            db_path = Path(temp_dir) / "user-race.db"
-            setup = database.sqlite3.connect(db_path)
-            try:
-                self.assertEqual(
-                    setup.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal"
-                )
-                setup.executescript(
-                    """
-                    CREATE TABLE users (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        username TEXT UNIQUE NOT NULL,
-                        display_name TEXT DEFAULT '',
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    );
-                    CREATE TABLE seed_events (
-                        kind TEXT NOT NULL,
-                        user_id INTEGER NOT NULL
-                    );
-                    """
-                )
-                setup.commit()
-            finally:
-                setup.close()
+            @property
+            def row_factory(self):
+                return self._connection.row_factory
 
-            raw_connections = [
-                database.sqlite3.connect(
-                    db_path, timeout=5, check_same_thread=False
-                )
-                for _ in range(2)
+            @property
+            def isolation_level(self):
+                return self._connection.isolation_level
+
+        raw_connections = [
+            database.sqlite3.connect(
+                self.db_path, timeout=5, check_same_thread=False
+            )
+            for _ in range(2)
+        ]
+        for connection in raw_connections:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA busy_timeout=5000")
+            connection.execute("PRAGMA foreign_keys=ON")
+        connections = [
+            SynchronizedConnection(connection) for connection in raw_connections
+        ]
+        thread_connection = threading.local()
+        creator_calls = []
+        creator_calls_lock = threading.Lock()
+        results = [None, None]
+        errors = [None, None]
+
+        original_get_db = database.get_db
+        original_speakers = database._BUILTIN_SPEAKERS
+        original_instructs = database._BUILTIN_SPEAKER_INSTRUCTS
+        original_profiles = database._BUILTIN_HOST_PROFILES
+        original_uuid4 = database.uuid.uuid4
+
+        class CountingProfiles(dict):
+            def get(self, key, default=None):
+                with creator_calls_lock:
+                    creator_calls.append((threading.get_ident(), "hosts"))
+                return super().get(key, default)
+
+        def counted_uuid4():
+            with creator_calls_lock:
+                creator_calls.append((threading.get_ident(), "voices"))
+            return original_uuid4()
+
+        def create_user(index):
+            thread_connection.current = connections[index]
+            try:
+                results[index] = database.get_or_create_user("race-user")
+            except BaseException as exc:
+                errors[index] = exc
+
+        workers = []
+        try:
+            database.get_db = lambda: thread_connection.current
+            database._BUILTIN_SPEAKERS = [("Race", "female", "German")]
+            database._BUILTIN_SPEAKER_INSTRUCTS = {"Race": ""}
+            database._BUILTIN_HOST_PROFILES = CountingProfiles(
+                {"Race": ("Race personality", "Race style", "host")}
+            )
+            database.uuid.uuid4 = counted_uuid4
+            workers = [
+                threading.Thread(target=create_user, args=(index,))
+                for index in range(2)
             ]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=10)
+        finally:
+            database.get_db = original_get_db
+            database._BUILTIN_SPEAKERS = original_speakers
+            database._BUILTIN_SPEAKER_INSTRUCTS = original_instructs
+            database._BUILTIN_HOST_PROFILES = original_profiles
+            database.uuid.uuid4 = original_uuid4
+
+        self.assertFalse(any(worker.is_alive() for worker in workers))
+        self.assertEqual(errors, [None, None])
+
+        observer = database.sqlite3.connect(self.db_path)
+        try:
+            canonical_row = observer.execute(
+                "SELECT id, username FROM users WHERE username=?",
+                ("race-user",),
+            ).fetchone()
+            voice_rows = observer.execute(
+                "SELECT user_id, speaker FROM voices WHERE speaker='Race'"
+            ).fetchall()
+            host_rows = observer.execute(
+                "SELECT user_id, name FROM hosts WHERE name='Race'"
+            ).fetchall()
+        finally:
+            observer.close()
             for connection in raw_connections:
-                connection.execute("PRAGMA busy_timeout=5000")
-            connections = [
-                SynchronizedConnection(connection) for connection in raw_connections
-            ]
-            thread_connection = threading.local()
-            creator_calls = []
-            creator_calls_lock = threading.Lock()
-            results = [None, None]
-            errors = [None, None]
-
-            def record_seed(kind):
-                def seed(user_id, *, db=None, commit=True):
-                    connection = db if db is not None else database.get_db()
-                    with creator_calls_lock:
-                        creator_calls.append(
-                            (threading.get_ident(), kind, user_id)
-                        )
-                    connection.execute(
-                        "INSERT INTO seed_events (kind, user_id) VALUES (?, ?)",
-                        (kind, user_id),
-                    )
-                    if commit:
-                        connection.commit()
-                    return 1
-
-                return seed
-
-            def create_user(index):
-                thread_connection.current = connections[index]
-                try:
-                    results[index] = database.get_or_create_user("race-user")
-                except BaseException as exc:
-                    errors[index] = exc
-
-            original_get_db = database.get_db
-            original_voices = database.seed_prebuilt_custom_voices
-            original_hosts = database.seed_prebuilt_hosts
-            workers = []
-            try:
-                database.get_db = lambda: thread_connection.current
-                database.seed_prebuilt_custom_voices = record_seed("voices")
-                database.seed_prebuilt_hosts = record_seed("hosts")
-                workers = [
-                    threading.Thread(target=create_user, args=(index,))
-                    for index in range(2)
-                ]
-                for worker in workers:
-                    worker.start()
-                for worker in workers:
-                    worker.join(timeout=10)
-            finally:
-                database.get_db = original_get_db
-                database.seed_prebuilt_custom_voices = original_voices
-                database.seed_prebuilt_hosts = original_hosts
-
-            self.assertFalse(any(worker.is_alive() for worker in workers))
-            self.assertEqual(errors, [None, None])
-
-            observer = database.sqlite3.connect(db_path)
-            try:
-                canonical_row = observer.execute(
-                    "SELECT id, username FROM users WHERE username=?",
-                    ("race-user",),
-                ).fetchone()
-                seed_events = observer.execute(
-                    "SELECT kind, user_id FROM seed_events ORDER BY rowid"
-                ).fetchall()
-            finally:
-                observer.close()
-                for connection in raw_connections:
-                    connection.close()
+                connection.close()
 
         self.assertIsNotNone(canonical_row)
         canonical_id = canonical_row[0]
         self.assertEqual(canonical_row[1], "race-user")
         self.assertEqual([result["id"] for result in results], [canonical_id] * 2)
-        self.assertEqual(seed_events, [("voices", canonical_id), ("hosts", canonical_id)])
+        self.assertEqual(voice_rows, [(canonical_id, "Race")])
+        self.assertEqual(host_rows, [(canonical_id, "Race")])
         self.assertEqual(
-            [(kind, user_id) for _thread_id, kind, user_id in creator_calls],
-            [("voices", canonical_id), ("hosts", canonical_id)],
+            [kind for _thread_id, kind in creator_calls],
+            ["voices", "hosts"],
         )
         self.assertEqual(len({call[0] for call in creator_calls}), 1)
 
-    def test_seed_failure_rolls_back_user_partial_seed_and_reuses_connection(self):
-        import database
-        import tempfile
+    def test_other_request_cannot_commit_failed_creators_partial_work(self):
+        import threading
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            db_path = Path(temp_dir) / "user-rollback.db"
-            connection = database.sqlite3.connect(db_path)
-            connection.executescript(
-                """
-                CREATE TABLE users (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    username TEXT UNIQUE NOT NULL,
-                    display_name TEXT DEFAULT '',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-                CREATE TABLE seed_events (
-                    kind TEXT NOT NULL,
-                    user_id INTEGER NOT NULL
-                );
-                """
-            )
-            connection.commit()
+        database = self.database
+        partial_seeded = threading.Event()
+        other_request_complete = threading.Event()
+        first_errors = []
+        second_errors = []
 
-            def partial_voice_seed(user_id, *, db=None, commit=True):
-                active_db = db if db is not None else connection
-                active_db.execute(
-                    "INSERT INTO seed_events (kind, user_id) VALUES ('voices', ?)",
-                    (user_id,),
-                )
-                return 1
+        original_speakers = database._BUILTIN_SPEAKERS
+        original_instructs = database._BUILTIN_SPEAKER_INSTRUCTS
+        original_profiles = database._BUILTIN_HOST_PROFILES
 
-            def failing_host_seed(user_id, *, db=None, commit=True):
-                active_db = db if db is not None else connection
-                active_db.execute(
-                    "INSERT INTO seed_events (kind, user_id) VALUES ('hosts', ?)",
-                    (user_id,),
-                )
+        class PausingFailingProfiles(dict):
+            def get(self, key, default=None):
+                partial_seeded.set()
+                if not other_request_complete.wait(timeout=5):
+                    raise AssertionError("second request did not complete")
                 raise RuntimeError("host seed failed")
 
-            original_get_db = database.get_db
-            original_voices = database.seed_prebuilt_custom_voices
-            original_hosts = database.seed_prebuilt_hosts
+        def create_first_user():
             try:
-                database.get_db = lambda: connection
-                database.seed_prebuilt_custom_voices = partial_voice_seed
-                database.seed_prebuilt_hosts = failing_host_seed
-                with self.assertRaisesRegex(RuntimeError, "host seed failed"):
-                    database.get_or_create_user("rollback-user")
+                database.get_or_create_user("interleaved-user")
+            except BaseException as exc:
+                first_errors.append(exc)
 
-                state_after_failure = (
-                    connection.in_transaction,
-                    connection.execute(
-                        "SELECT COUNT(*) FROM users WHERE username=?",
-                        ("rollback-user",),
-                    ).fetchone()[0],
-                    connection.execute(
-                        "SELECT COUNT(*) FROM seed_events"
-                    ).fetchone()[0],
-                )
-                self.assertEqual(state_after_failure, (False, 0, 0))
-
-                connection.execute(
-                    "INSERT INTO users (username, display_name) VALUES (?, ?)",
-                    ("after-rollback", "after-rollback"),
-                )
-                connection.commit()
-                self.assertEqual(
-                    connection.execute(
-                        "SELECT COUNT(*) FROM users WHERE username=?",
-                        ("after-rollback",),
-                    ).fetchone()[0],
-                    1,
-                )
+        def complete_other_request():
+            try:
+                database.get_db().execute("SELECT 1").fetchone()
+                database.get_db().commit()
+            except BaseException as exc:
+                second_errors.append(exc)
             finally:
-                database.get_db = original_get_db
-                database.seed_prebuilt_custom_voices = original_voices
-                database.seed_prebuilt_hosts = original_hosts
-                connection.close()
+                other_request_complete.set()
+
+        try:
+            database._BUILTIN_SPEAKERS = [("Interleave", "female", "German")]
+            database._BUILTIN_SPEAKER_INSTRUCTS = {"Interleave": ""}
+            database._BUILTIN_HOST_PROFILES = PausingFailingProfiles(
+                {"Interleave": ("Personality", "Style", "host")}
+            )
+            first = threading.Thread(target=create_first_user)
+            first.start()
+            self.assertTrue(partial_seeded.wait(timeout=5))
+
+            second = threading.Thread(target=complete_other_request)
+            second.start()
+            second.join(timeout=5)
+            first.join(timeout=5)
+        finally:
+            database._BUILTIN_SPEAKERS = original_speakers
+            database._BUILTIN_SPEAKER_INSTRUCTS = original_instructs
+            database._BUILTIN_HOST_PROFILES = original_profiles
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(second_errors, [])
+        self.assertEqual(len(first_errors), 1)
+        self.assertIsInstance(first_errors[0], RuntimeError)
+        self.assertEqual(str(first_errors[0]), "host seed failed")
+
+        observer = database.sqlite3.connect(self.db_path)
+        try:
+            state = (
+                observer.execute(
+                    "SELECT COUNT(*) FROM users WHERE username='interleaved-user'"
+                ).fetchone()[0],
+                observer.execute(
+                    "SELECT COUNT(*) FROM voices WHERE speaker='Interleave'"
+                ).fetchone()[0],
+                observer.execute(
+                    "SELECT COUNT(*) FROM hosts WHERE name='Interleave'"
+                ).fetchone()[0],
+            )
+        finally:
+            observer.close()
+        self.assertEqual(state, (0, 0, 0))
+
+    def test_seed_failure_rolls_back_user_partial_seed_and_reuses_connection(self):
+        database = self.database
+        original_speakers = database._BUILTIN_SPEAKERS
+        original_instructs = database._BUILTIN_SPEAKER_INSTRUCTS
+        original_profiles = database._BUILTIN_HOST_PROFILES
+
+        class FailingProfiles(dict):
+            def get(self, key, default=None):
+                raise RuntimeError("host seed failed")
+
+        try:
+            database._BUILTIN_SPEAKERS = [("Rollback", "female", "German")]
+            database._BUILTIN_SPEAKER_INSTRUCTS = {"Rollback": ""}
+            database._BUILTIN_HOST_PROFILES = FailingProfiles(
+                {"Rollback": ("Personality", "Style", "host")}
+            )
+            with self.assertRaisesRegex(RuntimeError, "host seed failed"):
+                database.get_or_create_user("rollback-user")
+        finally:
+            database._BUILTIN_SPEAKERS = original_speakers
+            database._BUILTIN_SPEAKER_INSTRUCTS = original_instructs
+            database._BUILTIN_HOST_PROFILES = original_profiles
+
+        observer = database.sqlite3.connect(self.db_path)
+        try:
+            state_after_failure = (
+                observer.execute(
+                    "SELECT COUNT(*) FROM users WHERE username='rollback-user'"
+                ).fetchone()[0],
+                observer.execute(
+                    "SELECT COUNT(*) FROM voices WHERE speaker='Rollback'"
+                ).fetchone()[0],
+                observer.execute(
+                    "SELECT COUNT(*) FROM hosts WHERE name='Rollback'"
+                ).fetchone()[0],
+            )
+        finally:
+            observer.close()
+        self.assertEqual(state_after_failure, (0, 0, 0))
+
+        self.db.execute(
+            "INSERT INTO users (username, display_name) VALUES (?, ?)",
+            ("after-rollback", "after-rollback"),
+        )
+        self.db.commit()
+        self.assertEqual(
+            self.db.execute(
+                "SELECT COUNT(*) FROM users WHERE username='after-rollback'"
+            ).fetchone()[0],
+            1,
+        )
+
+
+class SeedTransactionOwnershipTest(_A5DatabaseTestCase):
+    def setUp(self):
+        super().setUp()
+        cursor = self.db.execute(
+            "INSERT INTO users (username, display_name) VALUES (?, ?)",
+            ("seed-owner", "seed-owner"),
+        )
+        self.user_id = cursor.lastrowid
+        self.db.commit()
+
+    def test_public_seed_helpers_keep_one_argument_api(self):
+        import inspect
+
+        for helper in (
+            self.database.seed_prebuilt_custom_voices,
+            self.database.seed_prebuilt_hosts,
+        ):
+            with self.subTest(helper=helper.__name__):
+                self.assertEqual(
+                    list(inspect.signature(helper).parameters), ["user_id"]
+                )
+
+    def test_public_custom_voice_helper_commits_its_work(self):
+        inserted = self.database.seed_prebuilt_custom_voices(self.user_id)
+        observer = self.database.sqlite3.connect(self.db_path)
+        try:
+            visible = observer.execute(
+                "SELECT COUNT(*) FROM voices WHERE user_id=?",
+                (self.user_id,),
+            ).fetchone()[0]
+        finally:
+            observer.close()
+        self.assertEqual((inserted, visible), (9, 9))
+
+    def test_public_host_helper_commits_its_work(self):
+        self.database.seed_prebuilt_custom_voices(self.user_id)
+        inserted = self.database.seed_prebuilt_hosts(self.user_id)
+        observer = self.database.sqlite3.connect(self.db_path)
+        try:
+            visible = observer.execute(
+                "SELECT COUNT(*) FROM hosts WHERE user_id=?",
+                (self.user_id,),
+            ).fetchone()[0]
+        finally:
+            observer.close()
+        self.assertEqual((inserted, visible), (9, 9))
+
+    def test_private_custom_voice_seed_does_not_commit_unrelated_dml(self):
+        self.assertTrue(
+            hasattr(self.database, "_seed_prebuilt_custom_voices"),
+            "missing private non-committing custom-voice seed primitive",
+        )
+        primitive = self.database._seed_prebuilt_custom_voices
+        self.db.execute(
+            "INSERT INTO users (username, display_name) VALUES ('unrelated', 'x')"
+        )
+        inserted = primitive(self.db, self.user_id)
+        own_state = (
+            self.db.execute(
+                "SELECT COUNT(*) FROM users WHERE username='unrelated'"
+            ).fetchone()[0],
+            self.db.execute(
+                "SELECT COUNT(*) FROM voices WHERE user_id=?", (self.user_id,)
+            ).fetchone()[0],
+        )
+        observer = self.database.sqlite3.connect(self.db_path)
+        try:
+            visible_state = (
+                observer.execute(
+                    "SELECT COUNT(*) FROM users WHERE username='unrelated'"
+                ).fetchone()[0],
+                observer.execute(
+                    "SELECT COUNT(*) FROM voices WHERE user_id=?", (self.user_id,)
+                ).fetchone()[0],
+            )
+        finally:
+            observer.close()
+            self.db.rollback()
+        self.assertEqual((inserted, own_state, visible_state), (9, (1, 9), (0, 0)))
+
+    def test_private_host_seed_does_not_commit_unrelated_dml(self):
+        self.assertTrue(
+            hasattr(self.database, "_seed_prebuilt_hosts"),
+            "missing private non-committing host seed primitive",
+        )
+        self.database.seed_prebuilt_custom_voices(self.user_id)
+        primitive = self.database._seed_prebuilt_hosts
+        self.db.execute(
+            "INSERT INTO users (username, display_name) VALUES ('unrelated', 'x')"
+        )
+        inserted = primitive(self.db, self.user_id)
+        own_state = (
+            self.db.execute(
+                "SELECT COUNT(*) FROM users WHERE username='unrelated'"
+            ).fetchone()[0],
+            self.db.execute(
+                "SELECT COUNT(*) FROM hosts WHERE user_id=?", (self.user_id,)
+            ).fetchone()[0],
+        )
+        observer = self.database.sqlite3.connect(self.db_path)
+        try:
+            visible_state = (
+                observer.execute(
+                    "SELECT COUNT(*) FROM users WHERE username='unrelated'"
+                ).fetchone()[0],
+                observer.execute(
+                    "SELECT COUNT(*) FROM hosts WHERE user_id=?", (self.user_id,)
+                ).fetchone()[0],
+            )
+        finally:
+            observer.close()
+            self.db.rollback()
+        self.assertEqual((inserted, own_state, visible_state), (9, (1, 9), (0, 0)))
+
+    def test_owned_creation_connection_matches_main_configuration(self):
+        self.assertTrue(
+            hasattr(self.database, "_open_user_creation_connection"),
+            "missing independently owned user-creation connection",
+        )
+        self.db.row_factory = self.database.sqlite3.Row
+        owned = self.database._open_user_creation_connection(self.db)
+        try:
+            main_path = self.db.execute("PRAGMA database_list").fetchone()[2]
+            owned_path = owned.execute("PRAGMA database_list").fetchone()[2]
+            self.assertIsNot(owned, self.db)
+            self.assertIsInstance(owned, self.database.InstrumentedConnection)
+            self.assertEqual(owned_path, main_path)
+            self.assertEqual(
+                owned.execute("PRAGMA journal_mode").fetchone()[0], "wal"
+            )
+            self.assertEqual(
+                owned.execute("PRAGMA busy_timeout").fetchone()[0], 5000
+            )
+            self.assertEqual(
+                owned.execute("PRAGMA foreign_keys").fetchone()[0], 1
+            )
+            self.assertIs(owned.row_factory, self.database.sqlite3.Row)
+            self.assertEqual(owned.isolation_level, self.db.isolation_level)
+        finally:
+            owned.close()
+
+    def test_missing_user_rechecks_owned_connection_and_closes_it(self):
+        self.assertTrue(
+            hasattr(self.database, "_open_user_creation_connection"),
+            "missing independently owned user-creation connection",
+        )
+        self.db.execute(
+            "INSERT INTO users (username, display_name) VALUES (?, ?)",
+            ("won-elsewhere", "Canonical Winner"),
+        )
+        self.db.commit()
+        raw_owned = self.database.sqlite3.connect(self.db_path)
+
+        class MissingMain:
+            row_factory = None
+
+            def execute(self, sql, params=()):
+                if sql.startswith("SELECT id, username"):
+                    return type("Cursor", (), {"fetchone": lambda self: None})()
+                raise AssertionError(sql)
+
+        class TrackingConnection:
+            def __init__(self, connection):
+                self._connection = connection
+                self.statements = []
+                self.closed = False
+
+            def execute(self, sql, params=()):
+                self.statements.append(sql)
+                return self._connection.execute(sql, params)
+
+            def commit(self):
+                self._connection.commit()
+
+            def rollback(self):
+                self._connection.rollback()
+
+            def close(self):
+                self.closed = True
+                self._connection.close()
+
+        tracking = TrackingConnection(raw_owned)
+        original_get_db = self.database.get_db
+        original_open = self.database._open_user_creation_connection
+        try:
+            self.database.get_db = lambda: MissingMain()
+            self.database._open_user_creation_connection = lambda _main: tracking
+            user = self.database.get_or_create_user("won-elsewhere")
+        finally:
+            self.database.get_db = original_get_db
+            self.database._open_user_creation_connection = original_open
+            if not tracking.closed:
+                tracking.close()
+
+        self.assertEqual(user["display_name"], "Canonical Winner")
+        self.assertTrue(tracking.closed)
+        self.assertTrue(
+            any(sql.startswith("SELECT id, username") for sql in tracking.statements)
+        )
+        self.assertFalse(
+            any(sql.startswith("INSERT") for sql in tracking.statements)
+        )
