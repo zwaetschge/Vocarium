@@ -367,3 +367,15 @@ class AdminAuthorizationBoundaryTest(unittest.TestCase):
                 self.assertFalse(
                     any(call.func.id == "get_current_user" for call in calls)
                 )
+
+
+class MetricsCardinalityTest(unittest.TestCase):
+    def test_unmatched_routes_share_one_bounded_label(self):
+        from metrics import route_path_label
+
+        class Matched:
+            path = "/api/voices/{voice_id}"
+
+        self.assertEqual(route_path_label(Matched()), "/api/voices/{voice_id}")
+        self.assertEqual(route_path_label(None), "__unmatched__")
+        self.assertEqual(route_path_label(object()), "__unmatched__")

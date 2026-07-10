@@ -53,7 +53,7 @@ from gpu_queue import (
     register_unloaders,
 )
 from health_public import build_public_health
-from metrics import inc, observe, render_prometheus
+from metrics import inc, observe, render_prometheus, route_path_label
 from podcast.routes import create_podcast_router
 from request_context import request_id_var, user_id_var
 from url_security import URLValidationError, normalize_http_base_url
@@ -192,8 +192,7 @@ async def metrics_middleware(request: Request, call_next):
         response.headers[TRACE_HEADER] = request_id
         return response
     finally:
-        route = request.scope.get("route")
-        route_path = getattr(route, "path", request.url.path)
+        route_path = route_path_label(request.scope.get("route"))
         labels = {
             "method": request.method,
             "path": route_path,
