@@ -1,16 +1,45 @@
 import ast
 import unittest
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FUNCTION_NODES = (ast.FunctionDef, ast.AsyncFunctionDef)
+RUNTIME_SCOPE_NODES = (*FUNCTION_NODES, ast.Lambda, ast.ClassDef)
+DIRECT_EXECUTION_STATEMENTS = (
+    ast.Expr,
+    ast.Assign,
+    ast.AnnAssign,
+    ast.AugAssign,
+    ast.Return,
+    ast.Raise,
+)
 
 
 @dataclass(frozen=True)
 class ParsedSource:
     name: str
     tree: ast.Module
+
+
+def runtime_children(scope: ast.AST, node: ast.AST) -> tuple[ast.AST, ...]:
+    if isinstance(node, RUNTIME_SCOPE_NODES):
+        if node is not scope:
+            return ()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            return tuple(node.body)
+        assert isinstance(node, ast.Lambda)
+        return (node.body,)
+    return tuple(ast.iter_child_nodes(node))
+
+
+def runtime_nodes(scope: ast.AST) -> Iterator[ast.AST]:
+    stack = [scope]
+    while stack:
+        node = stack.pop()
+        yield node
+        stack.extend(reversed(runtime_children(scope, node)))
 
 
 def parsed_source(name: str) -> ParsedSource:
@@ -33,7 +62,7 @@ def find_function(
     is_async: bool | None = None,
     within: ast.AST | None = None,
 ) -> ast.FunctionDef | ast.AsyncFunctionDef:
-    nodes = source.tree.body if within is None else ast.walk(within)
+    nodes = source.tree.body if within is None else runtime_nodes(within)
     matches = [
         node
         for node in nodes
@@ -64,7 +93,7 @@ def expression_name(node: ast.AST) -> str:
 
 def ordered_nodes(scope: ast.AST, node_type: type[ast.AST]) -> list[ast.AST]:
     return sorted(
-        (node for node in ast.walk(scope) if isinstance(node, node_type)),
+        (node for node in runtime_nodes(scope) if isinstance(node, node_type)),
         key=lambda node: (getattr(node, "lineno", -1), getattr(node, "col_offset", -1)),
     )
 
@@ -144,7 +173,7 @@ def find_awaited_call(
 
 
 def contains(scope: ast.AST, target: ast.AST) -> bool:
-    return any(node is target for node in ast.walk(scope))
+    return any(node is target for node in runtime_nodes(scope))
 
 
 def block_contains(statements: list[ast.stmt], target: ast.AST) -> bool:
@@ -158,7 +187,7 @@ def find_try_containing(
 ) -> ast.Try:
     matches = [
         node
-        for node in ast.walk(function)
+        for node in runtime_nodes(function)
         if isinstance(node, ast.Try) and block_contains(node.body, target)
     ]
     if not matches:
@@ -168,16 +197,48 @@ def find_try_containing(
     return min(matches, key=lambda node: node.end_lineno - node.lineno)
 
 
+def unconditional_statement_index(
+    source: ParsedSource,
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+    statements: list[ast.stmt],
+    target: ast.AST,
+    *,
+    context: str,
+) -> int:
+    sequential: list[ast.stmt] = []
+
+    def append_sequential(block: list[ast.stmt]) -> None:
+        for statement in block:
+            sequential.append(statement)
+            if isinstance(statement, (ast.With, ast.AsyncWith)):
+                append_sequential(statement.body)
+            elif isinstance(statement, ast.Try):
+                append_sequential(statement.body)
+
+    append_sequential(statements)
+    for index, statement in enumerate(sequential):
+        if statement is target or (
+            isinstance(statement, DIRECT_EXECUTION_STATEMENTS)
+            and contains(statement, target)
+        ):
+            return index
+    raise AssertionError(
+        f"{source.name}:{function.name}: expected {context} on an unconditional "
+        "executable statement path"
+    )
+
+
 def direct_statement_index(
     source: ParsedSource,
     function: ast.FunctionDef | ast.AsyncFunctionDef,
     target: ast.AST,
 ) -> int:
-    for index, statement in enumerate(function.body):
-        if contains(statement, target):
-            return index
-    raise AssertionError(
-        f"{source.name}:{function.name}: expected lifecycle action in direct function body"
+    return unconditional_statement_index(
+        source,
+        function,
+        function.body,
+        target,
+        context="lifecycle action in the direct function body",
     )
 
 
@@ -199,7 +260,7 @@ def find_lock_block(
 
 
 def find_augassign(scope: ast.AST, name: str, operation: type[ast.operator]) -> ast.AugAssign | None:
-    for node in ast.walk(scope):
+    for node in runtime_nodes(scope):
         if (
             isinstance(node, ast.AugAssign)
             and isinstance(node.target, ast.Name)
@@ -213,7 +274,7 @@ def find_augassign(scope: ast.AST, name: str, operation: type[ast.operator]) -> 
 
 
 def find_last_used_update(scope: ast.AST) -> ast.Assign | None:
-    for node in ast.walk(scope):
+    for node in runtime_nodes(scope):
         if (
             isinstance(node, ast.Assign)
             and any(isinstance(target, ast.Name) and target.id == "last_used" for target in node.targets)
@@ -225,23 +286,46 @@ def find_last_used_update(scope: ast.AST) -> ast.Assign | None:
 
 
 def comparison_in(scope: ast.AST, name: str, operator: type[ast.cmpop]) -> bool:
-    for node in ast.walk(scope):
-        if not isinstance(node, ast.Compare) or len(node.ops) != 1:
-            continue
-        if (
-            isinstance(node.left, ast.Name)
-            and node.left.id == name
-            and isinstance(node.ops[0], operator)
-            and len(node.comparators) == 1
-            and isinstance(node.comparators[0], ast.Constant)
-            and node.comparators[0].value == 0
-        ):
-            return True
-    return False
+    if isinstance(scope, ast.BoolOp) and isinstance(scope.op, ast.And):
+        return any(comparison_in(value, name, operator) for value in scope.values)
+    return (
+        isinstance(scope, ast.Compare)
+        and isinstance(scope.left, ast.Name)
+        and scope.left.id == name
+        and len(scope.ops) == 1
+        and isinstance(scope.ops[0], operator)
+        and len(scope.comparators) == 1
+        and isinstance(scope.comparators[0], ast.Constant)
+        and scope.comparators[0].value == 0
+    )
 
 
 def parent_map(scope: ast.AST) -> dict[ast.AST, ast.AST]:
-    return {child: parent for parent in ast.walk(scope) for child in ast.iter_child_nodes(parent)}
+    return {
+        child: parent
+        for parent in runtime_nodes(scope)
+        for child in runtime_children(scope, parent)
+    }
+
+
+def guarding_if(
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+    action: ast.AST,
+    operator: type[ast.cmpop],
+) -> ast.If | None:
+    parents = parent_map(function)
+    current = action
+    while current in parents:
+        parent = parents[current]
+        if isinstance(parent, ast.If):
+            in_safe_body = any(statement is current for statement in parent.body)
+            if (
+                in_safe_body
+                and comparison_in(parent.test, "active_requests", operator)
+            ):
+                return parent
+        current = parent
+    return None
 
 
 def guarded_by_zero_check(
@@ -249,13 +333,25 @@ def guarded_by_zero_check(
     action: ast.AST,
     operator: type[ast.cmpop],
 ) -> bool:
-    parents = parent_map(function)
-    current = action
-    while current in parents:
-        current = parents[current]
-        if isinstance(current, ast.If) and comparison_in(current.test, "active_requests", operator):
-            return True
-    return False
+    return guarding_if(function, action, operator) is not None
+
+
+def lifecycle_invocations(
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+    target: str,
+) -> list[ast.Call]:
+    matches: list[ast.Call] = []
+    for node in ordered_nodes(function, ast.Call):
+        assert isinstance(node, ast.Call)
+        if expression_name(node.func) == target:
+            matches.append(node)
+        elif (
+            expression_name(node.func) == "asyncio.to_thread"
+            and node.args
+            and expression_name(node.args[0]) == target
+        ):
+            matches.append(node)
+    return matches
 
 
 def find_lifecycle_invocation(
@@ -263,19 +359,35 @@ def find_lifecycle_invocation(
     function: ast.FunctionDef | ast.AsyncFunctionDef,
     target: str,
 ) -> ast.Call:
-    for node in ordered_nodes(function, ast.Call):
-        assert isinstance(node, ast.Call)
-        if expression_name(node.func) == target:
-            return node
-        if (
-            expression_name(node.func) == "asyncio.to_thread"
-            and node.args
-            and expression_name(node.args[0]) == target
-        ):
-            return node
+    matches = lifecycle_invocations(function, target)
+    if matches:
+        return matches[0]
     raise AssertionError(
         f"{source.name}:{function.name}: expected invocation of lifecycle helper {target!r}"
     )
+
+
+def guard_precedes_unconditional_action(
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+    guard: ast.If,
+    action: ast.AST,
+) -> bool:
+    parents = parent_map(function)
+    block_owner = parents.get(guard)
+    body = getattr(block_owner, "body", None)
+    if not isinstance(body, list) or guard not in body:
+        return False
+
+    current = action
+    while current in parents and parents[current] is not block_owner:
+        current = parents[current]
+    if current not in body:
+        return False
+    if current is not action and not (
+        isinstance(current, DIRECT_EXECUTION_STATEMENTS) and contains(current, action)
+    ):
+        return False
+    return body.index(guard) < body.index(current)
 
 
 def uses_shared_factory(function: ast.FunctionDef | ast.AsyncFunctionDef, call: ast.Call, factory: str) -> bool:
@@ -283,7 +395,7 @@ def uses_shared_factory(function: ast.FunctionDef | ast.AsyncFunctionDef, call: 
     if isinstance(receiver, ast.Call) and expression_name(receiver.func) == factory:
         return True
     aliases: set[str] = set()
-    for node in ast.walk(function):
+    for node in runtime_nodes(function):
         if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
             if expression_name(node.value.func) == factory:
                 aliases.update(target.id for target in node.targets if isinstance(target, ast.Name))
@@ -294,7 +406,7 @@ def uses_shared_factory(function: ast.FunctionDef | ast.AsyncFunctionDef, call: 
 
 
 def returned_status(scope: ast.AST, status: str) -> ast.Return | None:
-    for node in ast.walk(scope):
+    for node in runtime_nodes(scope):
         if not isinstance(node, ast.Return) or not isinstance(node.value, ast.Dict):
             continue
         for key, value in zip(node.value.keys, node.value.values):
@@ -306,6 +418,95 @@ def returned_status(scope: ast.AST, status: str) -> ast.Return | None:
             ):
                 return node
     return None
+
+
+class ASTControlFlowRegressionTest(unittest.TestCase):
+    def _function(
+        self,
+        text: str,
+        name: str,
+    ) -> tuple[ParsedSource, ast.FunctionDef | ast.AsyncFunctionDef]:
+        source = ParsedSource("<synthetic>", ast.parse(text))
+        return source, find_function(source, name)
+
+    def test_zero_active_guard_rejects_action_in_else_branch(self):
+        source, function = self._function(
+            """
+def worker():
+    if active_requests == 0:
+        pass
+    else:
+        stop_backend()
+""",
+            "worker",
+        )
+        action = find_lifecycle_invocation(source, function, "stop_backend")
+
+        self.assertFalse(guarded_by_zero_check(function, action, ast.Eq))
+
+    def test_zero_active_guard_rejects_or_override(self):
+        source, function = self._function(
+            """
+def worker():
+    if active_requests == 0 or override:
+        stop_backend()
+""",
+            "worker",
+        )
+        action = find_lifecycle_invocation(source, function, "stop_backend")
+
+        self.assertFalse(guarded_by_zero_check(function, action, ast.Eq))
+
+    def test_runtime_lookup_ignores_action_in_uncalled_nested_function(self):
+        source, function = self._function(
+            """
+def worker():
+    def never_called():
+        stop_backend()
+    return None
+""",
+            "worker",
+        )
+
+        with self.assertRaisesRegex(AssertionError, "expected invocation"):
+            find_lifecycle_invocation(source, function, "stop_backend")
+
+    def test_conditionally_skipped_acquisition_is_not_direct(self):
+        source, function = self._function(
+            """
+async def proxy():
+    if enabled:
+        await asyncio.to_thread(acquire_backend)
+    try:
+        await _client().request()
+    finally:
+        pass
+""",
+            "proxy",
+        )
+        acquisition = find_thread_offload(source, function, "acquire_backend")
+
+        with self.assertRaisesRegex(AssertionError, "unconditional"):
+            direct_statement_index(source, function, acquisition)
+
+    def test_conditionally_skipped_step_assignment_is_not_direct(self):
+        source, function = self._function(
+            """
+def generate_audio():
+    if apply_steps:
+        fm.num_steps = req.num_steps
+    audios = generate()
+""",
+            "generate_audio",
+        )
+        assignment = next(
+            node
+            for node in ordered_nodes(function, ast.Assign)
+            if expression_name(node.targets[0]) == "fm.num_steps"
+        )
+
+        with self.assertRaisesRegex(AssertionError, "unconditional"):
+            direct_statement_index(source, function, assignment)
 
 
 class TTSLifecycleContractTest(unittest.TestCase):
@@ -321,9 +522,41 @@ class TTSLifecycleContractTest(unittest.TestCase):
             f"{self.SOURCE}:_run_with_model: expected active_requests += 1",
         )
         work = find_call(source, wrapper, "work")
-        find_lock_block(source, wrapper, "model_lock", preparation, increment)
-        self.assertLess(preparation.lineno, increment.lineno)
-        self.assertLess(increment.lineno, work.lineno)
+        work_try = find_try_containing(source, wrapper, work)
+        ownership_lock = find_lock_block(
+            source,
+            wrapper,
+            "model_lock",
+            preparation,
+            increment,
+        )
+        self.assertLess(
+            unconditional_statement_index(
+                source,
+                wrapper,
+                ownership_lock.body,
+                preparation,
+                context="model preparation under model_lock",
+            ),
+            unconditional_statement_index(
+                source,
+                wrapper,
+                ownership_lock.body,
+                increment,
+                context="active_requests increment under model_lock",
+            ),
+        )
+        self.assertLess(
+            direct_statement_index(source, wrapper, ownership_lock),
+            direct_statement_index(source, wrapper, work_try),
+        )
+        unconditional_statement_index(
+            source,
+            wrapper,
+            work_try.body,
+            work,
+            context="work invocation in the protected try body",
+        )
 
     def test_wrapper_passes_one_immutable_model_id_to_returned_work(self):
         source = parsed_source(self.SOURCE)
@@ -336,7 +569,7 @@ class TTSLifecycleContractTest(unittest.TestCase):
         )
         stores = [
             node
-            for node in ast.walk(wrapper)
+            for node in runtime_nodes(wrapper)
             if isinstance(node, ast.Name)
             and node.id == "used_model_id"
             and isinstance(node.ctx, ast.Store)
@@ -347,7 +580,10 @@ class TTSLifecycleContractTest(unittest.TestCase):
             f"{self.SOURCE}:_run_with_model: used_model_id must be assigned exactly once",
         )
         self.assertTrue(
-            any(isinstance(node, ast.Return) and contains(node, work) for node in ast.walk(wrapper)),
+            any(
+                isinstance(node, ast.Return) and contains(node, work)
+                for node in runtime_nodes(wrapper)
+            ),
             f"{self.SOURCE}:_run_with_model: expected return work(used_model_id)",
         )
 
@@ -366,9 +602,36 @@ class TTSLifecycleContractTest(unittest.TestCase):
             last_used,
             f"{self.SOURCE}:_run_with_model: expected last_used = time.time() in finally",
         )
-        self.assertTrue(block_contains(work_try.finalbody, decrement))
-        self.assertTrue(block_contains(work_try.finalbody, last_used))
-        find_lock_block(source, wrapper, "model_lock", decrement, last_used)
+        release_lock = find_lock_block(
+            source,
+            wrapper,
+            "model_lock",
+            decrement,
+            last_used,
+        )
+        unconditional_statement_index(
+            source,
+            wrapper,
+            work_try.finalbody,
+            release_lock,
+            context="model_lock release block in finally",
+        )
+        self.assertLess(
+            unconditional_statement_index(
+                source,
+                wrapper,
+                release_lock.body,
+                decrement,
+                context="active_requests decrement under model_lock",
+            ),
+            unconditional_statement_index(
+                source,
+                wrapper,
+                release_lock.body,
+                last_used,
+                context="last_used update under model_lock",
+            ),
+        )
 
     def test_explicit_model_load_is_offloaded(self):
         source = parsed_source(self.SOURCE)
@@ -397,13 +660,20 @@ class ASRLifecycleContractTest(unittest.TestCase):
                 increment,
                 f"{self.SOURCE}:acquire_backend: expected active_requests += 1",
             )
-            find_lock_block(source, acquire, "lock", increment)
+            acquire_lock = find_lock_block(source, acquire, "lock", increment)
+            unconditional_statement_index(
+                source,
+                acquire,
+                acquire_lock.body,
+                increment,
+                context="active_requests increment under lock",
+            )
         with self.subTest(helper="release_backend"):
             release = find_function(source, "release_backend", is_async=False)
             decrement = next(
                 (
                     node
-                    for node in ast.walk(release)
+                    for node in runtime_nodes(release)
                     if isinstance(node, ast.Assign)
                     and any(isinstance(target, ast.Name) and target.id == "active_requests" for target in node.targets)
                     and any(
@@ -411,7 +681,7 @@ class ASRLifecycleContractTest(unittest.TestCase):
                         and isinstance(child.left, ast.Name)
                         and child.left.id == "active_requests"
                         and isinstance(child.op, ast.Sub)
-                        for child in ast.walk(node.value)
+                        for child in runtime_nodes(node.value)
                     )
                 ),
                 None,
@@ -420,7 +690,14 @@ class ASRLifecycleContractTest(unittest.TestCase):
                 decrement,
                 f"{self.SOURCE}:release_backend: expected a bounded active_requests decrement",
             )
-            find_lock_block(source, release, "lock", decrement)
+            release_lock = find_lock_block(source, release, "lock", decrement)
+            unconditional_statement_index(
+                source,
+                release,
+                release_lock.body,
+                decrement,
+                context="bounded active_requests decrement under lock",
+            )
 
     def test_acquisition_is_offloaded_before_proxied_request(self):
         source = parsed_source(self.SOURCE)
@@ -447,9 +724,12 @@ class ASRLifecycleContractTest(unittest.TestCase):
             context="the proxied request finally block",
         )
         release = find_thread_offload(source, proxy, "release_backend", within=request_try)
-        self.assertTrue(
-            block_contains(request_try.finalbody, release),
-            f"{self.SOURCE}:proxy: release_backend must execute from finally",
+        unconditional_statement_index(
+            source,
+            proxy,
+            request_try.finalbody,
+            release,
+            context="release_backend offload in the proxied request finally block",
         )
 
     def test_idle_stop_requires_zero_active_requests(self):
@@ -457,9 +737,18 @@ class ASRLifecycleContractTest(unittest.TestCase):
         scheduler = find_function(source, "schedule_unload", is_async=False)
         check = find_function(source, "_check", is_async=False, within=scheduler)
         stop = find_lifecycle_invocation(source, check, "stop_backend")
-        self.assertTrue(
-            guarded_by_zero_check(check, stop, ast.Eq),
+        guard = guarding_if(check, stop, ast.Eq)
+        self.assertIsNotNone(
+            guard,
             f"{self.SOURCE}:schedule_unload._check: stop_backend must be guarded by active_requests == 0",
+        )
+        assert guard is not None
+        unconditional_statement_index(
+            source,
+            check,
+            guard.body,
+            stop,
+            context="stop_backend in the zero-active guard body",
         )
 
     def test_proxy_reuses_shared_http_client(self):
@@ -474,7 +763,7 @@ class ASRLifecycleContractTest(unittest.TestCase):
         self.assertFalse(
             any(
                 isinstance(node, ast.Call) and expression_name(node.func) == "httpx.AsyncClient"
-                for node in ast.walk(proxy)
+                for node in runtime_nodes(proxy)
             ),
             f"{self.SOURCE}:proxy: must not construct a per-request httpx.AsyncClient",
         )
@@ -493,13 +782,20 @@ class AceLifecycleContractTest(unittest.TestCase):
                 increment,
                 f"{self.SOURCE}:_acquire_backend: expected active_requests += 1",
             )
-            find_lock_block(source, acquire, "lock", increment)
+            acquire_lock = find_lock_block(source, acquire, "lock", increment)
+            unconditional_statement_index(
+                source,
+                acquire,
+                acquire_lock.body,
+                increment,
+                context="active_requests increment under lock",
+            )
         with self.subTest(helper="_release_backend"):
             release = find_function(source, "_release_backend", is_async=False)
             decrement = next(
                 (
                     node
-                    for node in ast.walk(release)
+                    for node in runtime_nodes(release)
                     if isinstance(node, ast.Assign)
                     and any(isinstance(target, ast.Name) and target.id == "active_requests" for target in node.targets)
                     and any(
@@ -507,7 +803,7 @@ class AceLifecycleContractTest(unittest.TestCase):
                         and isinstance(child.left, ast.Name)
                         and child.left.id == "active_requests"
                         and isinstance(child.op, ast.Sub)
-                        for child in ast.walk(node.value)
+                        for child in runtime_nodes(node.value)
                     )
                 ),
                 None,
@@ -516,7 +812,14 @@ class AceLifecycleContractTest(unittest.TestCase):
                 decrement,
                 f"{self.SOURCE}:_release_backend: expected a bounded active_requests decrement",
             )
-            find_lock_block(source, release, "lock", decrement)
+            release_lock = find_lock_block(source, release, "lock", decrement)
+            unconditional_statement_index(
+                source,
+                release,
+                release_lock.body,
+                decrement,
+                context="bounded active_requests decrement under lock",
+            )
 
     def test_each_proxy_endpoint_acquires_before_its_http_request(self):
         source = parsed_source(self.SOURCE)
@@ -546,9 +849,12 @@ class AceLifecycleContractTest(unittest.TestCase):
                     within=request_try,
                     context="the proxied request finally block",
                 )
-                self.assertTrue(
-                    block_contains(request_try.finalbody, release),
-                    f"{self.SOURCE}:{endpoint_name}: _release_backend must execute from finally",
+                unconditional_statement_index(
+                    source,
+                    endpoint,
+                    request_try.finalbody,
+                    release,
+                    context="_release_backend in the proxied request finally block",
                 )
 
     def test_idle_and_manual_unload_refuse_active_work(self):
@@ -556,9 +862,18 @@ class AceLifecycleContractTest(unittest.TestCase):
         with self.subTest(path="idle"):
             watcher = find_function(source, "idle_watcher", is_async=True)
             stop = find_lifecycle_invocation(source, watcher, "stop_backend")
-            self.assertTrue(
-                guarded_by_zero_check(watcher, stop, ast.Eq),
+            guard = guarding_if(watcher, stop, ast.Eq)
+            self.assertIsNotNone(
+                guard,
                 f"{self.SOURCE}:idle_watcher: stop_backend must be guarded by active_requests == 0",
+            )
+            assert guard is not None
+            unconditional_statement_index(
+                source,
+                watcher,
+                guard.body,
+                stop,
+                context="stop_backend in the zero-active guard body",
             )
         with self.subTest(path="manual"):
             helper = find_function(source, "_unload_if_idle", is_async=False)
@@ -567,11 +882,31 @@ class AceLifecycleContractTest(unittest.TestCase):
                 busy,
                 f"{self.SOURCE}:_unload_if_idle: expected busy response while active",
             )
-            self.assertTrue(
-                guarded_by_zero_check(helper, busy, ast.Gt),
+            assert busy is not None
+            busy_guard = guarding_if(helper, busy, ast.Gt)
+            self.assertIsNotNone(
+                busy_guard,
                 f"{self.SOURCE}:_unload_if_idle: busy response must be guarded by active_requests > 0",
             )
-            find_lifecycle_invocation(source, helper, "stop_backend")
+            assert busy_guard is not None
+            unconditional_statement_index(
+                source,
+                helper,
+                busy_guard.body,
+                busy,
+                context="busy early return in the active-work guard",
+            )
+            stops = lifecycle_invocations(helper, "stop_backend")
+            self.assertTrue(
+                stops,
+                f"{self.SOURCE}:_unload_if_idle: expected invocation of stop_backend",
+            )
+            for stop in stops:
+                self.assertTrue(
+                    guard_precedes_unconditional_action(helper, busy_guard, stop),
+                    f"{self.SOURCE}:_unload_if_idle: stop_backend must be reachable "
+                    "only after the active-work busy return",
+                )
             endpoint = find_function(source, "unload", is_async=True)
             find_thread_offload(source, endpoint, "_unload_if_idle")
 
@@ -590,7 +925,7 @@ class AceLifecycleContractTest(unittest.TestCase):
                     any(
                         isinstance(node, ast.Call)
                         and expression_name(node.func) == "aiohttp.ClientSession"
-                        for node in ast.walk(endpoint)
+                        for node in runtime_nodes(endpoint)
                     ),
                     f"{self.SOURCE}:{endpoint_name}: must not create a per-request ClientSession",
                 )
@@ -604,11 +939,19 @@ class MMAudioLifecycleContractTest(unittest.TestCase):
         function = find_function(source, "_generate_sfx_blocking", is_async=False)
         generate_call = find_call(source, function, "generate")
         lock_block = find_lock_block(source, function, "lock", generate_call)
+        direct_statement_index(source, function, lock_block)
+        unconditional_statement_index(
+            source,
+            function,
+            lock_block.body,
+            generate_call,
+            context="generate() call under the generation lock",
+        )
         assigned_to_audios = any(
             isinstance(node, ast.Assign)
             and any(isinstance(target, ast.Name) and target.id == "audios" for target in node.targets)
             and contains(node.value, generate_call)
-            for node in ast.walk(lock_block)
+            for node in runtime_nodes(lock_block)
         )
         self.assertTrue(
             assigned_to_audios,
@@ -621,7 +964,7 @@ class MMAudioLifecycleContractTest(unittest.TestCase):
         assignment = next(
             (
                 node
-                for node in ast.walk(lock_block)
+                for node in runtime_nodes(lock_block)
                 if isinstance(node, ast.Assign)
                 and len(node.targets) == 1
                 and expression_name(node.targets[0]) == "fm.num_steps"
@@ -634,9 +977,22 @@ class MMAudioLifecycleContractTest(unittest.TestCase):
             f"{source.name}:{function.name}: expected exact fm.num_steps = req.num_steps under lock",
         )
         self.assertLess(
-            assignment.lineno,
-            generate_call.lineno,
-            f"{source.name}:{function.name}: num_steps assignment must precede generate()",
+            unconditional_statement_index(
+                source,
+                function,
+                lock_block.body,
+                assignment,
+                context="fm.num_steps assignment under the generation lock",
+            ),
+            unconditional_statement_index(
+                source,
+                function,
+                lock_block.body,
+                generate_call,
+                context="generate() call under the generation lock",
+            ),
+            f"{source.name}:{function.name}: num_steps assignment must unconditionally "
+            "precede generate()",
         )
 
     def test_cuda_audio_copy_completes_inside_generation_lock(self):
@@ -644,7 +1000,7 @@ class MMAudioLifecycleContractTest(unittest.TestCase):
         copy_call = next(
             (
                 node
-                for node in ast.walk(lock_block)
+                for node in runtime_nodes(lock_block)
                 if isinstance(node, ast.Call)
                 and expression_name(node.func) == "audios.float().detach().cpu"
             ),
@@ -655,7 +1011,20 @@ class MMAudioLifecycleContractTest(unittest.TestCase):
             f"{source.name}:{function.name}: expected audios.float().detach().cpu() inside with lock",
         )
         self.assertGreater(
-            copy_call.lineno,
-            generate_call.lineno,
-            f"{source.name}:{function.name}: CUDA output must be copied after generate() and before unlocking",
+            unconditional_statement_index(
+                source,
+                function,
+                lock_block.body,
+                copy_call,
+                context="CUDA-to-CPU copy under the generation lock",
+            ),
+            unconditional_statement_index(
+                source,
+                function,
+                lock_block.body,
+                generate_call,
+                context="generate() call under the generation lock",
+            ),
+            f"{source.name}:{function.name}: CUDA output must be copied "
+            "unconditionally after generate() and before unlocking",
         )
