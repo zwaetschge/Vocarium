@@ -205,6 +205,7 @@ services:
       PODCAST_UPLOAD_PATH: /app/data/podcast_uploads
       PODCAST_VALIDATE_SOURCE_DNS: ${PODCAST_VALIDATE_SOURCE_DNS:-true}
       ALLOW_ANONYMOUS: ${ALLOW_ANONYMOUS:-true}
+      VOCARIUM_ADMIN_USERS: ${VOCARIUM_ADMIN_USERS:-api}
       CORS_ORIGINS: ${CORS_ORIGINS:-*}
       VOCARIUM_INSTANCE_ID: vocarium-api
       PYTHONDONTWRITEBYTECODE: "1"
@@ -213,6 +214,7 @@ services:
       - "127.0.0.1:${VOCARIUM_API_PORT:-8280}:8280"
     volumes:
       - ./vocarium-api/main.py:/app/main.py:ro
+      - ./vocarium-api/access_control.py:/app/access_control.py:ro
       - ./vocarium-api/database.py:/app/database.py:ro
       - ./vocarium-api/gpu_queue.py:/app/gpu_queue.py:ro
       - ./vocarium-api/metrics.py:/app/metrics.py:ro
@@ -272,6 +274,7 @@ services:
       PODCAST_UPLOAD_PATH: /app/data/podcast_uploads
       PODCAST_VALIDATE_SOURCE_DNS: ${PODCAST_VALIDATE_SOURCE_DNS:-true}
       ALLOW_ANONYMOUS: ${ALLOW_ANONYMOUS:-true}
+      VOCARIUM_ADMIN_USERS: ${VOCARIUM_ADMIN_USERS:-api}
       CORS_ORIGINS: ${CORS_ORIGINS:-*}
       VOCARIUM_INSTANCE_ID: vocarium-api-2
       PYTHONDONTWRITEBYTECODE: "1"
@@ -280,6 +283,7 @@ services:
       - "127.0.0.1:${VOCARIUM_API_PORT_2:-8281}:8280"
     volumes:
       - ./vocarium-api/main.py:/app/main.py:ro
+      - ./vocarium-api/access_control.py:/app/access_control.py:ro
       - ./vocarium-api/database.py:/app/database.py:ro
       - ./vocarium-api/gpu_queue.py:/app/gpu_queue.py:ro
       - ./vocarium-api/metrics.py:/app/metrics.py:ro

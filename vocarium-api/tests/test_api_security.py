@@ -278,3 +278,92 @@ class PublicHealthTest(unittest.TestCase):
                 for node in ast.walk(health_function)
             )
         )
+
+
+class AdminAllowlistTest(unittest.TestCase):
+    def test_admin_names_are_exact_casefolded_matches(self):
+        from access_control import is_admin_username
+
+        self.assertTrue(is_admin_username("API", "api, ops@example.test"))
+        self.assertTrue(
+            is_admin_username("ops@example.test", "api, ops@example.test")
+        )
+        self.assertFalse(is_admin_username("tenant", "api, ops@example.test"))
+        self.assertFalse(is_admin_username("", "api"))
+        self.assertFalse(is_admin_username("api", ""))
+
+
+class AdminAuthorizationBoundaryTest(unittest.TestCase):
+    @staticmethod
+    def _load_admin_guard(current_user: dict, configured: str):
+        from access_control import is_admin_username
+
+        source = (API_ROOT / "main.py").read_text()
+        module = ast.parse(source)
+        guard_functions = [
+            node
+            for node in module.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_require_admin"
+        ]
+        if len(guard_functions) != 1:
+            raise AssertionError("main.py must define exactly one _require_admin guard")
+
+        class StubHTTPException(Exception):
+            def __init__(self, status_code: int, detail: str):
+                super().__init__(detail)
+                self.status_code = status_code
+                self.detail = detail
+
+        namespace = {
+            "Request": object,
+            "HTTPException": StubHTTPException,
+            "VOCARIUM_ADMIN_USERS": configured,
+            "get_current_user": lambda _request: current_user,
+            "is_admin_username": is_admin_username,
+        }
+        guard_module = ast.Module(body=guard_functions, type_ignores=[])
+        exec(compile(guard_module, str(API_ROOT / "main.py"), "exec"), namespace)
+        return namespace["_require_admin"], StubHTTPException
+
+    def test_non_admin_is_rejected_with_forbidden(self):
+        require_admin, http_exception = self._load_admin_guard(
+            {"username": "tenant"}, "api"
+        )
+
+        with self.assertRaises(http_exception) as raised:
+            require_admin(object())
+
+        self.assertEqual(raised.exception.status_code, 403)
+        self.assertEqual(raised.exception.detail, "Administrator access required")
+
+    def test_global_process_routes_require_admin(self):
+        source = (API_ROOT / "main.py").read_text()
+        module = ast.parse(source)
+
+        for route_name in ("switch_model", "admin_artifact_cleanup"):
+            with self.subTest(route_name=route_name):
+                route_functions = [
+                    node
+                    for node in module.body
+                    if isinstance(node, ast.AsyncFunctionDef)
+                    and node.name == route_name
+                ]
+                self.assertEqual(len(route_functions), 1)
+                calls = [
+                    node
+                    for node in ast.walk(route_functions[0])
+                    if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                ]
+                self.assertTrue(
+                    any(
+                        call.func.id == "_require_admin"
+                        and len(call.args) == 1
+                        and isinstance(call.args[0], ast.Name)
+                        and call.args[0].id == "request"
+                        for call in calls
+                    )
+                )
+                self.assertFalse(
+                    any(call.func.id == "get_current_user" for call in calls)
+                )

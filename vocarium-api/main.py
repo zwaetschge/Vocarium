@@ -27,6 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from access_control import is_admin_username
 from artifact_cleanup import cleanup_artifacts
 from database import (
     gpu_queue_quota_decision,
@@ -99,6 +100,7 @@ OPENAI_TTS_DEFAULT_VOICE_PERSONA_ALIASES = {
 # `true` allows local single-user setups to fall back to a shared "api" user
 # when no Remote-User header is present. Disable for multi-user deployments.
 ALLOW_ANONYMOUS = os.environ.get("ALLOW_ANONYMOUS", "true").lower() in ("1", "true", "yes")
+VOCARIUM_ADMIN_USERS = os.environ.get("VOCARIUM_ADMIN_USERS", "")
 
 # Comma-separated list, or "*" for all (only safe in dev). Set per-deployment.
 _cors = os.environ.get("CORS_ORIGINS", "*").strip()
@@ -240,6 +242,13 @@ def get_current_user(request: Request, allow_anonymous: bool = True) -> dict:
     user = get_or_create_user(username)
     user_id_var.set(user["id"])
     request.state.user = user
+    return user
+
+
+def _require_admin(request: Request) -> dict:
+    user = get_current_user(request)
+    if not is_admin_username(user["username"], VOCARIUM_ADMIN_USERS):
+        raise HTTPException(403, "Administrator access required")
     return user
 
 
@@ -642,7 +651,7 @@ async def admin_artifact_cleanup(
 
     ``dry_run=true`` reports candidates without deleting them.
     """
-    get_current_user(request)
+    _require_admin(request)
     return await asyncio.to_thread(
         cleanup_artifacts,
         get_db(),
@@ -765,7 +774,7 @@ class SwitchModelRequest(BaseModel):
 
 @app.post("/api/models/switch")
 async def switch_model(req: SwitchModelRequest, request: Request):
-    get_current_user(request)
+    _require_admin(request)
 
     async def work():
         return await tts_json("POST", "/v1/models/load", json={"model_id": req.model_id})
