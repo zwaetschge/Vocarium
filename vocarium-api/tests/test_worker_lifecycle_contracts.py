@@ -286,7 +286,11 @@ def find_last_used_update(scope: ast.AST) -> ast.Assign | None:
 
 
 def comparison_in(scope: ast.AST, name: str, operator: type[ast.cmpop]) -> bool:
-    if isinstance(scope, ast.BoolOp) and isinstance(scope.op, ast.And):
+    if (
+        operator is ast.Eq
+        and isinstance(scope, ast.BoolOp)
+        and isinstance(scope.op, ast.And)
+    ):
         return any(comparison_in(value, name, operator) for value in scope.values)
     return (
         isinstance(scope, ast.Compare)
@@ -456,6 +460,21 @@ def worker():
         action = find_lifecycle_invocation(source, function, "stop_backend")
 
         self.assertFalse(guarded_by_zero_check(function, action, ast.Eq))
+
+    def test_positive_active_guard_rejects_required_override(self):
+        source, function = self._function(
+            """
+def unload():
+    if active_requests > 0 and override:
+        return {"status": "busy"}
+    stop_backend()
+""",
+            "unload",
+        )
+        busy = returned_status(function, "busy")
+        assert busy is not None
+
+        self.assertFalse(guarded_by_zero_check(function, busy, ast.Gt))
 
     def test_runtime_lookup_ignores_action_in_uncalled_nested_function(self):
         source, function = self._function(
