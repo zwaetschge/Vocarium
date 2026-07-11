@@ -731,7 +731,86 @@ class PodcastProductionHardeningTest(unittest.TestCase):
         self.assertIn("TTS_REF_NORMALIZE_PEAK", source)
         self.assertIn("Unknown voice", source)
         self.assertNotIn("voice_id = available[0]", source)
-        self.assertLess(source.index("voice_id = request.voice"), source.index("ensure_model(target_model)"))
+        tree = ast.parse(source)
+        endpoint = next(
+            (
+                node
+                for node in tree.body
+                if isinstance(node, ast.AsyncFunctionDef)
+                and node.name == "create_speech"
+            ),
+            None,
+        )
+        self.assertIsNotNone(endpoint)
+        assert endpoint is not None
+        voice_selection = next(
+            (
+                node
+                for node in endpoint.body
+                if isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Name) and target.id == "voice_id"
+                    for target in node.targets
+                )
+                and isinstance(node.value, ast.Attribute)
+                and isinstance(node.value.value, ast.Name)
+                and node.value.value.id == "request"
+                and node.value.attr == "voice"
+            ),
+            None,
+        )
+        self.assertIsNotNone(voice_selection)
+        voice_validation = next(
+            (
+                node
+                for node in endpoint.body
+                if isinstance(node, ast.If)
+                and isinstance(node.test, ast.Compare)
+                and isinstance(node.test.left, ast.Name)
+                and node.test.left.id == "voice_id"
+                and len(node.test.ops) == 1
+                and isinstance(node.test.ops[0], ast.NotIn)
+                and len(node.test.comparators) == 1
+                and isinstance(node.test.comparators[0], ast.Name)
+                and node.test.comparators[0].id == "voice_refs"
+            ),
+            None,
+        )
+        self.assertIsNotNone(voice_validation)
+        assert voice_validation is not None
+        self.assertTrue(any(isinstance(node, ast.Raise) for node in ast.walk(voice_validation)))
+
+        def runtime_nodes(scope: ast.AST):
+            stack = [scope]
+            while stack:
+                node = stack.pop()
+                yield node
+                if node is not scope and isinstance(
+                    node,
+                    (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef),
+                ):
+                    continue
+                stack.extend(reversed(list(ast.iter_child_nodes(node))))
+
+        model_offloads = [
+            node
+            for node in runtime_nodes(endpoint)
+            if isinstance(node, ast.Await)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Attribute)
+            and isinstance(node.value.func.value, ast.Name)
+            and node.value.func.value.id == "asyncio"
+            and node.value.func.attr == "to_thread"
+            and len(node.value.args) >= 2
+            and isinstance(node.value.args[0], ast.Name)
+            and node.value.args[0].id == "_run_with_model"
+            and isinstance(node.value.args[1], ast.Name)
+            and node.value.args[1].id == "target_model"
+        ]
+        self.assertEqual(len(model_offloads), 1)
+        assert voice_selection is not None
+        self.assertLess(voice_selection.lineno, voice_validation.lineno)
+        self.assertLess(voice_validation.lineno, model_offloads[0].lineno)
         self.assertIn("inference_lock = threading.RLock()", source)
         self.assertIn("with inference_lock:\n                for i, chunk in enumerate(chunks):", source)
         self.assertIn("def _run_stream_request", source)

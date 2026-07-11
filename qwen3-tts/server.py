@@ -20,8 +20,9 @@ import shutil
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TypeVar
 
 import numpy as np
 import soundfile as sf
@@ -40,6 +41,8 @@ MODELS_DIR = Path(os.environ.get("MODELS_DIR", "/app/models"))
 os.environ["HF_HOME"] = str(MODELS_DIR / "huggingface")
 
 from faster_qwen3_tts import FasterQwen3TTS
+
+T = TypeVar("T")
 
 VOICES_DIR = Path(os.environ.get("VOICES_DIR", "/app/voices"))
 VOICES_DIR.mkdir(parents=True, exist_ok=True)
@@ -468,26 +471,43 @@ def _schedule_unload():
     idle_timer.start()
 
 
-def ensure_model(model_id: str | None = None):
+def _ensure_model_locked(target: str) -> str:
     global last_used
-    target = model_id or current_model_id or DEFAULT_MODEL
     if target not in AVAILABLE_MODELS:
         raise ValueError(f"Unknown model: {target}")
+    if model is not None and current_model_id != target and active_requests > 0:
+        raise RuntimeError(
+            f"Model {current_model_id} is busy; cannot switch to {target}"
+        )
+    if model is None or current_model_id != target:
+        if model is not None:
+            _do_unload_model()
+        _do_load_model(target)
+    last_used = time.time()
+    assert current_model_id is not None
+    return current_model_id
+
+
+def ensure_model(model_id: str | None = None) -> str:
+    target = model_id or current_model_id or DEFAULT_MODEL
     with model_lock:
-        if (
-            model is not None
-            and current_model_id != target
-            and active_requests > 0
-        ):
-            raise RuntimeError(
-                f"Model {current_model_id} is busy; cannot switch to {target}"
-            )
-        if model is None or current_model_id != target:
-            if model is not None:
-                _do_unload_model()
-            _do_load_model(target)
-        last_used = time.time()
+        used_model_id = _ensure_model_locked(target)
     _schedule_unload()
+    return used_model_id
+
+
+def _run_with_model(model_id: str, work: Callable[[str], T]) -> T:
+    global active_requests, last_used
+    with model_lock:
+        used_model_id = _ensure_model_locked(model_id)
+        active_requests += 1
+    try:
+        return work(used_model_id)
+    finally:
+        with model_lock:
+            active_requests -= 1
+            last_used = time.time()
+        _schedule_unload()
 
 
 # ---------------------------------------------------------------------------
@@ -639,9 +659,7 @@ async def health():
 
 # ---- Model Management -----------------------------------------------------
 
-@app.post("/unload")
-async def unload():
-    """Unload current model to free GPU memory for other services."""
+def _unload_if_idle() -> dict:
     with model_lock:
         if active_requests > 0:
             return {
@@ -651,9 +669,15 @@ async def unload():
                 "active_requests": active_requests,
             }
         was_loaded = model is not None
-        mid = current_model_id
+        model_id = current_model_id
         _do_unload_model()
-    return {"status": "unloaded", "was_loaded": was_loaded, "model_id": mid}
+    return {"status": "unloaded", "was_loaded": was_loaded, "model_id": model_id}
+
+
+@app.post("/unload")
+async def unload():
+    """Unload current model to free GPU memory for other services."""
+    return await asyncio.to_thread(_unload_if_idle)
 
 
 @app.get("/v1/models")
@@ -688,21 +712,10 @@ async def load_model_endpoint(request: ModelLoadRequest):
     if request.model_id not in AVAILABLE_MODELS:
         raise HTTPException(400, f"Unknown model. Available: {list(AVAILABLE_MODELS.keys())}")
     t0 = time.time()
-    with model_lock:
-        if (
-            model is not None
-            and current_model_id != request.model_id
-            and active_requests > 0
-        ):
-            raise HTTPException(
-                409,
-                f"Model {current_model_id} is busy; cannot switch to {request.model_id}",
-            )
-        if model is not None and current_model_id != request.model_id:
-            _do_unload_model()
-        if model is None:
-            _do_load_model(request.model_id)
-    _schedule_unload()
+    try:
+        await asyncio.to_thread(ensure_model, request.model_id)
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
     return {
         "status": "loaded",
         "model_id": request.model_id,
@@ -1008,8 +1021,6 @@ async def create_speech(request: SpeechRequest):
             f"Unknown voice {voice_id!r}. Available voices: {available}",
         )
 
-    ensure_model(target_model)
-
     # Resolve language
     language = "English"
     if request.language:
@@ -1026,15 +1037,8 @@ async def create_speech(request: SpeechRequest):
     n_chunks = len(chunks)
     vref = voice_refs[voice_id]
 
-    global active_requests, last_used
-    with model_lock:
-        if model is None:
-            raise HTTPException(503, "Model not ready")
-        active_requests += 1
     try:
-        loop = asyncio.get_event_loop()
-
-        def _run_generate():
+        def _run_generate(used_model_id: str):
             t0 = time.time()
             audio_parts = []
             sr = 24000
@@ -1066,18 +1070,18 @@ async def create_speech(request: SpeechRequest):
             rtf = gen_time / audio_dur if audio_dur > 0 else 0
             cg = "CG" if use_cuda_graphs else "fallback"
             print(f"[{voice_id}/{language}] {audio_dur:.1f}s in {gen_time:.1f}s "
-                  f"(RTF {rtf:.2f}x) chunks={n_chunks} model={current_model_id} [{cg}]", flush=True)
-            return audio, sr, audio_dur, gen_time, n_chunks, rtf
+                  f"(RTF {rtf:.2f}x) chunks={n_chunks} model={used_model_id} [{cg}]", flush=True)
+            return audio, sr, audio_dur, gen_time, n_chunks, rtf, used_model_id
 
-        audio, sr, audio_dur, gen_time, n_chunks, rtf = await loop.run_in_executor(None, _run_generate)
+        result = await asyncio.to_thread(
+            _run_with_model,
+            target_model,
+            _run_generate,
+        )
+        audio, sr, audio_dur, gen_time, n_chunks, rtf, used_model_id = result
 
     except Exception as e:
         raise HTTPException(500, f"Generation failed: {e}")
-    finally:
-        with model_lock:
-            active_requests -= 1
-            last_used = time.time()
-        _schedule_unload()
 
     audio_bytes, content_type = await asyncio.to_thread(
         audio_to_format, audio, sr, response_format
@@ -1088,7 +1092,7 @@ async def create_speech(request: SpeechRequest):
             "X-Audio-Duration": str(round(audio_dur, 2)),
             "X-Generation-Time": str(round(gen_time, 2)),
             "X-RTF": str(round(rtf, 4)),
-            "X-Model": current_model_id or "",
+            "X-Model": used_model_id,
             "X-Voice": voice_id,
             "X-Chunks": str(n_chunks),
         },
@@ -1121,8 +1125,6 @@ async def create_speech_stream(request: SpeechRequest):
             f"Unknown voice {voice_id!r}. Available voices: {available}",
         )
 
-    ensure_model(target_model)
-
     language = "English"
     if request.language:
         for lang in SUPPORTED_LANGUAGES:
@@ -1138,12 +1140,6 @@ async def create_speech_stream(request: SpeechRequest):
     n_chunks = len(chunks)
     vref = voice_refs[voice_id]
 
-    global active_requests, last_used
-    with model_lock:
-        if model is None:
-            raise HTTPException(503, "Model not ready")
-        active_requests += 1
-
     def _gen_chunk(i: int, chunk: str, token_limit: int):
         """Run one chunk generation in an executor thread."""
         with model_lock:
@@ -1157,85 +1153,91 @@ async def create_speech_stream(request: SpeechRequest):
         )
 
     async def generate_sse():
-        global active_requests, last_used
         t0 = time.time()
         loop = asyncio.get_running_loop()
         event_queue: asyncio.Queue[str | None] = asyncio.Queue()
 
-        def _run_stream_request():
+        def _stream_work(used_model_id: str) -> None:
             total_audio_dur = 0.0
             sr = 24000
+            # Keep one streaming request's clone chunks contiguous for the same
+            # reason as non-streaming generation: the model-side speaker state
+            # is not safe to interleave between cloned voices.
+            with inference_lock:
+                for i, chunk in enumerate(chunks):
+                    chunk_len = len(chunk)
+                    token_limit = _clone_token_limit(
+                        chunk,
+                        request.max_new_tokens,
+                    )
+                    print(
+                        f"[stream chunk {i + 1}/{n_chunks}] "
+                        f"{chunk_len} chars → {token_limit} tokens",
+                        flush=True,
+                    )
+
+                    wavs, sr = _gen_chunk(i, chunk, token_limit)
+                    audio = wavs[0]
+                    audio_dur = len(audio) / sr
+                    total_audio_dur += audio_dur
+
+                    # Encode chunk as WAV bytes → base64
+                    buf = io.BytesIO()
+                    sf.write(buf, audio, sr, format="WAV", subtype="PCM_16")
+                    b64 = base64.b64encode(buf.getvalue()).decode()
+
+                    event_data = {
+                        "index": i,
+                        "total": n_chunks,
+                        "audio": b64,
+                        "duration": round(audio_dur, 2),
+                        "text": chunk[:80],
+                    }
+                    loop.call_soon_threadsafe(
+                        event_queue.put_nowait,
+                        f"event: chunk\ndata: {json.dumps(event_data)}\n\n",
+                    )
+
+            gen_time = time.time() - t0
+            rtf = gen_time / total_audio_dur if total_audio_dur > 0 else 0
+            cg = "CG" if use_cuda_graphs else "fallback"
+            print(
+                f"[stream/{voice_id}] {total_audio_dur:.1f}s in "
+                f"{gen_time:.1f}s (RTF {rtf:.2f}x) chunks={n_chunks} [{cg}]",
+                flush=True,
+            )
+
+            done_data = {
+                "total_duration": round(total_audio_dur, 2),
+                "generation_time": round(gen_time, 2),
+                "rtf": round(rtf, 4),
+                "model": used_model_id,
+                "voice": voice_id,
+                "chunks": n_chunks,
+            }
+            loop.call_soon_threadsafe(
+                event_queue.put_nowait,
+                f"event: done\ndata: {json.dumps(done_data)}\n\n",
+            )
+
+        def _run_stream_request() -> None:
             try:
-                # Keep one streaming request's clone chunks contiguous for the same
-                # reason as non-streaming generation: the model-side speaker state
-                # is not safe to interleave between cloned voices.
-                with inference_lock:
-                    for i, chunk in enumerate(chunks):
-                        chunk_len = len(chunk)
-                        token_limit = _clone_token_limit(chunk, request.max_new_tokens)
-                        print(f"[stream chunk {i+1}/{n_chunks}] {chunk_len} chars → {token_limit} tokens", flush=True)
-
-                        wavs, sr = _gen_chunk(i, chunk, token_limit)
-                        audio = wavs[0]
-                        audio_dur = len(audio) / sr
-                        total_audio_dur += audio_dur
-
-                        # Encode chunk as WAV bytes → base64
-                        buf = io.BytesIO()
-                        sf.write(buf, audio, sr, format="WAV", subtype="PCM_16")
-                        b64 = base64.b64encode(buf.getvalue()).decode()
-
-                        event_data = {
-                            "index": i,
-                            "total": n_chunks,
-                            "audio": b64,
-                            "duration": round(audio_dur, 2),
-                            "text": chunk[:80],
-                        }
-                        loop.call_soon_threadsafe(
-                            event_queue.put_nowait,
-                            f"event: chunk\ndata: {json.dumps(event_data)}\n\n",
-                        )
-
-                gen_time = time.time() - t0
-                rtf = gen_time / total_audio_dur if total_audio_dur > 0 else 0
-                cg = "CG" if use_cuda_graphs else "fallback"
-                print(f"[stream/{voice_id}] {total_audio_dur:.1f}s in {gen_time:.1f}s "
-                      f"(RTF {rtf:.2f}x) chunks={n_chunks} [{cg}]", flush=True)
-
-                done_data = {
-                    "total_duration": round(total_audio_dur, 2),
-                    "generation_time": round(gen_time, 2),
-                    "rtf": round(rtf, 4),
-                    "model": current_model_id or "",
-                    "voice": voice_id,
-                    "chunks": n_chunks,
-                }
+                _run_with_model(target_model, _stream_work)
+            except Exception as exc:
                 loop.call_soon_threadsafe(
                     event_queue.put_nowait,
-                    f"event: done\ndata: {json.dumps(done_data)}\n\n",
-                )
-            except Exception as e:
-                loop.call_soon_threadsafe(
-                    event_queue.put_nowait,
-                    f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n",
+                    f"event: error\ndata: {json.dumps({'error': str(exc)})}\n\n",
                 )
             finally:
                 loop.call_soon_threadsafe(event_queue.put_nowait, None)
 
-        try:
-            task = loop.run_in_executor(None, _run_stream_request)
-            while True:
-                event = await event_queue.get()
-                if event is None:
-                    break
-                yield event
-            await task
-        finally:
-            with model_lock:
-                active_requests -= 1
-                last_used = time.time()
-            _schedule_unload()
+        task = loop.run_in_executor(None, _run_stream_request)
+        while True:
+            event = await event_queue.get()
+            if event is None:
+                break
+            yield event
+        await task
 
     return StreamingResponse(generate_sse(), media_type="text/event-stream")
 
@@ -1266,21 +1268,13 @@ async def design_voice(request: DesignRequest):
         raise HTTPException(400, "Voice description is empty")
     response_format = _validate_response_format(request.response_format)
 
-    ensure_model("1.7b-design")
-
-    global active_requests, last_used
-    with model_lock:
-        if model is None:
-            raise HTTPException(503, "Model not ready")
-        active_requests += 1
     try:
-        t0 = time.time()
         token_limit = _tts_token_limit(request.text, request.max_new_tokens)
-        loop = asyncio.get_event_loop()
 
-        def _gen():
+        def _run_generate(used_model_id: str):
+            t0 = time.time()
             with inference_lock:
-                return model.model.generate_voice_design(
+                wavs, sr = model.model.generate_voice_design(
                     text=request.text,
                     language=request.language,
                     instruct=request.description,
@@ -1288,22 +1282,24 @@ async def design_voice(request: DesignRequest):
                     eos_token_id=[2150, 2157],
                     repetition_penalty=1.05,
                 )
+            gen_time = time.time() - t0
+            audio = wavs[0]
+            audio_dur = len(audio) / sr
+            print(
+                f"[design/{request.language}] {audio_dur:.1f}s in "
+                f"{gen_time:.1f}s",
+                flush=True,
+            )
+            return audio, sr, audio_dur, gen_time, used_model_id
 
-        wavs, sr = await loop.run_in_executor(None, _gen)
-        gen_time = time.time() - t0
-        audio = wavs[0]
-        audio_dur = len(audio) / sr
-        print(f"[design/{request.language}] {audio_dur:.1f}s in {gen_time:.1f}s", flush=True)
+        result = await asyncio.to_thread(
+            _run_with_model,
+            "1.7b-design",
+            _run_generate,
+        )
+        audio, sr, audio_dur, gen_time, used_model_id = result
     except Exception as e:
         raise HTTPException(500, f"Voice design failed: {e}")
-    finally:
-        try:
-            with model_lock:
-                active_requests -= 1
-                last_used = time.time()
-            _schedule_unload()
-        except Exception:
-            pass
 
     audio_bytes, content_type = await asyncio.to_thread(
         audio_to_format, audio, sr, response_format
@@ -1313,6 +1309,7 @@ async def design_voice(request: DesignRequest):
         headers={
             "X-Audio-Duration": str(round(audio_dur, 2)),
             "X-Generation-Time": str(round(gen_time, 2)),
+            "X-Model": used_model_id,
         },
     )
 
@@ -1342,15 +1339,7 @@ async def custom_voice(request: CustomVoiceRequest):
         )
     response_format = _validate_response_format(request.response_format)
 
-    ensure_model("1.7b-custom")
-
-    global active_requests, last_used
-    with model_lock:
-        if model is None:
-            raise HTTPException(503, "Model not ready")
-        active_requests += 1
     try:
-        t0 = time.time()
         token_limit = _tts_token_limit(request.text, request.max_new_tokens)
         kwargs = dict(
             text=request.text,
@@ -1369,27 +1358,29 @@ async def custom_voice(request: CustomVoiceRequest):
             kwargs["instruct"] = request.instruct.strip()
 
         # Run blocking inference in executor to avoid blocking the event loop
-        loop = asyncio.get_event_loop()
-        def _gen():
+        def _run_generate(used_model_id: str):
+            t0 = time.time()
             with inference_lock:
-                return model.model.generate_custom_voice(**kwargs)
-        wavs, sr = await loop.run_in_executor(None, _gen)
-        gen_time = time.time() - t0
-        audio = wavs[0]
-        audio_dur = len(audio) / sr
-        print(
-            f"[custom/{request.speaker}/{request.language}] "
-            f"{audio_dur:.1f}s in {gen_time:.1f}s "
-            f"instruct={'yes' if kwargs.get('instruct') else 'no'}",
-            flush=True,
+                wavs, sr = model.model.generate_custom_voice(**kwargs)
+            gen_time = time.time() - t0
+            audio = wavs[0]
+            audio_dur = len(audio) / sr
+            print(
+                f"[custom/{request.speaker}/{request.language}] "
+                f"{audio_dur:.1f}s in {gen_time:.1f}s "
+                f"instruct={'yes' if kwargs.get('instruct') else 'no'}",
+                flush=True,
+            )
+            return audio, sr, audio_dur, gen_time, used_model_id
+
+        result = await asyncio.to_thread(
+            _run_with_model,
+            "1.7b-custom",
+            _run_generate,
         )
+        audio, sr, audio_dur, gen_time, used_model_id = result
     except Exception as e:
         raise HTTPException(500, f"Custom voice generation failed: {e}")
-    finally:
-        with model_lock:
-            active_requests -= 1
-            last_used = time.time()
-        _schedule_unload()
 
     audio_bytes, content_type = await asyncio.to_thread(
         audio_to_format, audio, sr, response_format
@@ -1400,7 +1391,7 @@ async def custom_voice(request: CustomVoiceRequest):
             "X-Audio-Duration": str(round(audio_dur, 2)),
             "X-Generation-Time": str(round(gen_time, 2)),
             "X-Speaker": request.speaker,
-            "X-Model": current_model_id or "",
+            "X-Model": used_model_id,
         },
     )
 
