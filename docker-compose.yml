@@ -27,6 +27,7 @@ x-podcast-env: &podcast-env
 services:
   # --- ASR (Qwen3-ASR with on-demand vLLM backend) ---------------------------
   qwen3-asr:
+    init: true
     image: qwenllm/qwen3-asr:latest
     container_name: qwen3-asr
     runtime: nvidia
@@ -51,6 +52,7 @@ services:
 
   # --- TTS replica 1 ---------------------------------------------------------
   qwen3-tts:
+    init: true
     build:
       context: ./qwen3-tts
       dockerfile: Dockerfile
@@ -88,6 +90,7 @@ services:
 
   # --- TTS replica 2 (opt-in: enable with COMPOSE_PROFILES=dual-gpu) --------
   qwen3-tts-2:
+    init: true
     profiles: ["dual-gpu"]
     build:
       context: ./qwen3-tts
@@ -125,6 +128,7 @@ services:
 
   # --- ACE-Step (music) ------------------------------------------------------
   acestep:
+    init: true
     build:
       context: ./acestep
       dockerfile: Dockerfile
@@ -150,6 +154,7 @@ services:
 
   # --- MMAudio (sound effects) -----------------------------------------------
   mmaudio:
+    init: true
     build:
       context: ./mmaudio
       dockerfile: Dockerfile

@@ -1,4 +1,5 @@
 import unittest
+import re
 from pathlib import Path
 
 
@@ -36,3 +37,17 @@ class MMAudioCachePolicyTest(unittest.TestCase):
         self.assertIn("def _is_verified(", source)
         self.assertIn('data.get("mtime_ns") == stat.st_mtime_ns', source)
         self.assertIn("if _verify_and_mark(path, expected_md5):", source)
+
+
+class WorkerInitPolicyTest(unittest.TestCase):
+    def test_gpu_workers_run_behind_an_init_subreaper(self):
+        compose = (REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+        for service in ("qwen3-asr", "qwen3-tts", "qwen3-tts-2", "acestep", "mmaudio"):
+            block = re.search(
+                rf"^  {re.escape(service)}:\n(?P<body>(?:^    .*\n|^\s*$)*)",
+                compose,
+                re.MULTILINE,
+            )
+            self.assertIsNotNone(block, service)
+            assert block is not None
+            self.assertIn("    init: true\n", block.group("body"), service)
