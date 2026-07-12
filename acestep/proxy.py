@@ -52,10 +52,12 @@ process: subprocess.Popen | None = None
 lock = threading.Lock()
 last_activity = time.time()
 backend_starting = False
+backend_ready = False
 backend_started_at: float | None = None
 last_start_error: str | None = None
 active_requests = 0
 _http_session: aiohttp.ClientSession | None = None
+_startup_task: asyncio.Task[None] | None = None
 
 
 def _session() -> aiohttp.ClientSession:
@@ -100,7 +102,8 @@ def start_backend():
 
 def stop_backend():
     """Stop the ACE-Step API server to free GPU memory."""
-    global process, backend_started_at
+    global process, backend_ready, backend_started_at
+    backend_ready = False
     if process is None:
         return
     if process.poll() is None:
@@ -124,11 +127,13 @@ async def wait_for_backend(timeout: float = 120):
             exit_code = process.returncode
             raise RuntimeError(f"ACE-Step backend died with code {exit_code}")
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(f"{BACKEND_URL}/health", timeout=aiohttp.ClientTimeout(total=3)) as resp:
-                    if resp.status == 200:
-                        print("ACE-Step backend ready", flush=True)
-                        return
+            async with _session().get(
+                f"{BACKEND_URL}/health",
+                timeout=aiohttp.ClientTimeout(total=3),
+            ) as resp:
+                if resp.status == 200:
+                    print("ACE-Step backend ready", flush=True)
+                    return
         except Exception:
             pass
         await asyncio.sleep(2)
@@ -138,21 +143,40 @@ async def wait_for_backend(timeout: float = 120):
     )
 
 
-async def ensure_backend():
-    """Ensure the backend is running. Start it if not."""
-    global backend_starting, last_activity, last_start_error
-    last_activity = time.time()
+async def _start_backend_once() -> None:
+    global backend_ready, backend_starting, last_start_error
     backend_starting = True
+    backend_ready = False
     try:
         with lock:
             if process is None or process.poll() is not None:
                 start_backend()
         await wait_for_backend(STARTUP_TIMEOUT_SECONDS)
+        backend_ready = True
+        last_start_error = None
     except Exception as exc:
         last_start_error = str(exc)
+        with lock:
+            stop_backend()
         raise
     finally:
         backend_starting = False
+
+
+async def ensure_backend():
+    """Ensure one shared backend startup completes without duplicate polling."""
+    global _startup_task, last_activity
+    last_activity = time.time()
+    if backend_ready and process is not None and process.poll() is None:
+        return
+    if _startup_task is None or _startup_task.done():
+        _startup_task = asyncio.create_task(_start_backend_once())
+    task = _startup_task
+    try:
+        await asyncio.shield(task)
+    finally:
+        if task.done() and _startup_task is task:
+            _startup_task = None
 
 
 async def _acquire_backend() -> None:
@@ -177,6 +201,13 @@ def _unload_if_idle() -> dict:
                 "status": "busy",
                 "was_running": process is not None and process.poll() is None,
                 "active_requests": active_requests,
+            }
+        if backend_starting:
+            return {
+                "status": "busy",
+                "was_running": process is not None and process.poll() is None,
+                "active_requests": active_requests,
+                "backend_starting": True,
             }
         was_running = process is not None and process.poll() is None
         stop_backend()
@@ -230,6 +261,7 @@ async def health():
         "status": "ok",
         "backend_running": running,
         "backend_starting": backend_starting,
+        "backend_ready": backend_ready,
         "backend_started_at": backend_started_at,
         "last_start_error": last_start_error,
         "active_requests": active_requests,

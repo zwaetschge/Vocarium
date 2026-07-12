@@ -31,10 +31,11 @@ MIN_FREE_MIB = 2500
 
 process: subprocess.Popen | None = None
 last_used: float = 0.0
-lock = threading.Lock()
+lock = threading.Condition(threading.RLock())
 idle_timer: threading.Timer | None = None
 active_requests = 0
 backend_ready = False
+backend_starting = False
 last_start_error: str | None = None
 _http_client: httpx.AsyncClient | None = None
 
@@ -175,16 +176,35 @@ def schedule_unload():
 
 
 def acquire_backend() -> None:
-    global active_requests, last_used, last_start_error
+    global active_requests, backend_starting, last_used, last_start_error
     with lock:
+        waited_for_start = False
+        while backend_starting:
+            waited_for_start = True
+            lock.wait()
+        if waited_for_start and last_start_error:
+            raise RuntimeError(last_start_error)
+        needs_start = not (
+            backend_ready and process is not None and process.poll() is None
+        )
+        # Reserve the lifecycle while starting or claiming the ready backend,
+        # so a manual unload cannot slip in before active_requests increments.
+        backend_starting = True
+    if needs_start:
         try:
             start_backend()
         except Exception as exc:
-            last_start_error = str(exc)
+            with lock:
+                last_start_error = str(exc)
+                backend_starting = False
+                lock.notify_all()
             raise
+    with lock:
         last_start_error = None
         active_requests += 1
         last_used = time.time()
+        backend_starting = False
+        lock.notify_all()
 
 
 def release_backend() -> None:
@@ -203,6 +223,13 @@ def _unload_if_idle() -> dict:
                 "was_running": process is not None and process.poll() is None,
                 "active_requests": active_requests,
             }
+        if backend_starting:
+            return {
+                "status": "busy",
+                "was_running": process is not None and process.poll() is None,
+                "active_requests": active_requests,
+                "backend_starting": True,
+            }
         was_running = process is not None and process.poll() is None
         stop_backend()
         return {"status": "unloaded", "was_running": was_running}
@@ -216,6 +243,7 @@ async def health():
         "service": "qwen3-asr-proxy",
         "backend_running": running,
         "backend_ready": backend_ready,
+        "backend_starting": backend_starting,
         "active_requests": active_requests,
         "last_start_error": last_start_error,
         "model": MODEL,
