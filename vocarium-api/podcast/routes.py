@@ -46,6 +46,7 @@ from .audio_assembler import (
 from .disfluency import ScriptSegment
 from .docling_client import DoclingClient, get_docling_client
 from .embedding_client import EmbeddingClient, get_embedding_client
+from .file_stream import iter_file_range, parse_single_range
 from .helpers import chunk_text, count_words, estimate_speaking_duration, generate_id
 from .script_generator import (
     HostCharacter,
@@ -1978,27 +1979,17 @@ def create_podcast_router(
         range_header = request.headers.get("range") or request.headers.get("Range")
 
         if range_header:
-            match = re.match(r"bytes=(\d+)-(\d*)", range_header.strip())
-            if not match:
-                raise HTTPException(416, "Invalid Range header")
-            start = int(match.group(1))
-            end_raw = match.group(2)
-            end = int(end_raw) if end_raw else file_size - 1
-            if start >= file_size or end >= file_size or start > end:
-                raise HTTPException(416, "Range not satisfiable")
+            try:
+                start, end = parse_single_range(range_header, file_size)
+            except ValueError as exc:
+                raise HTTPException(
+                    416,
+                    "Range not satisfiable",
+                    headers={"Content-Range": f"bytes */{file_size}"},
+                ) from exc
             length = end - start + 1
-
-            async def reader():
-                loop = asyncio.get_event_loop()
-                def _read():
-                    with path.open("rb") as fh:
-                        fh.seek(start)
-                        return fh.read(length)
-                data = await loop.run_in_executor(None, _read)
-                yield data
-
             return StreamingResponse(
-                reader(),
+                iter_file_range(path, start, end),
                 status_code=206,
                 media_type=media_type,
                 headers={
