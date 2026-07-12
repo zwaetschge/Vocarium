@@ -51,3 +51,12 @@ class WorkerInitPolicyTest(unittest.TestCase):
             self.assertIsNotNone(block, service)
             assert block is not None
             self.assertIn("    init: true\n", block.group("body"), service)
+
+
+class TTSMetadataCacheTest(unittest.TestCase):
+    def test_generation_hotpaths_use_indexed_voice_metadata(self):
+        source = (REPO_ROOT / "qwen3-tts" / "server.py").read_text(encoding="utf-8")
+        self.assertIn("voice_metadata: dict[str, dict]", source)
+        self.assertIn('language = voice_metadata.get(voice_id, {}).get("language", "English")', source)
+        create_speech = source[source.index("async def create_speech("):source.index("async def create_speech_stream(")]
+        self.assertNotIn("read_text", create_speech)

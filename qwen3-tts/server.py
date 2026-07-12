@@ -192,6 +192,7 @@ model: Optional[FasterQwen3TTS] = None
 use_cuda_graphs: bool = False  # whether current model uses CUDA graph path
 voice_prompts: dict = {}       # legacy compat — kept for health endpoint
 voice_refs: dict = {}          # {voice_id: {"ref_audio": path, "ref_text": str}}
+voice_metadata: dict[str, dict] = {}  # metadata indexed with voice_refs
 voice_clone_prompt_cache: dict = {}  # {(model_id, voice_id, xvec_only): prompt}
 last_used: float = 0.0
 model_lock = threading.Lock()
@@ -421,6 +422,7 @@ def _load_all_voice_refs():
     """Scan /app/voices/ and index ref audio paths + text for every stored voice."""
     voice_refs.clear()
     voice_prompts.clear()
+    voice_metadata.clear()
     if not VOICES_DIR.exists():
         return
     for voice_dir in sorted(VOICES_DIR.iterdir()):
@@ -448,6 +450,7 @@ def _load_all_voice_refs():
             "ref_audio": str(ref_audio),
             "ref_text": ref_text,
         }
+        voice_metadata[vid] = dict(meta)
         voice_prompts[vid] = True  # for health endpoint compat
         print(f"  Indexed voice '{vid}'", flush=True)
 
@@ -729,15 +732,10 @@ async def load_model_endpoint(request: ModelLoadRequest):
 @app.get("/v1/voices")
 async def list_voices():
     voices = []
-    for voice_dir in sorted(VOICES_DIR.iterdir()):
-        if not voice_dir.is_dir():
-            continue
-        meta_file = voice_dir / "metadata.json"
-        if not meta_file.exists():
-            continue
-        meta = json.loads(meta_file.read_text())
-        meta["voice_id"] = voice_dir.name
-        meta["prompt_loaded"] = voice_dir.name in voice_prompts
+    for voice_id in sorted(voice_metadata):
+        meta = dict(voice_metadata[voice_id])
+        meta["voice_id"] = voice_id
+        meta["prompt_loaded"] = voice_id in voice_prompts
         voices.append(meta)
     return {"voices": voices}
 
@@ -778,6 +776,7 @@ async def register_voice(
     # Index the voice ref for generation
     _clear_voice_clone_prompt(voice_id)
     voice_refs[voice_id] = {"ref_audio": str(audio_path), "ref_text": ref_text}
+    voice_metadata[voice_id] = dict(meta)
     voice_prompts[voice_id] = True
 
     return {"status": "registered", "voice_id": voice_id, "prompt_loaded": voice_id in voice_refs}
@@ -820,6 +819,7 @@ async def register_designed_voice(
     # Index the voice ref for generation
     _clear_voice_clone_prompt(voice_id)
     voice_refs[voice_id] = {"ref_audio": str(audio_path), "ref_text": ref_text}
+    voice_metadata[voice_id] = dict(meta)
     voice_prompts[voice_id] = True
 
     return {"status": "registered", "voice_id": voice_id, "prompt_loaded": voice_id in voice_refs}
@@ -833,6 +833,7 @@ async def delete_voice(voice_id: str):
     shutil.rmtree(voice_dir)
     voice_prompts.pop(voice_id, None)
     voice_refs.pop(voice_id, None)
+    voice_metadata.pop(voice_id, None)
     _clear_voice_clone_prompt(voice_id)
     return {"status": "deleted", "voice_id": voice_id}
 
@@ -1029,9 +1030,7 @@ async def create_speech(request: SpeechRequest):
                 language = lang
                 break
     else:
-        meta_file = VOICES_DIR / voice_id / "metadata.json"
-        if meta_file.exists():
-            language = json.loads(meta_file.read_text()).get("language", "English")
+        language = voice_metadata.get(voice_id, {}).get("language", "English")
 
     chunks = _split_text_to_chunks(request.input)
     n_chunks = len(chunks)
@@ -1132,9 +1131,7 @@ async def create_speech_stream(request: SpeechRequest):
                 language = lang
                 break
     else:
-        meta_file = VOICES_DIR / voice_id / "metadata.json"
-        if meta_file.exists():
-            language = json.loads(meta_file.read_text()).get("language", "English")
+        language = voice_metadata.get(voice_id, {}).get("language", "English")
 
     chunks = _split_text_to_chunks(request.input)
     n_chunks = len(chunks)
