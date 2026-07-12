@@ -1,9 +1,11 @@
 import asyncio
 import io
 import os
+import py_compile
 import re
 import ast
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -430,6 +432,136 @@ class SourceSecurityTest(unittest.TestCase):
         self.assertIn("ALLOW_ANONYMOUS: ${ALLOW_ANONYMOUS:-false}", prod)
         self.assertIn("CORS_ORIGINS: ${CORS_ORIGINS:?", prod)
 
+    def test_api_cache_mounts_avoid_read_only_source_bind_mountpoints(self):
+        compose = (REPO_ROOT / "docker-compose.yml").read_text()
+        strategies: dict[str, tuple[str, tuple[str, ...]]] = {}
+
+        for service in ("vocarium-api", "vocarium-api-2"):
+            match = re.search(
+                rf"(?ms)^  {re.escape(service)}:\n(?P<body>.*?)(?=^  [a-zA-Z0-9_-]+:\n|\Z)",
+                compose,
+            )
+            self.assertIsNotNone(match, f"missing Compose service {service}")
+            block = match.group("body")
+            read_only_targets = re.findall(
+                r"(?m)^      - [^:\n]+:(/[^:\n]+):ro$", block
+            )
+            tmpfs_targets = tuple(
+                re.findall(
+                    r"(?m)^      - type: tmpfs\n        target: (/\S+)$", block
+                )
+            )
+            nested_targets = [
+                (tmpfs_target, source_target)
+                for tmpfs_target in tmpfs_targets
+                for source_target in read_only_targets
+                if tmpfs_target == source_target
+                or tmpfs_target.startswith(source_target.rstrip("/") + "/")
+            ]
+            self.assertEqual(
+                nested_targets,
+                [],
+                f"{service} tmpfs targets must not require mountpoints below "
+                "read-only sources",
+            )
+
+            prefix_match = re.search(
+                r"(?m)^      PYTHONPYCACHEPREFIX:[ \t]*(\S+)[ \t]*$", block
+            )
+            self.assertIsNotNone(
+                prefix_match, f"{service} must configure PYTHONPYCACHEPREFIX"
+            )
+            prefix = prefix_match.group(1).strip("\"'")
+            self.assertTrue(prefix.startswith("/"))
+            self.assertFalse(prefix == "/app" or prefix.startswith("/app/"))
+            self.assertIn(prefix, tmpfs_targets)
+            self.assertFalse(
+                any("__pycache__" in Path(target).parts for target in tmpfs_targets)
+            )
+            strategies[service] = (prefix, tmpfs_targets)
+
+        self.assertEqual(strategies["vocarium-api"], strategies["vocarium-api-2"])
+
+    def test_api_cache_prefix_ignores_colocated_stale_bytecode(self):
+        compose = (REPO_ROOT / "docker-compose.yml").read_text()
+        prefixes: list[str] = []
+        for service in ("vocarium-api", "vocarium-api-2"):
+            match = re.search(
+                rf"(?ms)^  {re.escape(service)}:\n(?P<body>.*?)(?=^  [a-zA-Z0-9_-]+:\n|\Z)",
+                compose,
+            )
+            self.assertIsNotNone(match, f"missing Compose service {service}")
+            prefix_match = re.search(
+                r"(?m)^      PYTHONPYCACHEPREFIX:[ \t]*(\S+)[ \t]*$",
+                match.group("body"),
+            )
+            self.assertIsNotNone(
+                prefix_match, f"{service} must configure PYTHONPYCACHEPREFIX"
+            )
+            prefixes.append(prefix_match.group(1).strip("\"'"))
+        self.assertEqual(prefixes[0], prefixes[1])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source_root = Path(tmp) / "source"
+            source_root.mkdir()
+            module_path = source_root / "cache_probe.py"
+            module_path.write_text("VALUE = 'stale'\n")
+            colocated_cache = (
+                module_path.parent
+                / "__pycache__"
+                / f"{module_path.stem}.{sys.implementation.cache_tag}.pyc"
+            )
+            colocated_cache.parent.mkdir()
+            py_compile.compile(
+                str(module_path),
+                cfile=str(colocated_cache),
+                doraise=True,
+                invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+            )
+            module_path.write_text("VALUE = 'fresh'\n")
+
+            probe = (
+                "import importlib.util, pathlib, sys\n"
+                f"source_root = pathlib.Path({str(source_root)!r})\n"
+                "sys.path.insert(0, str(source_root))\n"
+                "import cache_probe\n"
+                "print(cache_probe.VALUE)\n"
+                "print(sys.pycache_prefix)\n"
+                "print(importlib.util.cache_from_source(str(source_root / 'cache_probe.py')))\n"
+            )
+            baseline_env = os.environ.copy()
+            baseline_env.pop("PYTHONPYCACHEPREFIX", None)
+            baseline_env["PYTHONDONTWRITEBYTECODE"] = "1"
+            baseline = subprocess.run(
+                [sys.executable, "-c", probe],
+                capture_output=True,
+                check=False,
+                env=baseline_env,
+                text=True,
+            )
+            self.assertEqual(baseline.returncode, 0, baseline.stderr)
+            baseline_output = baseline.stdout.splitlines()
+            self.assertEqual(baseline_output[0], "stale")
+            self.assertEqual(baseline_output[1], "None")
+            self.assertEqual(Path(baseline_output[2]), colocated_cache)
+
+            prefixed_env = baseline_env.copy()
+            prefixed_env["PYTHONPYCACHEPREFIX"] = prefixes[0]
+            prefixed = subprocess.run(
+                [sys.executable, "-c", probe],
+                capture_output=True,
+                check=False,
+                env=prefixed_env,
+                text=True,
+            )
+            self.assertEqual(prefixed.returncode, 0, prefixed.stderr)
+            prefixed_output = prefixed.stdout.splitlines()
+            self.assertEqual(prefixed_output[0], "fresh")
+            self.assertEqual(prefixed_output[1], prefixes[0])
+            redirected_cache = Path(prefixed_output[2])
+            self.assertTrue(redirected_cache.is_relative_to(Path(prefixes[0])))
+            self.assertNotEqual(redirected_cache, colocated_cache)
+
     def test_local_auth_default_allows_shared_api_user(self):
         main_source = (API_ROOT / "main.py").read_text()
         self.assertIn(
@@ -576,6 +708,209 @@ class PodcastProductionHardeningTest(unittest.TestCase):
         self.assertIn("def _validate_response_format", source)
         self.assertIn("Streaming speech returns base64 WAV chunks", source)
 
+    def test_qwen_clone_generation_is_voice_stable_by_default(self):
+        source = (REPO_ROOT / "qwen3-tts" / "server.py").read_text()
+        compose = (REPO_ROOT / "docker-compose.yml").read_text()
+        env_example = (REPO_ROOT / ".env.example").read_text()
+        self.assertIn("TTS_CLONE_DO_SAMPLE", source)
+        self.assertIn('"do_sample": CLONE_DO_SAMPLE', source)
+        self.assertIn('"temperature": CLONE_TEMPERATURE', source)
+        self.assertIn("TTS_CLONE_XVEC_ONLY", source)
+        self.assertIn('CLONE_XVEC_ONLY = _env_bool("TTS_CLONE_XVEC_ONLY", True)', source)
+        self.assertIn("TTS_CLONE_XVEC_ONLY=${TTS_CLONE_XVEC_ONLY:-true}", compose)
+        self.assertIn("TTS_CLONE_XVEC_ONLY=true", env_example)
+        self.assertIn('CLONE_NON_STREAMING_MODE = _env_bool("TTS_CLONE_NON_STREAMING_MODE", False)', source)
+        self.assertIn('"non_streaming_mode": CLONE_NON_STREAMING_MODE', source)
+        self.assertIn("TTS_CLONE_NON_STREAMING_MODE=${TTS_CLONE_NON_STREAMING_MODE:-false}", compose)
+        self.assertIn("TTS_CLONE_NON_STREAMING_MODE=false", env_example)
+        self.assertIn('xvec_only = CLONE_XVEC_ONLY or not (ref_text or "").strip()', source)
+        self.assertIn('"xvec_only": xvec_only', source)
+        self.assertIn('"x_vector_only_mode": xvec_only', source)
+        self.assertIn("def _normalize_reference_wav", source)
+        self.assertIn("ref_audio_normalization", source)
+        self.assertIn("TTS_REF_NORMALIZE_PEAK", source)
+        self.assertIn("Unknown voice", source)
+        self.assertNotIn("voice_id = available[0]", source)
+        tree = ast.parse(source)
+        endpoint = next(
+            (
+                node
+                for node in tree.body
+                if isinstance(node, ast.AsyncFunctionDef)
+                and node.name == "create_speech"
+            ),
+            None,
+        )
+        self.assertIsNotNone(endpoint)
+        assert endpoint is not None
+        voice_selection = next(
+            (
+                node
+                for node in endpoint.body
+                if isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Name) and target.id == "voice_id"
+                    for target in node.targets
+                )
+                and isinstance(node.value, ast.Attribute)
+                and isinstance(node.value.value, ast.Name)
+                and node.value.value.id == "request"
+                and node.value.attr == "voice"
+            ),
+            None,
+        )
+        self.assertIsNotNone(voice_selection)
+        voice_validation = next(
+            (
+                node
+                for node in endpoint.body
+                if isinstance(node, ast.If)
+                and isinstance(node.test, ast.Compare)
+                and isinstance(node.test.left, ast.Name)
+                and node.test.left.id == "voice_id"
+                and len(node.test.ops) == 1
+                and isinstance(node.test.ops[0], ast.NotIn)
+                and len(node.test.comparators) == 1
+                and isinstance(node.test.comparators[0], ast.Name)
+                and node.test.comparators[0].id == "voice_refs"
+            ),
+            None,
+        )
+        self.assertIsNotNone(voice_validation)
+        assert voice_validation is not None
+        self.assertTrue(any(isinstance(node, ast.Raise) for node in ast.walk(voice_validation)))
+
+        def runtime_nodes(scope: ast.AST):
+            stack = [scope]
+            while stack:
+                node = stack.pop()
+                yield node
+                if node is not scope and isinstance(
+                    node,
+                    (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef),
+                ):
+                    continue
+                stack.extend(reversed(list(ast.iter_child_nodes(node))))
+
+        model_offloads = [
+            node
+            for node in runtime_nodes(endpoint)
+            if isinstance(node, ast.Await)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Attribute)
+            and isinstance(node.value.func.value, ast.Name)
+            and node.value.func.value.id == "asyncio"
+            and node.value.func.attr == "to_thread"
+            and len(node.value.args) >= 2
+            and isinstance(node.value.args[0], ast.Name)
+            and node.value.args[0].id == "_run_with_model"
+            and isinstance(node.value.args[1], ast.Name)
+            and node.value.args[1].id == "target_model"
+        ]
+        self.assertEqual(len(model_offloads), 1)
+        assert voice_selection is not None
+        self.assertLess(voice_selection.lineno, voice_validation.lineno)
+        self.assertLess(voice_validation.lineno, model_offloads[0].lineno)
+        self.assertIn("inference_lock = threading.RLock()", source)
+        self.assertIn("with inference_lock:\n                for i, chunk in enumerate(chunks):", source)
+        self.assertIn("def _run_stream_request", source)
+        self.assertIn("loop.run_in_executor(None, _run_stream_request)", source)
+        self.assertIn("voice_clone_prompt_cache", source)
+        self.assertIn("create_voice_clone_prompt", source)
+        self.assertIn("voice_clone_prompt", source)
+        self.assertIn("_clear_voice_clone_prompt(voice_id)", source)
+
+    def test_qwen_clone_generation_caps_chunk_and_token_budget(self):
+        source = (REPO_ROOT / "qwen3-tts" / "server.py").read_text()
+        self.assertIn('MAX_CHUNK_CHARS = _env_int("TTS_MAX_CHUNK_CHARS", 140)', source)
+        self.assertIn('TOKEN_BUDGET_TOKENS_PER_CHAR = _env_float("TTS_TOKEN_BUDGET_TOKENS_PER_CHAR", 1.05)', source)
+        self.assertIn('TOKEN_BUDGET_MIN = _env_int("TTS_TOKEN_BUDGET_MIN", 40)', source)
+        self.assertIn("TTS_TOKEN_BUDGET_MIN=${TTS_TOKEN_BUDGET_MIN:-40}", (REPO_ROOT / "docker-compose.yml").read_text())
+        self.assertIn('TOKEN_BUDGET_MAX = _env_int("TTS_TOKEN_BUDGET_MAX", 260)', source)
+        self.assertIn("def _tts_token_limit", source)
+        self.assertIn("return min(TOKEN_BUDGET_MAX, max(TOKEN_BUDGET_MIN, estimated))", source)
+        self.assertIn("return _tts_token_limit(text, override)", source)
+        self.assertNotIn("int(len(text) * 2.0)", source)
+        self.assertNotIn("MAX_CHUNK_CHARS = 200", source)
+
+    def test_qwen_clone_generation_disables_cuda_graphs_by_default(self):
+        source = (REPO_ROOT / "qwen3-tts" / "server.py").read_text()
+        compose = (REPO_ROOT / "docker-compose.yml").read_text()
+        env_example = (REPO_ROOT / ".env.example").read_text()
+
+        self.assertIn('ENABLE_CUDA_GRAPHS = _env_bool("TTS_ENABLE_CUDA_GRAPHS", False)', source)
+        self.assertIn('TTS_ENABLE_CUDA_GRAPHS=${TTS_ENABLE_CUDA_GRAPHS:-false}', compose)
+        self.assertIn("TTS_ENABLE_CUDA_GRAPHS=false", env_example)
+
+    def test_qwen_clone_generation_retries_suspicious_chunks(self):
+        source = (REPO_ROOT / "qwen3-tts" / "server.py").read_text()
+
+        self.assertIn("TTS_CHUNK_MAX_SECONDS", source)
+        self.assertIn("TTS_CHUNK_RETRY_TOKEN_FACTOR", source)
+        self.assertIn("def _chunk_max_duration", source)
+        self.assertIn("def _is_suspicious_chunk", source)
+        self.assertIn("def _generate_guarded_voice_clone", source)
+        self.assertIn("retry_tokens = max(TOKEN_BUDGET_MIN, int(token_limit * CHUNK_RETRY_TOKEN_FACTOR))", source)
+        self.assertIn("raise RuntimeError(", source)
+        self.assertIn("_generate_guarded_voice_clone(", source)
+
+    def test_qwen_custom_voice_generation_is_voice_stable_by_default(self):
+        source = (REPO_ROOT / "qwen3-tts" / "server.py").read_text()
+        custom_start = source.index("@app.post(\"/v1/audio/speech/custom\")")
+        custom_end = source.index("return Response(", custom_start)
+        custom_source = source[custom_start:custom_end]
+        self.assertIn("TTS_CUSTOM_DO_SAMPLE", source)
+        self.assertIn("CUSTOM_DO_SAMPLE = _env_bool(\"TTS_CUSTOM_DO_SAMPLE\", False)", source)
+        self.assertIn("CUSTOM_TEMPERATURE", source)
+        self.assertIn("CUSTOM_TOP_K", source)
+        self.assertIn("CUSTOM_TOP_P", source)
+        self.assertIn("non_streaming_mode=True", custom_source)
+        self.assertIn("do_sample=CUSTOM_DO_SAMPLE", custom_source)
+        self.assertIn("temperature=CUSTOM_TEMPERATURE", custom_source)
+        self.assertIn("top_k=CUSTOM_TOP_K", custom_source)
+        self.assertIn("top_p=CUSTOM_TOP_P", custom_source)
+        self.assertIn("repetition_penalty=1.08", custom_source)
+        self.assertIn("custom_sampling", source)
+        self.assertIn("token_limit = _tts_token_limit(request.text, request.max_new_tokens)", custom_source)
+
+    def test_webui_speech_generation_keeps_cloned_voices_available(self):
+        main_source = (API_ROOT / "main.py").read_text()
+        speech_page = (REPO_ROOT / "vocarium-ui" / "src" / "pages" / "SpeechPage.tsx").read_text()
+
+        generate_start = main_source.index("@app.post(\"/api/generate\")")
+        generate_end = main_source.index("# ---------------------------------------------------------------------------\n# Benchmark", generate_start)
+        generate_source = main_source[generate_start:generate_end]
+        stream_start = main_source.index("@app.post(\"/api/generate/stream\")")
+        stream_end = main_source.index("@app.post(\"/api/generate\")", stream_start)
+        stream_source = main_source[stream_start:stream_end]
+
+        self.assertNotIn("_require_custom_generation_voice(source)", main_source)
+        self.assertNotIn("Speech generation only supports custom voices", main_source)
+        self.assertNotIn("_require_custom_generation_voice(source)", generate_source)
+        self.assertNotIn("_require_custom_generation_voice(source)", stream_source)
+        self.assertIn("generationVoices = useMemo(() => withDefaultVoice(voices), [voices])", speech_page)
+        self.assertIn("const selectedModel = '1.7b-base'", speech_page)
+        self.assertIn("model_id: selectedModel", speech_page)
+        self.assertNotIn("voices.filter((voice) => voice.source === 'custom')", speech_page)
+
+    def test_f5_experiment_is_not_in_stack(self):
+        compose = (REPO_ROOT / "docker-compose.yml").read_text()
+        env_example = (REPO_ROOT / ".env.example").read_text()
+        main_source = (API_ROOT / "main.py").read_text()
+        speech_page = (REPO_ROOT / "vocarium-ui" / "src" / "pages" / "SpeechPage.tsx").read_text()
+        e2e_source = (REPO_ROOT / "vocarium-ui" / "e2e" / "runtime.spec.ts").read_text()
+        combined = "\n".join([compose, env_example, main_source, speech_page, e2e_source])
+        self.assertNotIn("f5", combined.lower())
+        self.assertFalse((REPO_ROOT / "f5-tts" / "Dockerfile").exists())
+        self.assertFalse((REPO_ROOT / "f5-tts" / "server.py").exists())
+
+    def test_neutts_experiment_is_not_in_stack(self):
+        compose = (REPO_ROOT / "docker-compose.yml").read_text()
+        main_source = (API_ROOT / "main.py").read_text()
+        self.assertNotIn("neutts-tts", compose)
+        self.assertNotIn("NEUTTS_URL", main_source)
+        self.assertFalse((REPO_ROOT / "neutts-tts" / "Dockerfile").exists())
+
     def test_chunk_text_uses_requested_overlap(self):
         from podcast.helpers import chunk_text
 
@@ -588,11 +923,108 @@ class PodcastProductionHardeningTest(unittest.TestCase):
         self.assertIn("SELECT 1 FROM music_task_files WHERE user_id=? AND path=? LIMIT 1", source)
         self.assertNotIn("SELECT file_paths FROM music_tasks WHERE user_id=?", source)
 
+    def test_music_audio_prefers_local_acestep_output_file(self):
+        source = (API_ROOT / "main.py").read_text()
+        self.assertIn("MUSIC_OUTPUT_DIR", source)
+        self.assertIn('Path(os.environ.get("MUSIC_OUTPUT_DIR", "/app/acestep/.cache/acestep"))', source)
+        self.assertIn("def _music_audio_local_path(path: str) -> Path | None:", source)
+        self.assertIn("local_path = _music_audio_local_path(path)", source)
+        self.assertIn("return FileResponse(", source)
+
+    def test_api_mounts_acestep_output_read_only(self):
+        compose = (REPO_ROOT / "docker-compose.yml").read_text()
+        self.assertIn("acestep-output:/app/acestep/.cache/acestep:ro", compose)
+
+    def test_music_generation_exposes_engine_and_client_audio_options(self):
+        source = (API_ROOT / "main.py").read_text()
+        self.assertIn('SUPPORTED_MUSIC_ENGINES = {"acestep"}', source)
+        self.assertIn('engine: str = "acestep"', source)
+        self.assertIn('negative_prompt: str = ""', source)
+        self.assertIn("instrumental: bool = False", source)
+        self.assertIn("loopable: bool = False", source)
+        self.assertIn("normalize_lufs: float | None = None", source)
+        self.assertIn("fade_ms: int = 0", source)
+        self.assertIn("_validate_engine(req.engine, SUPPORTED_MUSIC_ENGINES", source)
+        self.assertIn("_validate_lufs(req.normalize_lufs)", source)
+        self.assertIn("_validate_fade_ms(req.fade_ms)", source)
+        self.assertIn('"negative_prompt": req.negative_prompt', source)
+        self.assertIn('"instrumental": req.instrumental', source)
+        self.assertIn('"loopable": req.loopable', source)
+        self.assertIn('"vocarium_options"', source)
+
+    def test_sfx_generation_exposes_engine_and_negative_prompt_controls(self):
+        source = (API_ROOT / "main.py").read_text()
+        self.assertIn('SUPPORTED_SFX_ENGINES = {"mmaudio"}', source)
+        self.assertIn("_validate_engine(engine, SUPPORTED_SFX_ENGINES", source)
+        self.assertIn('no_speech = _coerce_bool(body.get("no_speech", False), "no_speech")', source)
+        self.assertIn('no_music = _coerce_bool(body.get("no_music", False), "no_music")', source)
+        self.assertIn("_merge_negative_prompt(", source)
+        self.assertIn('"speech, voice, vocals, talking"', source)
+        self.assertIn('"music, melody, song, vocals"', source)
+        self.assertIn("_validate_lufs(normalize_lufs)", source)
+        self.assertIn("_validate_fade_ms(fade_ms)", source)
+        self.assertIn('"vocarium_options"', source)
+
+    def test_sfx_generation_uses_cold_start_timeout_and_translates_client_errors(self):
+        source = (API_ROOT / "main.py").read_text()
+        self.assertIn("SFX_GENERATE_TIMEOUT_SECONDS", source)
+        self.assertIn('os.environ.get("SFX_GENERATE_TIMEOUT_SECONDS", "900")', source)
+        self.assertIn("sock_read=timeout_seconds", source)
+        self.assertIn("except asyncio.TimeoutError as exc:", source)
+        self.assertIn("SFX backend timed out", source)
+        self.assertIn("except aiohttp.ClientError as exc:", source)
+        self.assertIn("SFX backend connection failed", source)
+
+    def test_mmaudio_unload_reports_busy_while_lock_is_held(self):
+        source = (REPO_ROOT / "mmaudio" / "server.py").read_text()
+        self.assertIn("lock.acquire(blocking=False)", source)
+        self.assertIn('"status": "busy"', source)
+        self.assertIn("try:\n        was_loaded = model_loaded", source)
+        self.assertIn("finally:\n        lock.release()", source)
+
+    def test_audio_generation_services_report_first_load_download_status(self):
+        ace_source = (REPO_ROOT / "acestep" / "proxy.py").read_text()
+        mmaudio_source = (REPO_ROOT / "mmaudio" / "server.py").read_text()
+        self.assertIn("MODEL_WEIGHT_HINTS", ace_source)
+        self.assertIn("backend_starting", ace_source)
+        self.assertIn("last_start_error", ace_source)
+        self.assertIn('"first_load"', ace_source)
+        self.assertIn("MODEL_WEIGHT_HINTS", mmaudio_source)
+        self.assertIn("model_loading", mmaudio_source)
+        self.assertIn("last_load_error", mmaudio_source)
+        self.assertIn('"first_load"', mmaudio_source)
+
+    def test_acestep_query_result_timeout_allows_first_load(self):
+        ace_source = (REPO_ROOT / "acestep" / "proxy.py").read_text()
+        self.assertIn("QUERY_RESULT_TIMEOUT_SECONDS", ace_source)
+        self.assertIn(
+            'os.environ.get("ACESTEP_QUERY_RESULT_TIMEOUT_SECONDS", "600")',
+            ace_source,
+        )
+        self.assertIn("aiohttp.ClientTimeout(total=QUERY_RESULT_TIMEOUT_SECONDS)", ace_source)
+
+    def test_audio_generation_benchmark_script_documents_preload_costs(self):
+        script = REPO_ROOT / "scripts" / "benchmark-audio-generation.py"
+        self.assertTrue(script.exists())
+        source = script.read_text()
+        self.assertIn("MODEL_WEIGHT_HINTS", source)
+        self.assertIn("--kind", source)
+        self.assertIn("--preload", source)
+        self.assertIn("--json", source)
+        self.assertIn("--force-generate", source)
+        self.assertIn("Remote-User", source)
+
     def test_openai_tts_persona_aliases_route_to_default_voice(self):
         source = (API_ROOT / "main.py").read_text()
-        self.assertIn("def _normalize_openai_tts_voice", source)
+        self.assertIn("def _resolve_openai_tts_voice", source)
+        self.assertIn("def _openai_voice_lookup_key", source)
+        self.assertIn("SELECT id, name FROM voices WHERE user_id=?", source)
+        self.assertIn("SELECT id, name FROM voices WHERE user_id IS NULL", source)
+        self.assertIn("WHERE id=? AND (user_id=? OR user_id IS NULL)", source)
+        self.assertIn("Stored user voices win over persona aliases", source)
         self.assertIn('"michael scott"', source)
-        self.assertIn("voice = _normalize_openai_tts_voice(req.voice)", source)
+        self.assertIn('if r[0] == "default" and source in (None, "clone"):', source)
+        self.assertIn("voice = _resolve_openai_tts_voice(req.voice, user_id=user[\"id\"])", source)
         self.assertIn("voice_override=voice", source)
         self.assertIn('"voice": voice', source)
 

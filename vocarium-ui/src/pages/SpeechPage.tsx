@@ -14,7 +14,6 @@ export default function SpeechPage() {
   const [languages, setLanguages] = useState<string[]>([]);
   const [selectedVoice, setSelectedVoice] = useState('default');
   const [selectedLang, setSelectedLang] = useState('');
-  const [selectedModel] = useState('1.7b-base');
   const [text, setText] = useState('');
   const [generating, setGenerating] = useState(false);
   const [genStartTime, setGenStartTime] = useState(0);
@@ -28,6 +27,7 @@ export default function SpeechPage() {
   const audioChunksRef = useRef<Uint8Array[]>([]);
   const audio = useAudio();
   const generationVoices = useMemo(() => withDefaultVoice(voices), [voices]);
+  const selectedModel = '1.7b-base';
 
   useEffect(() => {
     if (!generating) return;

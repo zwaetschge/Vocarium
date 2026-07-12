@@ -129,19 +129,20 @@ h3, .h3 {
   z-index: 0;
   overflow: hidden;
   background:
-    linear-gradient(135deg, rgba(10, 10, 15, 0.98) 0%, rgba(13, 18, 20, 0.96) 48%, rgba(18, 12, 18, 0.98) 100%),
-    linear-gradient(90deg, rgba(50, 181, 255, 0.08), transparent 34%, rgba(255, 184, 77, 0.07) 70%, transparent);
+    radial-gradient(ellipse 75% 65% at 72% 18%, rgba(45, 119, 138, 0.13), transparent 68%),
+    radial-gradient(ellipse 62% 72% at 18% 84%, rgba(84, 67, 157, 0.16), transparent 72%),
+    linear-gradient(145deg, #0a0a10 0%, #0c1115 48%, #110d14 100%);
 }
 
 .aurora-stage::before {
   content: "";
   position: absolute;
-  inset: -20%;
+  inset: 0;
   background:
-    conic-gradient(from 210deg at 58% 42%, transparent 0deg, rgba(123, 97, 255, 0.14) 80deg, transparent 145deg, rgba(255, 77, 210, 0.09) 220deg, transparent 300deg),
-    linear-gradient(120deg, transparent 0%, rgba(255, 255, 255, 0.035) 42%, transparent 62%);
-  opacity: 0.8;
-  transform: rotate(-4deg);
+    radial-gradient(circle at 78% 32%, rgba(255, 184, 77, 0.07) 0 1px, transparent 2px),
+    radial-gradient(circle at 78% 32%, transparent 0 18%, rgba(255, 184, 77, 0.035) 18.2% 18.4%, transparent 18.6%),
+    radial-gradient(circle at 24% 64%, transparent 0 22%, rgba(123, 97, 255, 0.06) 22.2% 22.4%, transparent 22.6%);
+  opacity: 0.9;
 }
 
 .aurora-grid,
@@ -156,66 +157,55 @@ h3, .h3 {
   background-image:
     linear-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px),
     linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px);
-  background-size: 48px 48px;
-  mask-image: linear-gradient(to bottom, rgba(0, 0, 0, 0.85), transparent 82%);
-  opacity: 0.55;
+  background-size: 64px 64px;
+  mask-image: radial-gradient(ellipse 70% 55% at 55% 42%, black, transparent 76%);
+  opacity: 0.18;
 }
 
 .aurora-wavefield {
-  background:
-    repeating-linear-gradient(
-      112deg,
-      transparent 0 54px,
-      rgba(50, 181, 255, 0.07) 54px 56px,
-      transparent 56px 112px
-    ),
-    repeating-linear-gradient(
-      67deg,
-      transparent 0 68px,
-      rgba(255, 184, 77, 0.045) 68px 70px,
-      transparent 70px 138px
-    );
+  inset: -38% -22%;
+  background: repeating-radial-gradient(
+    ellipse at 52% 96%,
+    transparent 0 62px,
+    rgba(86, 180, 199, 0.055) 63px 64px,
+    transparent 65px 98px
+  );
+  mask-image: linear-gradient(to top, rgba(0, 0, 0, 0.9), transparent 76%);
   opacity: 0.72;
-  animation: wavefield-pan 34s linear infinite;
+  transform: scale(1.02);
+  animation: wavefield-breathe 16s ease-in-out infinite;
 }
 
 .aurora-spectrum {
   top: auto;
-  height: 54%;
-  background:
-    linear-gradient(180deg, transparent 0%, rgba(123, 97, 255, 0.08) 38%, rgba(50, 181, 255, 0.08) 72%, transparent 100%),
-    repeating-linear-gradient(
-      90deg,
-      transparent 0 20px,
-      rgba(123, 97, 255, 0.17) 20px 22px,
-      transparent 22px 34px,
-      rgba(255, 184, 77, 0.1) 34px 35px,
-      transparent 35px 48px
-    );
-  clip-path: polygon(0 32%, 11% 24%, 22% 38%, 34% 18%, 48% 44%, 61% 26%, 74% 36%, 88% 16%, 100% 30%, 100% 100%, 0 100%);
-  filter: blur(0.4px);
-  opacity: 0.46;
-  transform: translateY(14%) skewY(-4deg);
-  animation: spectrum-drift 28s ease-in-out infinite;
+  bottom: -8%;
+  height: 32%;
+  background: repeating-linear-gradient(
+    90deg,
+    transparent 0 17px,
+    rgba(123, 97, 255, 0.12) 18px 19px,
+    transparent 20px 35px
+  );
+  mask-image: linear-gradient(to top, black 0%, transparent 92%);
+  opacity: 0.34;
+  animation: spectrum-drift 18s ease-in-out infinite;
 }
 
 .aurora-scanlines {
-  background: repeating-linear-gradient(
-    180deg,
-    rgba(255, 255, 255, 0.018) 0 1px,
-    transparent 1px 8px
-  );
-  opacity: 0.35;
+  background:
+    radial-gradient(ellipse 38% 32% at 83% 68%, rgba(255, 77, 210, 0.075), transparent 72%),
+    radial-gradient(ellipse 46% 40% at 38% 24%, rgba(50, 181, 255, 0.065), transparent 74%);
+  filter: blur(18px);
 }
 
-@keyframes wavefield-pan {
-  0% { background-position: 0 0, 0 0; }
-  100% { background-position: 180px 96px, -140px 120px; }
+@keyframes wavefield-breathe {
+  0%, 100% { transform: scale(1.02); opacity: 0.62; }
+  50% { transform: scale(1.06); opacity: 0.78; }
 }
 
 @keyframes spectrum-drift {
-  0%, 100% { transform: translateY(14%) skewY(-4deg); opacity: 0.42; }
-  50% { transform: translateY(9%) skewY(-4deg); opacity: 0.56; }
+  0%, 100% { transform: translateY(3%); opacity: 0.28; }
+  50% { transform: translateY(-2%); opacity: 0.38; }
 }
 
 /* Film grain overlay — layered above aurora, below content */

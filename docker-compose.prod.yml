@@ -26,9 +26,11 @@ services:
     ports: !reset []
     environment:
       ALLOW_ANONYMOUS: ${ALLOW_ANONYMOUS:-false}
+      VOCARIUM_ADMIN_USERS: ${VOCARIUM_ADMIN_USERS:-}
       CORS_ORIGINS: ${CORS_ORIGINS:?Set CORS_ORIGINS to your production origin, e.g. https://vocarium.example.com}
   vocarium-api-2:
     ports: !reset []
     environment:
       ALLOW_ANONYMOUS: ${ALLOW_ANONYMOUS:-false}
+      VOCARIUM_ADMIN_USERS: ${VOCARIUM_ADMIN_USERS:-}
       CORS_ORIGINS: ${CORS_ORIGINS:?Set CORS_ORIGINS to your production origin, e.g. https://vocarium.example.com}

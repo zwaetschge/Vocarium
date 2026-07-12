@@ -27,6 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from access_control import is_admin_username
 from artifact_cleanup import cleanup_artifacts
 from database import (
     gpu_queue_quota_decision,
@@ -51,7 +52,8 @@ from gpu_queue import (
     register_quota_checker,
     register_unloaders,
 )
-from metrics import inc, observe, render_prometheus
+from health_public import build_public_health
+from metrics import inc, observe, render_prometheus, route_path_label
 from podcast.routes import create_podcast_router
 from request_context import request_id_var, user_id_var
 from url_security import URLValidationError, normalize_http_base_url
@@ -67,7 +69,9 @@ EXTRA_TTS_URLS = [TTS_URL_2] if TTS_URL_2 else []
 ASR_URL = os.environ.get("ASR_URL", "http://qwen3-asr:8000")
 MUSIC_URL = os.environ.get("MUSIC_URL", "http://acestep:8003")
 SFX_URL = os.environ.get("SFX_URL", "http://mmaudio:8004")
+SFX_GENERATE_TIMEOUT_SECONDS = int(os.environ.get("SFX_GENERATE_TIMEOUT_SECONDS", "900"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
+MUSIC_OUTPUT_DIR = Path(os.environ.get("MUSIC_OUTPUT_DIR", "/app/acestep/.cache/acestep"))
 VOICES_DIR = Path(os.environ.get("VOICES_DIR", "/app/voices"))
 MAX_VOICE_UPLOAD_BYTES = int(os.environ.get("MAX_VOICE_UPLOAD_BYTES", str(50 * 1024 * 1024)))
 MAX_TRANSCRIBE_UPLOAD_BYTES = int(
@@ -80,6 +84,9 @@ MAX_MUSIC_ENHANCE_BODY_BYTES = int(
 )
 TTS_RESPONSE_FORMATS = {"wav", "mp3", "flac", "opus", "aac", "pcm"}
 MUSIC_RESPONSE_FORMATS = {"wav", "mp3", "flac"}
+SUPPORTED_TTS_ENGINES = {"qwen"}
+SUPPORTED_MUSIC_ENGINES = {"acestep"}
+SUPPORTED_SFX_ENGINES = {"mmaudio"}
 VOICE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 REQUEST_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
 TRACE_HEADER = "X-Request-ID"
@@ -93,6 +100,7 @@ OPENAI_TTS_DEFAULT_VOICE_PERSONA_ALIASES = {
 # `true` allows local single-user setups to fall back to a shared "api" user
 # when no Remote-User header is present. Disable for multi-user deployments.
 ALLOW_ANONYMOUS = os.environ.get("ALLOW_ANONYMOUS", "true").lower() in ("1", "true", "yes")
+VOCARIUM_ADMIN_USERS = os.environ.get("VOCARIUM_ADMIN_USERS", "")
 
 # Comma-separated list, or "*" for all (only safe in dev). Set per-deployment.
 _cors = os.environ.get("CORS_ORIGINS", "*").strip()
@@ -184,8 +192,7 @@ async def metrics_middleware(request: Request, call_next):
         response.headers[TRACE_HEADER] = request_id
         return response
     finally:
-        route = request.scope.get("route")
-        route_path = getattr(route, "path", request.url.path)
+        route_path = route_path_label(request.scope.get("route"))
         labels = {
             "method": request.method,
             "path": route_path,
@@ -234,6 +241,13 @@ def get_current_user(request: Request, allow_anonymous: bool = True) -> dict:
     user = get_or_create_user(username)
     user_id_var.set(user["id"])
     request.state.user = user
+    return user
+
+
+def _require_admin(request: Request) -> dict:
+    user = get_current_user(request)
+    if not is_admin_username(user["username"], VOCARIUM_ADMIN_USERS):
+        raise HTTPException(403, "Administrator access required")
     return user
 
 
@@ -302,6 +316,60 @@ def _validate_audio_format(
             f"{field} must be one of: {', '.join(sorted(allowed))}",
         )
     return fmt
+
+
+def _validate_engine(engine: str, supported: set[str], field: str = "engine") -> str:
+    value = (engine or "").strip().lower()
+    if value not in supported:
+        raise HTTPException(
+            400,
+            f"{field} must be one of: {', '.join(sorted(supported))}",
+        )
+    return value
+
+
+def _select_tts_backend(req_model: str | None, req_engine: str | None) -> tuple[str, str]:
+    engine = (req_engine or "").strip().lower()
+    if engine:
+        engine = _validate_engine(engine, SUPPORTED_TTS_ENGINES)
+    else:
+        engine = "qwen"
+
+    return TTS_URL, "qwen"
+
+
+def _validate_lufs(normalize_lufs: float | None) -> float | None:
+    if normalize_lufs is None:
+        return None
+    if normalize_lufs < -40 or normalize_lufs > 0:
+        raise HTTPException(400, "normalize_lufs must be between -40 and 0")
+    return normalize_lufs
+
+
+def _validate_fade_ms(fade_ms: int) -> int:
+    if fade_ms < 0 or fade_ms > 10000:
+        raise HTTPException(400, "fade_ms must be between 0 and 10000")
+    return fade_ms
+
+
+def _coerce_bool(value: object, field: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off", ""}:
+            return False
+    raise HTTPException(400, f"{field} must be a boolean")
+
+
+def _merge_negative_prompt(base: str, *parts: str) -> str:
+    values = [base.strip()] if base and base.strip() else []
+    values.extend(part for part in parts if part)
+    return ", ".join(values)
 
 
 def _sse_event(event: str, data: dict) -> str:
@@ -447,7 +515,7 @@ async def _unload_music():
 
 async def _unload_sfx():
     """Tell MMAudio to unload model, freeing shared GPU VRAM."""
-    await _post_unload(SFX_URL, "MMAudio", "was_loaded")
+    await _post_unload(SFX_URL, "MMAudio", "was_loaded", wait_if_busy=True)
 
 
 async def tts_request(method: str, path: str, *, url: str | None = None, **kwargs) -> tuple[int, dict, bytes]:
@@ -480,13 +548,13 @@ async def tts_json(method: str, path: str, **kwargs) -> dict:
     return json.loads(body)
 
 
-async def _run_tts_job(description: str, work_maker):
+async def _run_tts_job(description: str, work_maker, *, tts_url: str = TTS_URL):
     """Run a TTS job on the GPU TTS service via the shared GPU queue.
 
     work_maker(tts_url) → coroutine that performs the actual TTS work.
     """
     async def work():
-        return await work_maker(TTS_URL)
+        return await work_maker(tts_url)
 
     _, future = await gpu_queue.submit("tts", description, work)
     return await future
@@ -582,7 +650,7 @@ async def admin_artifact_cleanup(
 
     ``dry_run=true`` reports candidates without deleting them.
     """
-    get_current_user(request)
+    _require_admin(request)
     return await asyncio.to_thread(
         cleanup_artifacts,
         get_db(),
@@ -705,7 +773,7 @@ class SwitchModelRequest(BaseModel):
 
 @app.post("/api/models/switch")
 async def switch_model(req: SwitchModelRequest, request: Request):
-    get_current_user(request)
+    _require_admin(request)
 
     async def work():
         return await tts_json("POST", "/v1/models/load", json={"model_id": req.model_id})
@@ -799,7 +867,7 @@ async def _register_voice_on_tts(
     design_prompt: str | None = None,
 ):
     """Register a voice on every configured TTS service."""
-    urls = [TTS_URL, *EXTRA_TTS_URLS]
+    urls = _tts_registration_urls()
 
     for url in urls:
         form = aiohttp.FormData()
@@ -821,6 +889,10 @@ async def _register_voice_on_tts(
                 )
         except Exception as e:
             logger.warning("TTS registration failed on %s: %s", url, e)
+
+
+def _tts_registration_urls() -> list[str]:
+    return [TTS_URL, *EXTRA_TTS_URLS]
 
 
 def _convert_reference_audio_to_wav(audio_bytes: bytes, audio_path: Path) -> None:
@@ -1205,6 +1277,7 @@ class GenerateRequest(BaseModel):
     text: str
     voice_id: str = "default"
     model_id: str | None = None
+    engine: str | None = None
     language: str | None = None
     response_format: str = "wav"
 
@@ -1216,7 +1289,10 @@ def _verify_voice_exists(voice_id: str, user_id: int | None = None):
         return
     db = get_db()
     if user_id is not None:
-        r = db.execute("SELECT id FROM voices WHERE id=? AND user_id=?", (voice_id, user_id)).fetchone()
+        r = db.execute(
+            "SELECT id FROM voices WHERE id=? AND (user_id=? OR user_id IS NULL)",
+            (voice_id, user_id),
+        ).fetchone()
     else:
         r = db.execute("SELECT id FROM voices WHERE id=?", (voice_id,)).fetchone()
     if not r:
@@ -1236,7 +1312,10 @@ def _verify_voice_source(voice_id: str, allowed_sources: tuple[str, ...], user_i
         raise HTTPException(403, "Default voice not allowed on this endpoint")
     db = get_db()
     if user_id is not None:
-        r = db.execute("SELECT source FROM voices WHERE id=? AND user_id=?", (voice_id, user_id)).fetchone()
+        r = db.execute(
+            "SELECT source FROM voices WHERE id=? AND (user_id=? OR user_id IS NULL)",
+            (voice_id, user_id),
+        ).fetchone()
     else:
         r = db.execute("SELECT source FROM voices WHERE id=?", (voice_id,)).fetchone()
     if not r:
@@ -1257,7 +1336,7 @@ def _voice_source(voice_id: str, user_id: int | None = None) -> str:
     db = get_db()
     if user_id is not None:
         row = db.execute(
-            "SELECT source FROM voices WHERE id=? AND user_id=?",
+            "SELECT source FROM voices WHERE id=? AND (user_id=? OR user_id IS NULL)",
             (voice_id, user_id),
         ).fetchone()
     else:
@@ -1447,6 +1526,7 @@ async def generate_speech(req: GenerateRequest, request: Request):
     _require_text_limit(req.text)
     _verify_voice_exists(req.voice_id, user_id=user["id"])
     source = _voice_source(req.voice_id, user_id=user["id"])
+    selected_url, selected_engine = _select_tts_backend(req.model_id, req.engine)
 
     async def work_maker(tts_url):
         status, headers, body = await _tts_generate_for_voice(
@@ -1465,7 +1545,7 @@ async def generate_speech(req: GenerateRequest, request: Request):
         content_type = headers.get("Content-Type", headers.get("content-type", "audio/wav"))
         return {"body": body, "media_type": content_type, "headers": resp_headers}
 
-    result = await _run_tts_job("TTS Generate", work_maker)
+    result = await _run_tts_job("TTS Generate", work_maker, tts_url=selected_url)
     return Response(content=result["body"], media_type=result["media_type"], headers=result["headers"])
 
 
@@ -1721,7 +1801,7 @@ async def health():
     except Exception:
         tts_health = {"status": "unreachable"}
     gpu_resources = await get_resource_status()
-    return {"api": "ok", "tts": tts_health, "gpu_resources": gpu_resources}
+    return build_public_health(tts_health, gpu_resources)
 
 
 # ---------------------------------------------------------------------------
@@ -1729,7 +1809,9 @@ async def health():
 # ---------------------------------------------------------------------------
 class MusicGenerateRequest(BaseModel):
     prompt: str
+    engine: str = "acestep"
     lyrics: str = ""
+    negative_prompt: str = ""
     audio_duration: int = 60
     bpm: int | None = None
     key_scale: str | None = None
@@ -1738,6 +1820,10 @@ class MusicGenerateRequest(BaseModel):
     audio_format: str = "wav"
     batch_size: int = 1
     seed: int | None = None
+    instrumental: bool = False
+    loopable: bool = False
+    normalize_lufs: float | None = None
+    fade_ms: int = 0
 
 
 async def _music_request(method: str, path: str, **kwargs) -> tuple[int, bytes]:
@@ -1804,6 +1890,32 @@ def _extract_music_audio_paths(payload: object) -> list[str]:
 
     visit(payload)
     return sorted(set(paths))
+
+
+def _music_audio_content_type(path: str) -> str:
+    if path.endswith(".mp3"):
+        return "audio/mpeg"
+    if path.endswith(".wav"):
+        return "audio/wav"
+    if path.endswith(".flac"):
+        return "audio/flac"
+    return "audio/mpeg"
+
+
+def _music_audio_local_path(path: str) -> Path | None:
+    backend_root = Path("/app/acestep/.cache/acestep").resolve()
+    output_root = MUSIC_OUTPUT_DIR.resolve()
+    raw = Path(path)
+    try:
+        if raw.is_absolute():
+            relative = raw.resolve().relative_to(backend_root)
+        else:
+            relative = raw
+        local_path = (output_root / relative).resolve()
+        local_path.relative_to(output_root)
+    except (OSError, ValueError):
+        return None
+    return local_path if local_path.is_file() else None
 
 
 def _record_music_task(
@@ -1888,12 +2000,15 @@ def _require_owned_music_audio_path(user_id: int, path: str) -> None:
 async def music_generate(req: MusicGenerateRequest, request: Request):
     """Submit music generation, hold GPU lock until complete, return result."""
     user = get_current_user(request)
+    engine = _validate_engine(req.engine, SUPPORTED_MUSIC_ENGINES)
     if not req.prompt.strip():
         raise HTTPException(400, "prompt is required")
     if len(req.prompt) > 2000:
         raise HTTPException(413, "prompt too long (max 2000 characters)")
     if len(req.lyrics) > 10000:
         raise HTTPException(413, "lyrics too long (max 10000 characters)")
+    if len(req.negative_prompt) > 2000:
+        raise HTTPException(413, "negative_prompt too long (max 2000 characters)")
     if req.audio_duration < 10 or req.audio_duration > 300:
         raise HTTPException(400, "audio_duration must be between 10 and 300 seconds")
     if req.batch_size < 1 or req.batch_size > 4:
@@ -1901,9 +2016,29 @@ async def music_generate(req: MusicGenerateRequest, request: Request):
     audio_format = _validate_audio_format(
         req.audio_format, allowed=MUSIC_RESPONSE_FORMATS, field="audio_format"
     )
+    normalize_lufs = _validate_lufs(req.normalize_lufs)
+    fade_ms = _validate_fade_ms(req.fade_ms)
+
+    prompt = req.prompt
+    if req.instrumental and "instrumental" not in prompt.casefold():
+        prompt = f"{prompt}, instrumental"
+    if req.loopable and "loop" not in prompt.casefold():
+        prompt = f"{prompt}, seamless loop"
+    negative_prompt = _merge_negative_prompt(
+        req.negative_prompt,
+        "vocals, singing, speech" if req.instrumental else "",
+    )
+    vocarium_options = {
+        "engine": engine,
+        "negative_prompt": req.negative_prompt,
+        "instrumental": req.instrumental,
+        "loopable": req.loopable,
+        "normalize_lufs": normalize_lufs,
+        "fade_ms": fade_ms,
+    }
 
     payload = {
-        "prompt": req.prompt,
+        "prompt": prompt,
         "lyrics": req.lyrics,
         "audio_duration": req.audio_duration,
         "thinking": req.thinking,
@@ -1918,6 +2053,8 @@ async def music_generate(req: MusicGenerateRequest, request: Request):
         payload["key_scale"] = req.key_scale
     if req.time_signature is not None:
         payload["time_signature"] = req.time_signature
+    if negative_prompt:
+        payload["negative_prompt"] = negative_prompt
     if req.seed is not None:
         payload["seed"] = req.seed
         payload["use_random_seed"] = False
@@ -1932,7 +2069,10 @@ async def music_generate(req: MusicGenerateRequest, request: Request):
         submit_result = json.loads(body)
         task_id = submit_result.get("data", {}).get("task_id")
         if not task_id:
-            return submit_result  # no task_id means immediate result or error
+            return {
+                "submit": submit_result,
+                "vocarium_options": vocarium_options,
+            }  # no task_id means immediate result or error
         _record_music_task(user["id"], task_id, "submitted")
 
         # Poll until complete (holds GPU lock)
@@ -1948,7 +2088,11 @@ async def music_generate(req: MusicGenerateRequest, request: Request):
             task = tasks[0]
             if task.get("status") == 1:  # success
                 _sync_music_tasks_from_poll(user["id"], poll)
-                return {"submit": submit_result, "result": poll}
+                return {
+                    "submit": submit_result,
+                    "result": poll,
+                    "vocarium_options": vocarium_options,
+                }
             if task.get("status") == 2:  # failed
                 _record_music_task(user["id"], task_id, "failed")
                 raise HTTPException(500, "Music generation failed")
@@ -1992,19 +2136,16 @@ async def music_audio(path: str, request: Request):
     path = _normalize_music_audio_path(path)
     assert path is not None
     _require_owned_music_audio_path(user["id"], path)
+    local_path = _music_audio_local_path(path)
+    if local_path is not None:
+        return FileResponse(
+            str(local_path),
+            media_type=_music_audio_content_type(path),
+        )
     status, body = await _music_request("GET", "/v1/audio", params={"path": path})
     if status >= 400:
         raise HTTPException(status, body.decode(errors="replace"))
-    # Guess content type from path
-    if path.endswith(".mp3"):
-        ct = "audio/mpeg"
-    elif path.endswith(".wav"):
-        ct = "audio/wav"
-    elif path.endswith(".flac"):
-        ct = "audio/flac"
-    else:
-        ct = "audio/mpeg"
-    return Response(content=body, media_type=ct)
+    return Response(content=body, media_type=_music_audio_content_type(path))
 
 
 @app.post("/api/music/enhance")
@@ -2040,7 +2181,12 @@ async def music_health():
 # Sound Effects (MMAudio)
 # ---------------------------------------------------------------------------
 async def _sfx_request(method: str, path: str, **kwargs) -> tuple[int, bytes]:
-    timeout = aiohttp.ClientTimeout(total=300, sock_connect=30, sock_read=300)
+    timeout_seconds = SFX_GENERATE_TIMEOUT_SECONDS if path == "/generate" else 30
+    timeout = aiohttp.ClientTimeout(
+        total=timeout_seconds,
+        sock_connect=30,
+        sock_read=timeout_seconds,
+    )
     start = time.perf_counter()
     status = 0
     try:
@@ -2069,22 +2215,49 @@ async def sfx_generate(request: Request):
         raise HTTPException(400, "prompt is required")
     if len(prompt) > 1000:
         raise HTTPException(413, "prompt too long (max 1000 characters)")
+    engine = (body.get("engine") or "mmaudio").strip().lower()
+    engine = _validate_engine(engine, SUPPORTED_SFX_ENGINES)
     negative_prompt = (body.get("negative_prompt") or "").strip()
     if len(negative_prompt) > 1000:
         raise HTTPException(413, "negative_prompt too long (max 1000 characters)")
+    no_speech = _coerce_bool(body.get("no_speech", False), "no_speech")
+    no_music = _coerce_bool(body.get("no_music", False), "no_music")
 
     try:
         duration = float(body.get("duration", 8.0))
         cfg_strength = float(body.get("cfg_strength", 4.5))
         num_steps = int(body.get("num_steps", 25))
+        normalize_lufs = (
+            None
+            if body.get("normalize_lufs") is None
+            else float(body.get("normalize_lufs"))
+        )
+        fade_ms = int(body.get("fade_ms", 0))
     except (TypeError, ValueError):
-        raise HTTPException(400, "duration, cfg_strength, and num_steps must be numeric")
+        raise HTTPException(
+            400,
+            "duration, cfg_strength, num_steps, normalize_lufs, and fade_ms must be numeric",
+        )
     if duration < 1 or duration > 30:
         raise HTTPException(400, "duration must be between 1 and 30 seconds")
     if cfg_strength < 1 or cfg_strength > 10:
         raise HTTPException(400, "cfg_strength must be between 1 and 10")
     if num_steps < 1 or num_steps > 100:
         raise HTTPException(400, "num_steps must be between 1 and 100")
+    normalize_lufs = _validate_lufs(normalize_lufs)
+    fade_ms = _validate_fade_ms(fade_ms)
+    negative_prompt = _merge_negative_prompt(
+        negative_prompt,
+        "speech, voice, vocals, talking" if no_speech else "",
+        "music, melody, song, vocals" if no_music else "",
+    )
+    vocarium_options = {
+        "engine": engine,
+        "no_speech": no_speech,
+        "no_music": no_music,
+        "normalize_lufs": normalize_lufs,
+        "fade_ms": fade_ms,
+    }
 
     sfx_params = {
         "prompt": prompt,
@@ -2096,7 +2269,18 @@ async def sfx_generate(request: Request):
     }
 
     async def work():
-        status, resp_body = await _sfx_request("POST", "/generate", json=sfx_params)
+        try:
+            status, resp_body = await _sfx_request("POST", "/generate", json=sfx_params)
+        except asyncio.TimeoutError as exc:
+            raise HTTPException(
+                504,
+                f"SFX backend timed out after {SFX_GENERATE_TIMEOUT_SECONDS}s while loading or generating audio",
+            ) from exc
+        except aiohttp.ClientError as exc:
+            raise HTTPException(
+                502,
+                f"SFX backend connection failed: {exc}",
+            ) from exc
         if status >= 400:
             raise HTTPException(status, detail=resp_body.decode(errors="replace"))
         return resp_body
@@ -2106,7 +2290,10 @@ async def sfx_generate(request: Request):
     return Response(
         content=wav_bytes,
         media_type="audio/wav",
-        headers={"Content-Disposition": "attachment; filename=sfx.wav"},
+        headers={
+            "Content-Disposition": "attachment; filename=sfx.wav",
+            "X-Vocarium-Options": json.dumps(vocarium_options),
+        },
     )
 
 
@@ -2130,18 +2317,41 @@ class OpenAISpeechRequest(BaseModel):
     input: str
     voice: str = "default"
     response_format: str = "wav"
+    engine: str | None = None
     speed: float = 1.0  # ignored, kept for compat
 
 
-def _normalize_openai_tts_voice(voice: str) -> str:
-    """Map SUB/WAVE persona labels to the only built-in OpenAI TTS voice.
+def _openai_voice_lookup_key(value: str) -> str:
+    return re.sub(r"[\s_-]+", " ", (value or "").strip()).casefold()
+
+
+def _resolve_openai_tts_voice(voice: str, user_id: int | None = None) -> str:
+    """Resolve OpenAI-compatible voice input to a concrete Vocarium voice id.
 
     Persona names belong in the caller's script/persona fields. The
-    OpenAI-compatible voice field stays a concrete Vocarium voice id.
+    OpenAI-compatible voice field should be a concrete Vocarium voice id, but
+    some clients send the displayed voice name back instead of the listed id.
+    Stored user voices win over persona aliases.
     """
     cleaned = (voice or "").strip()
     if not cleaned:
         return "default"
+
+    lookup_key = _openai_voice_lookup_key(cleaned)
+    db = get_db()
+    if user_id is not None:
+        rows = db.execute("SELECT id, name FROM voices WHERE user_id=?", (user_id,)).fetchall()
+        rows += db.execute("SELECT id, name FROM voices WHERE user_id IS NULL").fetchall()
+    else:
+        rows = db.execute("SELECT id, name FROM voices").fetchall()
+
+    for voice_id, name in rows:
+        if cleaned == (voice_id or ""):
+            return voice_id
+    for voice_id, name in rows:
+        if lookup_key == _openai_voice_lookup_key(name or ""):
+            return voice_id
+
     normalized = re.sub(r"[\s_-]+", " ", cleaned).casefold()
     compact = re.sub(r"[\s_-]+", "", cleaned).casefold()
     if (
@@ -2165,6 +2375,7 @@ async def _openai_speech_proxy(
     )
     requested_voice = (req.voice or "").strip()
     voice = voice_override or _normalize_openai_tts_voice(req.voice)
+    selected_url, selected_engine = _select_tts_backend(req.model, req.engine)
     payload = {
         "input": req.input,
         "voice": voice,
@@ -2178,7 +2389,9 @@ async def _openai_speech_proxy(
         payload["model_id"] = req.model
 
     async def work_maker(tts_url):
-        status, headers, body = await tts_request("POST", "/v1/audio/speech", url=tts_url, json=payload)
+        status, headers, body = await tts_request(
+            "POST", "/v1/audio/speech", url=selected_url, json=payload
+        )
         if status >= 400:
             raise HTTPException(status, body.decode(errors="replace"))
         if voice not in ("default", ""):
@@ -2194,6 +2407,7 @@ async def _openai_speech_proxy(
 
     result = await _run_tts_job(description, work_maker)
     headers = {}
+    headers["X-TTS-Engine"] = selected_engine
     if result.get("voice") and result["voice"] != requested_voice:
         headers["X-Voice"] = result["voice"]
         headers["X-Requested-Voice"] = requested_voice
@@ -2208,7 +2422,7 @@ async def openai_tts(req: OpenAISpeechRequest, request: Request):
     Designed voices live behind ``/v1/audio/speech/designed``.
     """
     user = get_current_user(request, allow_anonymous=True)
-    voice = _normalize_openai_tts_voice(req.voice)
+    voice = _resolve_openai_tts_voice(req.voice, user_id=user["id"])
     _verify_voice_source(voice, allowed_sources=("clone",), user_id=user["id"])
     return await _openai_speech_proxy(
         req,
@@ -2225,8 +2439,13 @@ async def openai_tts_designed(req: OpenAISpeechRequest, request: Request):
     OpenAI-compatible endpoint. Cloned and default base voices are rejected.
     """
     user = get_current_user(request, allow_anonymous=True)
-    _verify_voice_source(req.voice, allowed_sources=("design",), user_id=user["id"])
-    return await _openai_speech_proxy(req, "OpenAI TTS (designed)")
+    voice = _resolve_openai_tts_voice(req.voice, user_id=user["id"])
+    _verify_voice_source(voice, allowed_sources=("design",), user_id=user["id"])
+    return await _openai_speech_proxy(
+        req,
+        "OpenAI TTS (designed)",
+        voice_override=voice,
+    )
 
 
 @app.post("/v1/audio/transcriptions")
@@ -2270,17 +2489,22 @@ async def openai_stt(
 @app.get("/v1/models")
 async def openai_models():
     """OpenAI-compatible model listing for TTS/STT."""
-    return {
-        "object": "list",
-        "data": [
-            {"id": "tts-1", "object": "model", "owned_by": "vocarium",
-             "description": "Qwen3-TTS 1.7B (GPU)"},
-            {"id": "tts-1-hd", "object": "model", "owned_by": "vocarium",
-             "description": "Qwen3-TTS 1.7B (GPU)"},
-            {"id": "whisper-1", "object": "model", "owned_by": "vocarium",
-             "description": "Qwen3-ASR 0.6B"},
-        ],
-    }
+    models = [
+        {"id": "tts-1", "object": "model", "owned_by": "vocarium",
+         "description": "Qwen3-TTS 1.7B (GPU)"},
+        {"id": "tts-1-hd", "object": "model", "owned_by": "vocarium",
+         "description": "Qwen3-TTS 1.7B (GPU)"},
+        {"id": "whisper-1", "object": "model", "owned_by": "vocarium",
+         "description": "Qwen3-ASR 0.6B"},
+    ]
+    return {"object": "list", "data": models}
+
+
+@app.get("/v1/audio/models")
+async def openai_audio_models():
+    """Open WebUI-compatible TTS model listing."""
+    data = await openai_models()
+    return {"models": data["data"]}
 
 
 @app.get("/v1/voices")
@@ -2309,6 +2533,8 @@ async def openai_voices(request: Request, source: str | None = Query(default=Non
             "source": "clone",
         })
     for r in rows:
+        if r[0] == "default" and source in (None, "clone"):
+            continue
         voices.append({
             "voice_id": r[0],
             "name": r[1],
@@ -2316,6 +2542,23 @@ async def openai_voices(request: Request, source: str | None = Query(default=Non
             "source": r[3],
         })
     return {"voices": voices}
+
+
+@app.get("/v1/audio/voices")
+async def openai_audio_voices(request: Request):
+    """Open WebUI-compatible voice listing for the base /speech endpoint."""
+    data = await openai_voices(request, source="clone")
+    return {
+        "voices": [
+            {
+                "id": voice["voice_id"],
+                "name": voice["name"],
+                "language": voice.get("language"),
+                "source": voice.get("source"),
+            }
+            for voice in data.get("voices", [])
+        ]
+    }
 
 
 class PersonaRequest(BaseModel):

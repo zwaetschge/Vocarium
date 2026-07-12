@@ -6,6 +6,7 @@ Dynamically calculates GPU memory utilization based on available VRAM
 so it can coexist with TTS on the same GPU.
 """
 
+import asyncio
 import os
 import signal
 import subprocess
@@ -30,8 +31,13 @@ MIN_FREE_MIB = 2500
 
 process: subprocess.Popen | None = None
 last_used: float = 0.0
-lock = threading.Lock()
+lock = threading.Condition(threading.RLock())
 idle_timer: threading.Timer | None = None
+active_requests = 0
+backend_ready = False
+backend_starting = False
+last_start_error: str | None = None
+_http_client: httpx.AsyncClient | None = None
 
 app = FastAPI(title="ASR Proxy")
 
@@ -65,10 +71,22 @@ def _get_total_vram_mib() -> int:
     return 12288  # fallback: 12GB
 
 
+def _client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(600.0, connect=30.0),
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
+    return _http_client
+
+
 def start_backend():
-    global process
+    global process, backend_ready
     if process is not None and process.poll() is None:
         return
+
+    backend_ready = False
 
     free_mib = _get_free_vram_mib()
     total_mib = _get_total_vram_mib()
@@ -107,20 +125,23 @@ def start_backend():
         time.sleep(2)
         if process.poll() is not None:
             exit_code = process.returncode
-            process = None
+            stop_backend()
             raise RuntimeError(f"vLLM process died with code {exit_code}")
         try:
             r = httpx.get(f"http://{BACKEND_HOST}:{BACKEND_PORT}/v1/models", timeout=2)
             if r.status_code == 200:
+                backend_ready = True
                 print(f"vLLM backend ready after {(i+1)*2}s", flush=True)
                 return
-        except httpx.ConnectError:
+        except httpx.HTTPError:
             pass
+    stop_backend()
     raise RuntimeError("vLLM backend did not become ready in 240s")
 
 
 def stop_backend():
-    global process
+    global process, backend_ready
+    backend_ready = False
     if process is None or process.poll() is not None:
         process = None
         return
@@ -146,7 +167,7 @@ def schedule_unload():
         with lock:
             if process is not None and process.poll() is None:
                 elapsed = time.time() - last_used
-                if elapsed >= IDLE_TIMEOUT:
+                if active_requests == 0 and backend_ready and elapsed >= IDLE_TIMEOUT:
                     stop_backend()
 
     idle_timer = threading.Timer(IDLE_TIMEOUT, _check)
@@ -154,12 +175,64 @@ def schedule_unload():
     idle_timer.start()
 
 
-def ensure_backend():
-    global last_used
+def acquire_backend() -> None:
+    global active_requests, backend_starting, last_used, last_start_error
     with lock:
-        start_backend()
+        waited_for_start = False
+        while backend_starting:
+            waited_for_start = True
+            lock.wait()
+        if waited_for_start and last_start_error:
+            raise RuntimeError(last_start_error)
+        needs_start = not (
+            backend_ready and process is not None and process.poll() is None
+        )
+        # Reserve the lifecycle while starting or claiming the ready backend,
+        # so a manual unload cannot slip in before active_requests increments.
+        backend_starting = True
+    if needs_start:
+        try:
+            start_backend()
+        except Exception as exc:
+            with lock:
+                last_start_error = str(exc)
+                backend_starting = False
+                lock.notify_all()
+            raise
+    with lock:
+        last_start_error = None
+        active_requests += 1
+        last_used = time.time()
+        backend_starting = False
+        lock.notify_all()
+
+
+def release_backend() -> None:
+    global active_requests, last_used
+    with lock:
+        active_requests = max(0, active_requests - 1)
         last_used = time.time()
     schedule_unload()
+
+
+def _unload_if_idle() -> dict:
+    with lock:
+        if active_requests > 0:
+            return {
+                "status": "busy",
+                "was_running": process is not None and process.poll() is None,
+                "active_requests": active_requests,
+            }
+        if backend_starting:
+            return {
+                "status": "busy",
+                "was_running": process is not None and process.poll() is None,
+                "active_requests": active_requests,
+                "backend_starting": True,
+            }
+        was_running = process is not None and process.poll() is None
+        stop_backend()
+        return {"status": "unloaded", "was_running": was_running}
 
 
 @app.get("/health")
@@ -169,6 +242,10 @@ async def health():
         "status": "ok",
         "service": "qwen3-asr-proxy",
         "backend_running": running,
+        "backend_ready": backend_ready,
+        "backend_starting": backend_starting,
+        "active_requests": active_requests,
+        "last_start_error": last_start_error,
         "model": MODEL,
         "idle_timeout": IDLE_TIMEOUT,
     }
@@ -177,29 +254,36 @@ async def health():
 @app.post("/unload")
 async def unload():
     """Unload vLLM backend to free GPU memory for other services."""
-    with lock:
-        was_running = process is not None and process.poll() is None
-        stop_backend()
-    return {"status": "unloaded", "was_running": was_running}
+    return await asyncio.to_thread(_unload_if_idle)
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    global _http_client
+    if _http_client is not None and not _http_client.is_closed:
+        await _http_client.aclose()
+    _http_client = None
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy(request: Request, path: str):
-    ensure_backend()
+    await asyncio.to_thread(acquire_backend)
 
     url = f"http://{BACKEND_HOST}:{BACKEND_PORT}/{path}"
     body = await request.body()
     headers = dict(request.headers)
     headers.pop("host", None)
 
-    async with httpx.AsyncClient(timeout=300) as client:
-        resp = await client.request(
+    try:
+        resp = await _client().request(
             method=request.method,
             url=url,
             content=body,
             headers=headers,
-            params=dict(request.query_params),
+            params=list(request.query_params.multi_items()),
         )
+    finally:
+        await asyncio.to_thread(release_backend)
 
     # Filter hop-by-hop and server headers to avoid duplicates with uvicorn
     skip = {"server", "date", "transfer-encoding", "connection", "content-length", "content-encoding"}

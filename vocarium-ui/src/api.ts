@@ -182,6 +182,7 @@ export async function generate(data: {
   text: string;
   voice_id: string;
   model_id?: string;
+  engine?: string;
   language?: string;
   response_format?: string;
 }): Promise<{ blob: Blob; meta: { audioDuration: string; generationTime: string; rtf: string; model: string; voice: string } }> {
@@ -221,7 +222,7 @@ export interface StreamDone {
 }
 
 export async function generateStream(
-  data: { text: string; voice_id: string; model_id?: string; language?: string },
+  data: { text: string; voice_id: string; model_id?: string; engine?: string; language?: string },
   onChunk: (chunk: StreamChunk) => void,
   onDone: (meta: StreamDone) => void,
   onError: (error: string) => void,

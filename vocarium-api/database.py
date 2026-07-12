@@ -12,6 +12,7 @@ from pathlib import Path
 from metrics import observe
 
 _db: sqlite3.Connection | None = None
+_db_path: Path | None = None
 
 # Mirrors BUILTIN_SPEAKERS in qwen3-tts/server.py. Every user gets one saved
 # custom-voice preset per speaker on first creation so hosts/podcasts work
@@ -72,14 +73,33 @@ def _sql_operation(sql: str) -> str:
     return "unknown"
 
 
-def init_db(db_path: Path):
-    global _db
-    _db = sqlite3.connect(
-        str(db_path), check_same_thread=False, factory=InstrumentedConnection
+def _connect_database(
+    db_path: Path,
+    *,
+    row_factory=None,  # type: ignore[no-untyped-def]
+    isolation_level: str | None = "",
+) -> sqlite3.Connection:
+    connection = sqlite3.connect(
+        str(db_path),
+        check_same_thread=False,
+        factory=InstrumentedConnection,
+        isolation_level=isolation_level,
     )
-    _db.execute("PRAGMA journal_mode=WAL")
-    _db.execute("PRAGMA busy_timeout=5000")
-    _db.execute("PRAGMA foreign_keys=ON")
+    try:
+        connection.row_factory = row_factory
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA busy_timeout=5000")
+        connection.execute("PRAGMA foreign_keys=ON")
+        return connection
+    except Exception:
+        connection.close()
+        raise
+
+
+def init_db(db_path: Path):
+    global _db, _db_path
+    _db_path = Path(db_path)
+    _db = _connect_database(_db_path)
 
     _db.executescript("""
         CREATE TABLE IF NOT EXISTS users (
@@ -572,11 +592,12 @@ def _backfill_podcast_embedding_blobs() -> None:
         )
 
 
-def seed_prebuilt_custom_voices(user_id: int) -> int:
+def _seed_prebuilt_custom_voices(
+    db: sqlite3.Connection, user_id: int
+) -> int:
     """Insert one saved custom-voice preset per built-in speaker for a user.
     Idempotent: skips speakers that already exist as saved voices for this user.
     Returns the number of rows inserted."""
-    db = get_db()
     existing = {
         row[0]
         for row in db.execute(
@@ -596,6 +617,13 @@ def seed_prebuilt_custom_voices(user_id: int) -> int:
             (str(uuid.uuid4()), user_id, name, language, speaker_id, instruct),
         )
         inserted += 1
+    return inserted
+
+
+def seed_prebuilt_custom_voices(user_id: int) -> int:
+    """Seed built-in custom voices and commit any inserted presets."""
+    db = get_db()
+    inserted = _seed_prebuilt_custom_voices(db, user_id)
     if inserted:
         db.commit()
     return inserted
@@ -629,11 +657,10 @@ _BUILTIN_HOST_PROFILES: dict[str, tuple[str, str, str]] = {
 }
 
 
-def seed_prebuilt_hosts(user_id: int) -> int:
+def _seed_prebuilt_hosts(db: sqlite3.Connection, user_id: int) -> int:
     """Create a preset podcast host for every custom-voice speaker a user owns.
     Idempotent: skips if a host with the same name already exists for this user.
     Returns the number of hosts inserted."""
-    db = get_db()
     # Find this user's custom voices that correspond to built-in speakers
     rows = db.execute(
         "SELECT id, name, speaker FROM voices WHERE user_id=? AND source='custom'",
@@ -670,7 +697,15 @@ def seed_prebuilt_hosts(user_id: int) -> int:
         )
         inserted += 1
 
-    if inserted or db.total_changes > 0:
+    return inserted
+
+
+def seed_prebuilt_hosts(user_id: int) -> int:
+    """Seed built-in podcast hosts and commit any inserted or linked hosts."""
+    db = get_db()
+    changes_before = db.total_changes
+    inserted = _seed_prebuilt_hosts(db, user_id)
+    if db.total_changes > changes_before:
         db.commit()
     return inserted
 
@@ -704,12 +739,61 @@ def get_or_create_user(username: str) -> dict:
     row = db.execute("SELECT id, username, display_name, created_at FROM users WHERE username=?", (username,)).fetchone()
     if row:
         return {"id": row[0], "username": row[1], "display_name": row[2] or row[1], "created_at": row[3]}
-    db.execute("INSERT INTO users (username, display_name) VALUES (?, ?)", (username, username))
-    db.commit()
-    row = db.execute("SELECT id, username, display_name, created_at FROM users WHERE username=?", (username,)).fetchone()
-    seed_prebuilt_custom_voices(row[0])
-    seed_prebuilt_hosts(row[0])
-    return {"id": row[0], "username": row[1], "display_name": row[2] or row[1], "created_at": row[3]}
+    owned_db = _open_user_creation_connection(db)
+    try:
+        owned_db.execute("BEGIN IMMEDIATE")
+        row = owned_db.execute(
+            "SELECT id, username, display_name, created_at FROM users WHERE username=?",
+            (username,),
+        ).fetchone()
+        if row:
+            owned_db.commit()
+            return {
+                "id": row[0],
+                "username": row[1],
+                "display_name": row[2] or row[1],
+                "created_at": row[3],
+            }
+        cursor = owned_db.execute(
+            "INSERT OR IGNORE INTO users (username, display_name) VALUES (?, ?)",
+            (username, username),
+        )
+        created = cursor.rowcount == 1
+        row = owned_db.execute(
+            "SELECT id, username, display_name, created_at FROM users WHERE username=?",
+            (username,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("User insert completed without a readable row")
+        if created:
+            _seed_prebuilt_custom_voices(owned_db, row[0])
+            _seed_prebuilt_hosts(owned_db, row[0])
+        owned_db.commit()
+    except Exception:
+        owned_db.rollback()
+        raise
+    finally:
+        owned_db.close()
+    return {
+        "id": row[0],
+        "username": row[1],
+        "display_name": row[2] or row[1],
+        "created_at": row[3],
+    }
+
+
+def _open_user_creation_connection(
+    main_db: sqlite3.Connection,
+) -> sqlite3.Connection:
+    if _db_path is None or str(_db_path) == ":memory:":
+        raise RuntimeError(
+            "User creation requires an initialized file-backed database"
+        )
+    return _connect_database(
+        _db_path,
+        row_factory=main_db.row_factory,
+        isolation_level=main_db.isolation_level,
+    )
 
 
 def backfill_hosts_for_all_users() -> int:
