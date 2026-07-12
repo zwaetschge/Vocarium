@@ -54,6 +54,15 @@ last_activity = time.time()
 backend_starting = False
 backend_started_at: float | None = None
 last_start_error: str | None = None
+active_requests = 0
+_http_session: aiohttp.ClientSession | None = None
+
+
+def _session() -> aiohttp.ClientSession:
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        _http_session = aiohttp.ClientSession()
+    return _http_session
 
 
 def start_backend():
@@ -146,6 +155,34 @@ async def ensure_backend():
         backend_starting = False
 
 
+async def _acquire_backend() -> None:
+    global active_requests, last_activity
+    await ensure_backend()
+    with lock:
+        active_requests += 1
+        last_activity = time.time()
+
+
+def _release_backend() -> None:
+    global active_requests, last_activity
+    with lock:
+        active_requests = max(0, active_requests - 1)
+        last_activity = time.time()
+
+
+def _unload_if_idle() -> dict:
+    with lock:
+        if active_requests > 0:
+            return {
+                "status": "busy",
+                "was_running": process is not None and process.poll() is None,
+                "active_requests": active_requests,
+            }
+        was_running = process is not None and process.poll() is None
+        stop_backend()
+        return {"status": "unloaded", "was_running": was_running}
+
+
 # ---------------------------------------------------------------------------
 # Idle shutdown
 # ---------------------------------------------------------------------------
@@ -157,7 +194,7 @@ async def idle_watcher():
             continue
         with lock:
             if process is not None and process.poll() is None:
-                if time.time() - last_activity > IDLE_TIMEOUT:
+                if active_requests == 0 and time.time() - last_activity > IDLE_TIMEOUT:
                     print(f"ACE-Step idle for {IDLE_TIMEOUT}s, stopping to free GPU", flush=True)
                     stop_backend()
 
@@ -174,10 +211,15 @@ async def startup():
 @app.post("/unload")
 async def unload():
     """Unload ACE-Step backend to free GPU memory."""
-    with lock:
-        was_running = process is not None and (process.poll() is None if process else False)
-        stop_backend()
-    return {"status": "unloaded", "was_running": was_running}
+    return await asyncio.to_thread(_unload_if_idle)
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    global _http_session
+    if _http_session is not None and not _http_session.closed:
+        await _http_session.close()
+    _http_session = None
 
 
 @app.get("/health")
@@ -190,6 +232,7 @@ async def health():
         "backend_starting": backend_starting,
         "backend_started_at": backend_started_at,
         "last_start_error": last_start_error,
+        "active_requests": active_requests,
         "first_load": {
             "may_download": not running,
             "startup_timeout_seconds": STARTUP_TIMEOUT_SECONDS,
@@ -201,77 +244,84 @@ async def health():
 @app.post("/release_task")
 async def release_task(request: Request):
     """Proxy to ACE-Step /release_task — starts backend if needed."""
-    await ensure_backend()
-    body = await request.body()
-    timeout = aiohttp.ClientTimeout(total=60)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(f"{BACKEND_URL}/release_task", data=body,
-                                headers={"Content-Type": "application/json"}) as resp:
+    await _acquire_backend()
+    try:
+        body = await request.body()
+        timeout = aiohttp.ClientTimeout(total=60)
+        async with _session().post(f"{BACKEND_URL}/release_task", data=body,
+                                   headers={"Content-Type": "application/json"},
+                                   timeout=timeout) as resp:
             data = await resp.read()
             return Response(content=data, status_code=resp.status,
                             media_type=resp.content_type)
+    finally:
+        _release_backend()
 
 
 @app.post("/query_result")
 async def query_result(request: Request):
     """Proxy to ACE-Step /query_result."""
-    global last_activity
-    last_activity = time.time()
-    if process is None or process.poll() is not None:
-        raise HTTPException(503, "ACE-Step backend not running")
-    body = await request.body()
-    timeout = aiohttp.ClientTimeout(total=QUERY_RESULT_TIMEOUT_SECONDS)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(f"{BACKEND_URL}/query_result", data=body,
-                                headers={"Content-Type": "application/json"}) as resp:
+    await _acquire_backend()
+    try:
+        body = await request.body()
+        timeout = aiohttp.ClientTimeout(total=QUERY_RESULT_TIMEOUT_SECONDS)
+        async with _session().post(f"{BACKEND_URL}/query_result", data=body,
+                                   headers={"Content-Type": "application/json"},
+                                   timeout=timeout) as resp:
             data = await resp.read()
             return Response(content=data, status_code=resp.status,
                             media_type=resp.content_type)
+    finally:
+        _release_backend()
 
 
 @app.get("/v1/audio")
 async def get_audio(path: str):
     """Proxy to ACE-Step /v1/audio — download generated audio."""
-    global last_activity
-    last_activity = time.time()
-    if process is None or process.poll() is not None:
-        raise HTTPException(503, "ACE-Step backend not running")
-    timeout = aiohttp.ClientTimeout(total=120)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(f"{BACKEND_URL}/v1/audio", params={"path": path}) as resp:
+    await _acquire_backend()
+    try:
+        timeout = aiohttp.ClientTimeout(total=120)
+        async with _session().get(f"{BACKEND_URL}/v1/audio", params={"path": path},
+                                  timeout=timeout) as resp:
             if resp.status >= 400:
                 body = await resp.read()
                 raise HTTPException(resp.status, body.decode(errors="replace"))
             data = await resp.read()
             ct = resp.headers.get("Content-Type", "audio/mpeg")
             return Response(content=data, media_type=ct)
+    finally:
+        _release_backend()
 
 
 @app.post("/format_input")
 async def format_input(request: Request):
     """Proxy to ACE-Step /format_input — enhance caption/lyrics via LM."""
-    await ensure_backend()
-    body = await request.body()
-    timeout = aiohttp.ClientTimeout(total=60)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(f"{BACKEND_URL}/format_input", data=body,
-                                headers={"Content-Type": "application/json"}) as resp:
+    await _acquire_backend()
+    try:
+        body = await request.body()
+        timeout = aiohttp.ClientTimeout(total=60)
+        async with _session().post(f"{BACKEND_URL}/format_input", data=body,
+                                   headers={"Content-Type": "application/json"},
+                                   timeout=timeout) as resp:
             data = await resp.read()
             return Response(content=data, status_code=resp.status,
                             media_type=resp.content_type)
+    finally:
+        _release_backend()
 
 
 @app.get("/v1/models")
 async def list_models():
     """Proxy to ACE-Step /v1/models."""
-    if process is None or process.poll() is not None:
-        return {"models": [], "backend_running": False}
-    timeout = aiohttp.ClientTimeout(total=10)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(f"{BACKEND_URL}/v1/models") as resp:
+    await _acquire_backend()
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with _session().get(f"{BACKEND_URL}/v1/models", timeout=timeout) as resp:
             data = await resp.read()
             return Response(content=data, status_code=resp.status,
                             media_type=resp.content_type)
+    finally:
+        _release_backend()
 
 
 if __name__ == "__main__":
