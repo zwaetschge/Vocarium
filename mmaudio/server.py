@@ -199,6 +199,7 @@ def _generate_sfx_blocking(req: GenerateRequest) -> tuple[bytes, float, int]:
 
         try:
             seq_cfg.duration = req.duration
+            fm.num_steps = req.num_steps
             net.update_seq_lengths(
                 seq_cfg.latent_seq_len, seq_cfg.clip_seq_len, seq_cfg.sync_seq_len
             )
@@ -223,13 +224,13 @@ def _generate_sfx_blocking(req: GenerateRequest) -> tuple[bytes, float, int]:
                 )
             gen_time = time.time() - start
             sampling_rate = seq_cfg.sampling_rate
+            audio = audios.float().detach().cpu()[0]  # may be 1D or 2D
 
         except Exception as exc:
             _unload_model()
             _schedule_process_exit("generation failed")
             raise RuntimeError(f"Generation failed: {exc}") from exc
 
-    audio = audios.float().detach().cpu()[0]  # may be 1D or 2D
     if audio.dim() == 1:
         audio = audio.unsqueeze(0)  # (1, samples)
     elif audio.dim() > 2:
@@ -245,8 +246,16 @@ def _generate_sfx_blocking(req: GenerateRequest) -> tuple[bytes, float, int]:
 @app.post("/generate")
 async def generate_sfx(req: GenerateRequest):
     """Generate a sound effect from a text prompt. Returns WAV audio."""
+    if not req.prompt.strip():
+        raise HTTPException(400, "Prompt is required")
+    if len(req.prompt) > 1000 or len(req.negative_prompt) > 1000:
+        raise HTTPException(413, "Prompt fields must be at most 1000 characters")
     if req.duration < 1 or req.duration > 30:
         raise HTTPException(400, "Duration must be between 1 and 30 seconds")
+    if req.cfg_strength < 1 or req.cfg_strength > 10:
+        raise HTTPException(400, "cfg_strength must be between 1 and 10")
+    if req.num_steps < 1 or req.num_steps > 100:
+        raise HTTPException(400, "num_steps must be between 1 and 100")
 
     try:
         wav_bytes, gen_time, sampling_rate = await asyncio.to_thread(
