@@ -7,6 +7,7 @@ Generates sound effects from text prompts using MMAudio large_44k_v2.
 import io
 import gc
 import hashlib
+import json
 import os
 from pathlib import Path
 import shutil
@@ -65,15 +66,63 @@ def _file_md5(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _verification_path(path: Path) -> Path:
+    return path.with_suffix(f"{path.suffix}.verified.json")
+
+
+def _write_verification(path: Path, expected_md5: str) -> None:
+    stat = path.stat()
+    marker = _verification_path(path)
+    temporary = marker.with_suffix(f"{marker.suffix}.tmp")
+    temporary.write_text(
+        json.dumps(
+            {
+                "file": path.name,
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+                "md5": expected_md5,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    temporary.replace(marker)
+
+
+def _is_verified(path: Path, expected_md5: str) -> bool:
+    try:
+        stat = path.stat()
+        data = json.loads(_verification_path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return False
+    return (
+        data.get("file") == path.name
+        and data.get("size") == stat.st_size
+        and data.get("mtime_ns") == stat.st_mtime_ns
+        and data.get("md5") == expected_md5
+    )
+
+
+def _verify_and_mark(path: Path, expected_md5: str) -> bool:
+    if _is_verified(path, expected_md5):
+        return True
+    if not path.exists() or _file_md5(path) != expected_md5:
+        return False
+    _write_verification(path, expected_md5)
+    return True
+
+
 def _download_model_file(path: Path, url: str, expected_md5: str) -> None:
     """Download a model file resumably and publish it only after verification."""
-    if path.exists() and _file_md5(path) == expected_md5:
+    if _verify_and_mark(path, expected_md5):
         return
 
     path.parent.mkdir(parents=True, exist_ok=True)
     partial = path.with_suffix(f"{path.suffix}.part")
     if partial.exists() and _file_md5(partial) == expected_md5:
         partial.replace(path)
+        _write_verification(path, expected_md5)
         return
     retry = Retry(
         total=5,
@@ -103,6 +152,7 @@ def _download_model_file(path: Path, url: str, expected_md5: str) -> None:
                     partial.unlink(missing_ok=True)
                     raise RuntimeError(f"Checksum mismatch for {path.name}")
                 partial.replace(path)
+                _write_verification(path, expected_md5)
                 return
             except (OSError, requests.RequestException, RuntimeError):
                 if attempt == 3:

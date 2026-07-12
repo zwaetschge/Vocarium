@@ -28,3 +28,11 @@ class DockerContextTest(unittest.TestCase):
             patterns = self._patterns(directory)
             self.assertIn("__pycache__/", patterns)
             self.assertIn("*.pyc", patterns)
+
+
+class MMAudioCachePolicyTest(unittest.TestCase):
+    def test_verified_weight_marker_avoids_rehashing_unchanged_files(self):
+        source = (REPO_ROOT / "mmaudio" / "server.py").read_text(encoding="utf-8")
+        self.assertIn("def _is_verified(", source)
+        self.assertIn('data.get("mtime_ns") == stat.st_mtime_ns', source)
+        self.assertIn("if _verify_and_mark(path, expected_md5):", source)
