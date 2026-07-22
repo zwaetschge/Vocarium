@@ -182,3 +182,27 @@ test('voice cloning defaults to German', async ({ page }) => {
   await expect(page.getByRole('heading', { name: 'Voice Cloning' })).toBeVisible();
   await expect(page.getByRole('combobox')).toHaveValue('German');
 });
+
+test('transcription renders model-backed timestamps', async ({ page }) => {
+  await page.route('**/api/transcribe', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      text: 'Guten Morgen. Willkommen bei Vocarium.',
+      language: 'German',
+      words: [],
+      segments: [
+        { start: 0, end: 2.2, text: 'Guten Morgen.' },
+        { start: 2.5, end: 5.2, text: 'Willkommen bei Vocarium.' },
+      ],
+    }),
+  }));
+  await page.goto('/transcribe');
+  await page.getByRole('button', { name: 'Media URL' }).click();
+  await page.getByPlaceholder('https://www.youtube.com/watch?v=...').fill('https://www.youtube.com/watch?v=test');
+  await page.getByRole('button', { name: 'Transcribe', exact: true }).click();
+
+  await expect(page.getByText('0:00 – 0:02')).toBeVisible();
+  await expect(page.getByText('0:02 – 0:05')).toBeVisible();
+  await expect(page.getByText('Willkommen bei Vocarium.')).toBeVisible();
+});

@@ -1725,7 +1725,7 @@ def _download_media_url(url: str) -> bytes:
 
 
 async def _transcribe_wav_bytes(wav_bytes: bytes) -> dict:
-    """Send WAV bytes to ASR via the native /v1/audio/transcriptions endpoint."""
+    """Transcribe WAV audio and attach model-backed word/segment timestamps."""
     timeout = aiohttp.ClientTimeout(total=600, sock_connect=60, sock_read=600)
     form = aiohttp.FormData()
     form.add_field("file", wav_bytes, filename="audio.wav", content_type="audio/wav")
@@ -1737,7 +1737,85 @@ async def _transcribe_wav_bytes(wav_bytes: bytes) -> dict:
             body = await resp.read()
             raise RuntimeError(f"ASR error {resp.status}: {body.decode(errors='replace')[:500]}")
         data = await resp.json()
-        return {"text": _clean_asr_text(data.get("text", ""))}
+    language, text = _parse_asr_result(data.get("text", ""), data.get("language"))
+    if not text:
+        return {"text": "", "language": language, "words": [], "segments": []}
+
+    align_form = aiohttp.FormData()
+    align_form.add_field("file", wav_bytes, filename="audio.wav", content_type="audio/wav")
+    align_form.add_field("text", text)
+    align_form.add_field("language", language)
+    async with _http_session().post(
+        f"{ASR_URL}/align", data=align_form, timeout=timeout
+    ) as resp:
+        if resp.status >= 400:
+            body = await resp.read()
+            raise RuntimeError(
+                f"Timestamp alignment error {resp.status}: "
+                f"{body.decode(errors='replace')[:500]}"
+            )
+        aligned = await resp.json()
+
+    words = _normalize_timestamp_words(aligned.get("words", []))
+    return {
+        "text": text,
+        "language": language,
+        "words": words,
+        "segments": _group_timestamp_words(words),
+    }
+
+
+def _parse_asr_result(raw: str, language_hint: str | None = None) -> tuple[str, str]:
+    """Extract Qwen's detected language and clean transcript text."""
+    source = (raw or "").strip()
+    match = re.match(r"^\s*language\s+([^<]+?)\s*<asr_text>\s*", source, re.IGNORECASE)
+    language = (language_hint or "").strip()
+    if match:
+        language = match.group(1).strip()
+    return language or "English", _clean_asr_text(source)
+
+
+def _normalize_timestamp_words(items: list[dict]) -> list[dict]:
+    words: list[dict] = []
+    for item in items:
+        try:
+            text = str(item.get("text", "")).strip()
+            start = max(0.0, float(item["start"]))
+            end = max(start, float(item["end"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if text:
+            words.append({"text": text, "start": round(start, 3), "end": round(end, 3)})
+    return words
+
+
+def _join_timestamp_token(current: str, token: str) -> str:
+    if not current:
+        return token
+    if token[0] in ".,!?;:%)]}" or current[-1] in "([{":
+        return current + token
+    return f"{current} {token}"
+
+
+def _group_timestamp_words(words: list[dict]) -> list[dict]:
+    """Group word alignment into readable timestamped transcript phrases."""
+    segments: list[dict] = []
+    current_text = ""
+    start = 0.0
+    end = 0.0
+    for word in words:
+        if not current_text:
+            start = word["start"]
+        current_text = _join_timestamp_token(current_text, word["text"])
+        end = word["end"]
+        duration = end - start
+        sentence_end = word["text"].endswith((".", "!", "?"))
+        if duration >= 10.0 or (duration >= 2.0 and sentence_end):
+            segments.append({"start": start, "end": end, "text": current_text})
+            current_text = ""
+    if current_text:
+        segments.append({"start": start, "end": end, "text": current_text})
+    return segments
 
 
 def _clean_asr_text(raw: str) -> str:

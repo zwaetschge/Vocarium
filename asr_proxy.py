@@ -7,16 +7,18 @@ so it can coexist with TTS on the same GPU.
 """
 
 import asyncio
+import gc
 import os
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 
 BACKEND_HOST = "127.0.0.1"
 BACKEND_PORT = 8001
@@ -24,6 +26,7 @@ LISTEN_PORT = int(os.environ.get("PROXY_PORT", "8000"))
 IDLE_TIMEOUT = int(os.environ.get("IDLE_TIMEOUT", "300"))  # seconds
 
 MODEL = os.environ.get("ASR_MODEL", "Qwen/Qwen3-ASR-0.6B")
+ALIGNER_MODEL = os.environ.get("ASR_ALIGNER_MODEL", "Qwen/Qwen3-ForcedAligner-0.6B")
 MAX_MODEL_LEN = os.environ.get("MAX_MODEL_LEN", "4096")
 
 # Minimum free VRAM (MiB) needed to start. Model ~1.2GB + KV cache ~0.5GB + overhead
@@ -38,6 +41,7 @@ backend_ready = False
 backend_starting = False
 last_start_error: str | None = None
 _http_client: httpx.AsyncClient | None = None
+aligner = None
 
 app = FastAPI(title="ASR Proxy")
 
@@ -140,20 +144,64 @@ def start_backend():
 
 
 def stop_backend():
-    global process, backend_ready
+    global process, backend_ready, aligner
     backend_ready = False
-    if process is None or process.poll() is not None:
-        process = None
-        return
-    print("Stopping vLLM backend to free GPU memory...", flush=True)
-    process.send_signal(signal.SIGTERM)
-    try:
-        process.wait(timeout=15)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=5)
+    if process is not None and process.poll() is None:
+        print("Stopping vLLM backend to free GPU memory...", flush=True)
+        process.send_signal(signal.SIGTERM)
+        try:
+            process.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
     process = None
+    if aligner is not None:
+        print("Unloading forced aligner...", flush=True)
+        aligner = None
+        gc.collect()
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
     print("vLLM backend stopped. GPU memory freed.", flush=True)
+
+
+def _align_audio(audio_bytes: bytes, text: str, language: str) -> list[dict]:
+    """Return model-backed word timestamps for an ASR transcript."""
+    global aligner
+    if aligner is None:
+        import torch
+        from qwen_asr import Qwen3ForcedAligner
+
+        print(f"Loading forced aligner: {ALIGNER_MODEL}", flush=True)
+        aligner = Qwen3ForcedAligner.from_pretrained(
+            ALIGNER_MODEL,
+            dtype=torch.bfloat16,
+            device_map="cuda:0",
+        )
+
+    tmp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp.write(audio_bytes)
+            tmp_path = tmp.name
+        results = aligner.align(audio=tmp_path, text=text, language=language)
+        aligned = results[0] if results else []
+        return [
+            {
+                "text": item.text,
+                "start": float(item.start_time),
+                "end": float(item.end_time),
+            }
+            for item in aligned
+        ]
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
 
 
 def schedule_unload():
@@ -255,6 +303,35 @@ async def health():
 async def unload():
     """Unload vLLM backend to free GPU memory for other services."""
     return await asyncio.to_thread(_unload_if_idle)
+
+
+@app.post("/align")
+async def align_transcript(
+    file: UploadFile = File(...),
+    text: str = Form(...),
+    language: str = Form(...),
+):
+    """Align a transcript to its audio with Qwen3-ForcedAligner."""
+    global active_requests, last_used
+    text = text.strip()
+    language = language.strip()
+    if not text:
+        raise HTTPException(400, "Transcript text is required")
+    if not language:
+        raise HTTPException(400, "Transcript language is required")
+
+    audio_bytes = await file.read()
+    if not audio_bytes:
+        raise HTTPException(400, "Audio file is empty")
+
+    with lock:
+        active_requests += 1
+        last_used = time.time()
+    try:
+        words = await asyncio.to_thread(_align_audio, audio_bytes, text, language)
+        return {"language": language, "words": words}
+    finally:
+        release_backend()
 
 
 @app.on_event("shutdown")

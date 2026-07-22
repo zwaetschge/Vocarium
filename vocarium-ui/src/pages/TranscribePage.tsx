@@ -1,6 +1,7 @@
 import { useState, useRef, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { transcribe } from '../api';
+import type { TranscriptionResult } from '../api';
 import AudioPlayer from '../components/AudioPlayer';
 import { useAudio } from '../hooks/useAudio';
 import WaveformBars from '../components/WaveformBars';
@@ -17,7 +18,7 @@ export default function TranscribePage() {
   const [dragging, setDragging] = useState(false);
   const [transcribing, setTranscribing] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [result, setResult] = useState<string | null>(null);
+  const [result, setResult] = useState<TranscriptionResult | null>(null);
   const [copied, setCopied] = useState(false);
 
   const [recording, setRecording] = useState(false);
@@ -73,7 +74,7 @@ export default function TranscribePage() {
     setResult(null);
 
     try {
-      let res: { text: string };
+      let res: TranscriptionResult;
       if (mode === 'url' && url.trim()) {
         res = await transcribe({ url: url.trim() });
       } else if (file) {
@@ -83,7 +84,7 @@ export default function TranscribePage() {
         setTranscribing(false);
         return;
       }
-      setResult(res.text);
+      setResult(res);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Transcription failed');
     }
@@ -92,12 +93,27 @@ export default function TranscribePage() {
 
   const handleCopy = () => {
     if (!result) return;
-    navigator.clipboard.writeText(result);
+    const content = result.segments.length > 0
+      ? result.segments
+          .map((segment) => `[${formatTimestamp(segment.start)} – ${formatTimestamp(segment.end)}] ${segment.text}`)
+          .join('\n')
+      : result.text;
+    navigator.clipboard.writeText(content);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
 
   const canTranscribe = mode === 'url' ? url.trim().length > 0 : !!file;
+
+  const formatTimestamp = (seconds: number) => {
+    const total = Math.max(0, Math.floor(seconds));
+    const hours = Math.floor(total / 3600);
+    const minutes = Math.floor((total % 3600) / 60);
+    const secs = total % 60;
+    return hours > 0
+      ? `${hours}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`
+      : `${minutes}:${secs.toString().padStart(2, '0')}`;
+  };
 
   const modeButtons: { key: InputMode; label: string; icon: JSX.Element }[] = [
     {
@@ -598,7 +614,7 @@ export default function TranscribePage() {
                     letterSpacing: 0,
                   }}
                 >
-                  {result.length} chars
+                  {result.text.length} chars · {result.language}
                 </span>
               </div>
               <motion.button
@@ -653,7 +669,39 @@ export default function TranscribePage() {
                 letterSpacing: 0,
               }}
             >
-              {result || (
+              {result.segments.length > 0 ? (
+                <div style={{ display: 'flex', flexDirection: 'column' }}>
+                  {result.segments.map((segment, index) => (
+                    <div
+                      key={`${segment.start}-${index}`}
+                      style={{
+                        display: 'grid',
+                        gridTemplateColumns: '104px minmax(0, 1fr)',
+                        gap: '14px',
+                        padding: '11px 0',
+                        borderBottom: index < result.segments.length - 1
+                          ? '1px solid rgba(255,255,255,0.055)'
+                          : 'none',
+                      }}
+                    >
+                      <span
+                        style={{
+                          fontFamily: 'var(--font-mono)',
+                          fontSize: '11px',
+                          lineHeight: 1.7,
+                          color: 'var(--color-accent-hover)',
+                          whiteSpace: 'nowrap',
+                        }}
+                      >
+                        {formatTimestamp(segment.start)} – {formatTimestamp(segment.end)}
+                      </span>
+                      <span>{segment.text}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : result.text ? (
+                result.text
+              ) : (
                 <span style={{ color: 'var(--color-text-dim)', fontStyle: 'italic' }}>
                   (empty transcription)
                 </span>

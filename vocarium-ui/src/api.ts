@@ -297,7 +297,20 @@ export async function getBenchmarkResults(): Promise<{ results: BenchmarkResult[
 }
 
 // Transcription (STT)
-export async function transcribe(data: { file?: File; url?: string }): Promise<{ text: string }> {
+export interface TranscriptionWord {
+  text: string;
+  start: number;
+  end: number;
+}
+
+export interface TranscriptionResult {
+  text: string;
+  language: string;
+  words: TranscriptionWord[];
+  segments: TranscriptionWord[];
+}
+
+export async function transcribe(data: { file?: File; url?: string }): Promise<TranscriptionResult> {
   const formData = new FormData();
   if (data.file) formData.append('file', data.file);
   if (data.url) formData.append('url', data.url);
@@ -306,7 +319,13 @@ export async function transcribe(data: { file?: File; url?: string }): Promise<{
     const body = await res.text();
     throw new Error(body || `Transcription failed: ${res.status}`);
   }
-  return res.json();
+  const result = await res.json() as Partial<TranscriptionResult>;
+  return {
+    text: result.text ?? '',
+    language: result.language ?? 'Unknown',
+    words: result.words ?? [],
+    segments: result.segments ?? [],
+  };
 }
 
 // Languages
