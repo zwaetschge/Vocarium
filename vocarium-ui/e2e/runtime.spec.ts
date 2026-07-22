@@ -175,3 +175,10 @@ test('lazy route chunks are requested after navigation', async ({ page }) => {
   expect(scriptRequests.some((url) => /PodcastPage|podcast/i.test(url))).toBeTruthy();
   expect(scriptRequests.length).toBeGreaterThanOrEqual(2);
 });
+
+test('voice cloning defaults to German', async ({ page }) => {
+  await page.goto('/clone');
+
+  await expect(page.getByRole('heading', { name: 'Voice Cloning' })).toBeVisible();
+  await expect(page.getByRole('combobox')).toHaveValue('German');
+});

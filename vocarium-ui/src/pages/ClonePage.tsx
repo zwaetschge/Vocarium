@@ -80,7 +80,7 @@ export default function ClonePage() {
   const waveContainerRef = useRef<HTMLDivElement>(null);
 
   const [name, setName] = useState('');
-  const [language, setLanguage] = useState('English');
+  const [language, setLanguage] = useState('German');
   const [refText, setRefText] = useState('');
   const [autoTranscribe, setAutoTranscribe] = useState(true);
   const [file, setFile] = useState<File | null>(null);
@@ -104,7 +104,7 @@ export default function ClonePage() {
   const clipEnd = Math.min(clipStart + CLIP_DURATION, totalDuration);
 
   useEffect(() => {
-    getLanguages().then(setLanguages).catch(() => setLanguages(['English', 'Chinese']));
+    getLanguages().then(setLanguages).catch(() => setLanguages(['German', 'English', 'Chinese']));
   }, []);
 
   useEffect(() => {
