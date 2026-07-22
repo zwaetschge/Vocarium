@@ -47,9 +47,9 @@ management path (`/api/voices/clone`, `/api/generate`, `/api/transcribe`).
 ## Hardware
 
 - **GPU**: NVIDIA, ≥ 12 GB VRAM. **One GPU is the default** — TTS, ASR,
-  music, and SFX share the GPU and auto-unload when idle. A second GPU
-  is optional (opt-in via `COMPOSE_PROFILES=dual-gpu`) and adds a parallel
-  TTS replica plus dedicated music/SFX placement.
+  music, and SFX share the RTX 3060 and auto-unload when idle. A second GPU
+  is optional (opt-in via `COMPOSE_PROFILES=dual-gpu`) as an emergency TTS
+  fallback.
 - Tested on **RTX 3060 (12 GB)** and **RTX 5060 Ti (16 GB, Blackwell SM 12.0)**.
 - **CPU/RAM**: 8 cores, 32 GB RAM is comfortable.
 - **Disk**: ~25 GB for model weights + working space for generated audio.
@@ -122,20 +122,20 @@ Everything is in `.env`. Highlights:
 | `DEFAULT_TTS_MODEL`| `1.7b-base`    | One of `1.7b-base`, `1.7b-design`, `1.7b-custom`.         |
 | `LLM_API_URL` etc. | (empty)        | Required for **Podcast Studio**; see below.               |
 
-### Dual-GPU mode (optional)
+### Emergency GPU fallback (optional)
 
-If you have two GPUs, uncomment two lines in `.env` to spin up a second
-TTS replica on GPU 1 and pin music/SFX there:
+To make the RTX 5060 Ti available only after a primary TTS failure, enable the
+fallback profile and URL. Music, SFX, ASR, and normal TTS remain on GPU 0:
 
 ```
 COMPOSE_PROFILES=dual-gpu
 TTS_URL_2=http://qwen3-tts-2:8880
-GPU_MUSIC=1
-GPU_SFX=1
 ```
 
 Then `docker compose up -d` brings up the extra `qwen3-tts-2` and
-`vocarium-api-2` containers. With one GPU, leave these commented and the
+`vocarium-api-2` containers. Both API replicas still prefer `qwen3-tts` on the
+RTX 3060; `qwen3-tts-2` is tried only after that request fails. With one GPU,
+leave these commented and the
 auto-unload logic (`*_IDLE_TIMEOUT`) keeps everything coexisting on GPU 0.
 
 ### Authentication
@@ -192,8 +192,8 @@ Vocarium works without them.
 - **Lazy services** (ASR / music / SFX) start a child process on first
   request and shut it down after `*_IDLE_TIMEOUT` seconds — this is what
   makes single-GPU operation viable.
-- **Dual-GPU mode** adds a second TTS replica on the secondary GPU and
-  uses it as a failover/parallel target for podcast rendering.
+- **Fallback mode** adds a standby TTS replica on the secondary GPU and uses
+  it only after the primary RTX 3060 request fails.
 
 See `CLAUDE.md` for the full architecture write-up and `AGENTS.md` for
 non-obvious gotchas (CUDA-graph hangs on Blackwell, pycache poisoning

@@ -118,15 +118,13 @@ class VocariumTTSGenerator:
     ):
         # Primary TTS endpoint
         self.tts_url = tts_url
-        # Extra TTS endpoints (failover order). Empty entries are filtered so
-        # callers can pass an unconditional list with optional URLs.
+        # Extra TTS endpoints are strict fallbacks. Empty entries are filtered
+        # so callers can pass an unconditional list with optional URLs.
         self._extra_tts_urls = [u for u in (extra_tts_urls or []) if u]
         self._db_getter = db_getter
         self._gpu_submit = gpu_submit
         self._tts_urls = [self.tts_url, *self._extra_tts_urls]
         self._url_semaphores = {url: asyncio.Semaphore(1) for url in self._tts_urls}
-        self._next_url = 0
-        self._url_lock = asyncio.Lock()
         self._aiosession: aiohttp.ClientSession | None = None
 
     @property
@@ -144,12 +142,8 @@ class VocariumTTSGenerator:
         self._aiosession = None
 
     async def _ordered_tts_urls(self) -> list[str]:
-        async with self._url_lock:
-            if not self._tts_urls:
-                return []
-            start = self._next_url % len(self._tts_urls)
-            self._next_url += 1
-            return self._tts_urls[start:] + self._tts_urls[:start]
+        """Always try the RTX 3060 endpoint before any emergency fallback."""
+        return list(self._tts_urls)
 
     async def run_batch(self, description: str, work: Callable[[], Any]) -> Any:
         async def queued_work():

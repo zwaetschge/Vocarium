@@ -697,6 +697,38 @@ class PodcastProductionHardeningTest(unittest.TestCase):
         self.assertNotIn("vocarium-data" + "-2", compose)
         self.assertGreaterEqual(compose.count("- vocarium-data:/app/data"), 2)
 
+    def test_rtx_3060_stays_primary_on_every_api_replica(self):
+        compose = (REPO_ROOT / "docker-compose.yml").read_text()
+        api_two = compose.split("  vocarium-api-2:", 1)[1].split("  vocarium-ui:", 1)[0]
+        self.assertIn("TTS_URL: http://qwen3-tts:8880", api_two)
+        self.assertIn("TTS_URL_2: http://qwen3-tts-2:8880", api_two)
+        self.assertIn("GPU_TTS_PRIMARY: ${GPU_TTS_1:-0}", api_two)
+        self.assertIn("GPU_TTS_EXTRA: ${GPU_TTS_2:-1}", api_two)
+
+    def test_podcast_tts_never_round_robins_to_emergency_gpu(self):
+        tree = ast.parse((API_ROOT / "podcast" / "routes.py").read_text())
+        generator_class = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "VocariumTTSGenerator"
+        )
+        order_method = next(
+            node for node in generator_class.body
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_ordered_tts_urls"
+        )
+        namespace: dict[str, object] = {}
+        exec(
+            compile(ast.Module(body=[order_method], type_ignores=[]), "routes.py", "exec"),
+            namespace,
+        )
+
+        class GeneratorStub:
+            _tts_urls = ["http://qwen3-tts:8880", "http://qwen3-tts-2:8880"]
+
+        expected = ["http://qwen3-tts:8880", "http://qwen3-tts-2:8880"]
+        ordered_urls = namespace["_ordered_tts_urls"]
+        self.assertEqual(asyncio.run(ordered_urls(GeneratorStub())), expected)
+        self.assertEqual(asyncio.run(ordered_urls(GeneratorStub())), expected)
+
     def test_mmaudio_generation_runs_off_event_loop(self):
         source = (REPO_ROOT / "mmaudio" / "server.py").read_text()
         self.assertIn("def _generate_sfx_blocking", source)
