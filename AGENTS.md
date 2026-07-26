@@ -4,6 +4,13 @@
 
 This file is for AI coding agents assisting with the Vocarium stack. Complements `CLAUDE.md` (architecture overview) with actionable conventions, common pitfalls, and workflow guidance.
 
+## GPU ownership and client access
+
+- **RTX 3060 / GPU 0 is dedicated to Vocarium and all of its inference services.** TTS, STT, music, and SFX are expected to share it through Vocarium's queue and load/unload coordination.
+- **Subwave, Hermes, and other applications are normal Vocarium clients.** Their recurring use of the RTX 3060 through the Vocarium API is intended traffic, not foreign GPU contention.
+- Clients must use the Vocarium gateway/API instead of calling inference workers such as `qwen3-tts:8880` directly. Direct worker access bypasses queueing, resource guards, user scoping, and coordinated model eviction.
+- **RTX 5060 Ti / GPU 1 is not part of normal Vocarium capacity.** Keep it protected and use it only as an explicitly enabled emergency fallback after the RTX 3060 path genuinely fails.
+
 ## Testing philosophy
 
 - **Test before, not after**: When you change any inference endpoint (`qwen3-tts/server.py`, `asr_proxy.py`, API routes), always run a direct container-level request to verify the model loads and responds. Do not assume "the code looks right" — CUDA/VRAM issues have silent failure modes.
