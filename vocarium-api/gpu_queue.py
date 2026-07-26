@@ -74,7 +74,10 @@ def _csv(name: str, default: str = "") -> list[str]:
 def _service_need_mib(service_type: str) -> int:
     kind = "tts" if service_type == "tts_extra" else service_type
     defaults = {
-        "tts": 8500,
+        # Qwen3-TTS 1.7B uses about 4.7 GiB on the RTX 3060. This is a total
+        # footprint estimate, not additional free memory required beside an
+        # already-running TTS CUDA context.
+        "tts": 5500,
         "asr": 2500,
         "music": 8000,
         "sfx": 7000,
@@ -83,6 +86,18 @@ def _service_need_mib(service_type: str) -> int:
     if default <= 0:
         return 0
     return _env_int(f"GPU_ESTIMATE_MIB_{kind.upper()}", default)
+
+
+def _service_memory_tolerance_mib(service_type: str) -> int:
+    """Allow for small gputasks/driver accounting differences.
+
+    The TTS 1.7B worker is measured at roughly 4.7 GiB on the RTX 3060, while
+    the conservative configured estimate remains 5.5 GiB. A 512 MiB tolerance
+    prevents false denials without weakening the estimate by a full GiB.
+    """
+    kind = "tts" if service_type == "tts_extra" else service_type
+    default = 512 if kind == "tts" else 0
+    return max(0, _env_int(f"GPU_GUARD_MEMORY_TOLERANCE_MIB_{kind.upper()}", default))
 
 def _gpu_id(name: str, default: str = "0") -> str:
     return (os.environ.get(name, default) or default).strip()
@@ -257,6 +272,7 @@ def _decision_for_service(
 ) -> dict[str, Any]:
     target = _service_gpus().get(service_type)
     need = _service_need_mib(service_type)
+    tolerance = _service_memory_tolerance_mib(service_type)
     candidates: list[dict[str, Any]] = []
     selected: dict[str, Any] | None = None
 
@@ -265,10 +281,10 @@ def _decision_for_service(
         reclaimable = _service_used_mib(gpu, service_type)
         effective_free = memory["free"] + reclaimable
         reasons = _gpu_protection_reasons(gpu)
-        if need > 0 and effective_free < need:
+        if need > 0 and effective_free + tolerance < need:
             reasons.append(
                 f"only {memory['free']} MiB free plus {reclaimable} MiB reclaimable, "
-                f"estimated need is {need} MiB"
+                f"estimated need is {need} MiB with {tolerance} MiB telemetry tolerance"
             )
         candidate = {
             "index": gpu.get("index"),
@@ -277,6 +293,7 @@ def _decision_for_service(
             "free_mib": memory["free"],
             "effective_free_mib": effective_free,
             "reclaimable_mib": reclaimable,
+            "memory_tolerance_mib": tolerance,
             "used_mib": memory["used"],
             "total_mib": memory["total"],
             "protected": _is_protected_gpu(gpu),

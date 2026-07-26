@@ -376,6 +376,45 @@ class GpuQueuePlacementTest(unittest.TestCase):
             {"tts", "asr", "music"},
         )
 
+    def test_tts_guard_accepts_observed_3060_headroom(self):
+        import gpu_queue
+
+        os.environ.update(
+            {
+                "GPU_TTS_PRIMARY": "0",
+                "GPU_ESTIMATE_MIB_TTS": "5500",
+                "GPU_GUARD_MEMORY_TOLERANCE_MIB_TTS": "512",
+                "GPU_PROTECTED_IDS": "1",
+                "GPU_PROTECTED_NAMES": "5060",
+            }
+        )
+        status = {
+            "gpus": [
+                {
+                    "index": 0,
+                    "name": "NVIDIA GeForce RTX 3060",
+                    "memory": {"free": 4853, "used": 7058, "total": 12288},
+                    "processes": [
+                        {
+                            "container": {"name": "qwen3-tts"},
+                            "gpu_memory": 368,
+                        },
+                        {
+                            "container": {"name": "qwen3-asr"},
+                            "gpu_memory": 6560,
+                        },
+                    ],
+                }
+            ]
+        }
+
+        decision = gpu_queue._decision_for_service("tts", status)
+
+        self.assertEqual(decision["estimated_need_mib"], 5500)
+        self.assertEqual(decision["selected"]["effective_free_mib"], 5221)
+        self.assertEqual(decision["selected"]["memory_tolerance_mib"], 512)
+        self.assertTrue(decision["allowed"])
+
     def test_gpu_guard_denial_retries_after_self_unload(self):
         import gpu_queue
 
