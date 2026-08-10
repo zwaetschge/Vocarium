@@ -1361,6 +1361,25 @@ def _voice_source(voice_id: str, user_id: int | None = None) -> str:
     return (row[0] or "clone").lower()
 
 
+def _is_dots_clone_voice(voice_id: str, user_id: int) -> bool:
+    """Return whether the user owns a complete clone usable by dots.tts.
+
+    ``default`` is also Qwen's built-in base-voice identifier, so its name
+    alone is not sufficient. Require the user-scoped clone row, transcript,
+    and shared reference WAV before routing it to dots.tts.
+    """
+    row = get_db().execute(
+        "SELECT source, ref_text FROM voices WHERE id=? AND user_id=?",
+        (voice_id, user_id),
+    ).fetchone()
+    return bool(
+        row
+        and (row[0] or "clone").lower() == "clone"
+        and (row[1] or "").strip()
+        and _voice_has_audio(voice_id)
+    )
+
+
 def _custom_tts_payload(
     *,
     text: str,
@@ -1395,7 +1414,7 @@ async def _tts_generate_for_voice(
         response_format, allowed=TTS_RESPONSE_FORMATS
     )
     if engine == "dots":
-        if source != "clone" or voice_id in ("default", ""):
+        if source != "clone" or not _is_dots_clone_voice(voice_id, user_id):
             raise HTTPException(400, "dots.tts supports cloned voices only")
         if response_format != "wav":
             raise HTTPException(400, "dots.tts currently supports WAV output only")

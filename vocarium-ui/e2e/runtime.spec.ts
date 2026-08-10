@@ -38,6 +38,7 @@ async function mockApi(page: Page) {
     if (path === '/api/voices') {
       return json({
         voices: [
+          { id: 'default', name: 'Default (German)', language: 'German', source: 'clone', ref_text: 'Guten Morgen.', created_at: now, has_audio: true },
           { id: 'voice-clone-de', name: 'German Clone', language: 'German', source: 'clone', ref_text: 'Guten Morgen.', created_at: now, has_audio: true },
           { id: 'voice-vivian', name: 'Vivian', language: 'German', source: 'custom', speaker: 'Vivian', instruct: '', created_at: now, has_audio: false },
           { id: 'voice-ryan', name: 'Ryan', language: 'German', source: 'custom', speaker: 'Ryan', instruct: '', created_at: now, has_audio: false },
@@ -191,7 +192,7 @@ test('speech page compares Qwen and dots with the same clone voice', async ({ pa
     await route.fulfill({
       status: 200,
       contentType: 'audio/wav',
-      headers: { 'X-TTS-Engine': 'dots', 'X-Voice': 'voice-clone-de' },
+      headers: { 'X-TTS-Engine': 'dots', 'X-Voice': 'default' },
       body: Buffer.from('RIFF....WAVE'),
     });
   });
@@ -200,14 +201,17 @@ test('speech page compares Qwen and dots with the same clone voice', async ({ pa
   await expect(page.getByRole('button', { name: /Qwen3-TTS/ })).toHaveAttribute('aria-pressed', 'true');
   await page.getByRole('button', { name: /dots\.tts/ }).click();
   await expect(page.getByRole('button', { name: /dots\.tts/ })).toHaveAttribute('aria-pressed', 'true');
-  await expect(page.getByRole('combobox').first()).toHaveValue('voice-clone-de');
+  await expect(page.getByRole('combobox').first()).toHaveValue('default');
+  await expect(page.getByRole('combobox').first().locator('option:checked')).toHaveText(
+    'Default (German) · Cloned default',
+  );
   await expect(page.getByRole('option', { name: /Vivian/ })).toHaveCount(0);
   await page.getByPlaceholder('Write or paste what you want your voice to say…').fill('Guten Morgen aus Vocarium.');
   await page.getByRole('button', { name: 'Generate' }).click();
   await expect.poll(() => requestBody).not.toBeNull();
   expect(requestBody).toMatchObject({
     engine: 'dots',
-    voice_id: 'voice-clone-de',
+    voice_id: 'default',
   });
 });
 

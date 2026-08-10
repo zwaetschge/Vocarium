@@ -48,6 +48,8 @@ class DotsTtsIntegrationContractTest(unittest.TestCase):
         self.assertIn('SUPPORTED_TTS_ENGINES = {"qwen", "dots"}', source)
         self.assertIn('return DOTS_TTS_URL, "dots"', selector_source)
         self.assertIn('source != "clone"', source)
+        self.assertIn('_is_dots_clone_voice(voice_id, user_id)', source)
+        self.assertIn('"SELECT source, ref_text FROM voices WHERE id=? AND user_id=?"', source)
         self.assertIn('service_type="dots"', source)
 
     def test_compose_mounts_shared_clone_voices_into_lazy_dots_worker(self):
@@ -78,6 +80,11 @@ class DotsTtsIntegrationContractTest(unittest.TestCase):
         self.assertIn("setSelectedEngine", source)
         self.assertIn("engine: selectedEngine", source)
         self.assertIn("Only cloned voices", source)
+
+        voice_utils = (REPO_ROOT / "vocarium-ui" / "src" / "voiceUtils.ts").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("voice.source === 'clone' && voice.has_audio", voice_utils)
 
 
 if __name__ == "__main__":
