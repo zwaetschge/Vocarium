@@ -350,6 +350,7 @@ class GpuQueuePlacementTest(unittest.TestCase):
         os.environ.update(
             {
                 "GPU_TTS_PRIMARY": "0",
+                "GPU_DOTS_TTS": "0",
                 "GPU_ASR": "0",
                 "GPU_MUSIC": "0",
                 "GPU_SFX": "0",
@@ -364,6 +365,7 @@ class GpuQueuePlacementTest(unittest.TestCase):
         os.environ.update(
             {
                 "GPU_TTS_PRIMARY": "0",
+                "GPU_DOTS_TTS": "0",
                 "GPU_TTS_EXTRA": "1",
                 "GPU_ASR": "0",
                 "GPU_MUSIC": "1",
@@ -373,7 +375,7 @@ class GpuQueuePlacementTest(unittest.TestCase):
         )
         self.assertEqual(
             gpu_queue._coexisting_services("music"),
-            {"tts", "asr", "music"},
+            {"tts", "dots", "asr", "music"},
         )
 
     def test_tts_guard_accepts_observed_3060_headroom(self):
@@ -959,7 +961,8 @@ class PodcastProductionHardeningTest(unittest.TestCase):
         self.assertNotIn("Speech generation only supports custom voices", main_source)
         self.assertNotIn("_require_custom_generation_voice(source)", generate_source)
         self.assertNotIn("_require_custom_generation_voice(source)", stream_source)
-        self.assertIn("generationVoices = useMemo(() => withDefaultVoice(voices), [voices])", speech_page)
+        self.assertIn(": withDefaultVoice(voices)", speech_page)
+        self.assertIn("voice.source === 'clone' && voice.has_audio", speech_page)
         self.assertIn("const selectedModel = '1.7b-base'", speech_page)
         self.assertIn("model_id: selectedModel", speech_page)
         self.assertNotIn("voices.filter((voice) => voice.source === 'custom')", speech_page)

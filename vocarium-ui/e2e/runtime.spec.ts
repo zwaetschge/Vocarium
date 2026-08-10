@@ -38,6 +38,7 @@ async function mockApi(page: Page) {
     if (path === '/api/voices') {
       return json({
         voices: [
+          { id: 'voice-clone-de', name: 'German Clone', language: 'German', source: 'clone', ref_text: 'Guten Morgen.', created_at: now, has_audio: true },
           { id: 'voice-vivian', name: 'Vivian', language: 'German', source: 'custom', speaker: 'Vivian', instruct: '', created_at: now, has_audio: false },
           { id: 'voice-ryan', name: 'Ryan', language: 'German', source: 'custom', speaker: 'Ryan', instruct: '', created_at: now, has_audio: false },
         ],
@@ -181,6 +182,33 @@ test('voice cloning defaults to German', async ({ page }) => {
 
   await expect(page.getByRole('heading', { name: 'Voice Cloning' })).toBeVisible();
   await expect(page.getByRole('combobox')).toHaveValue('German');
+});
+
+test('speech page compares Qwen and dots with the same clone voice', async ({ page }) => {
+  let requestBody: Record<string, unknown> | null = null;
+  await page.route('**/api/generate', async (route) => {
+    requestBody = route.request().postDataJSON();
+    await route.fulfill({
+      status: 200,
+      contentType: 'audio/wav',
+      headers: { 'X-TTS-Engine': 'dots', 'X-Voice': 'voice-clone-de' },
+      body: Buffer.from('RIFF....WAVE'),
+    });
+  });
+
+  await page.goto('/');
+  await expect(page.getByRole('button', { name: /Qwen3-TTS/ })).toHaveAttribute('aria-pressed', 'true');
+  await page.getByRole('button', { name: /dots\.tts/ }).click();
+  await expect(page.getByRole('button', { name: /dots\.tts/ })).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.getByRole('combobox').first()).toHaveValue('voice-clone-de');
+  await expect(page.getByRole('option', { name: /Vivian/ })).toHaveCount(0);
+  await page.getByPlaceholder('Write or paste what you want your voice to say…').fill('Guten Morgen aus Vocarium.');
+  await page.getByRole('button', { name: 'Generate' }).click();
+  await expect.poll(() => requestBody).not.toBeNull();
+  expect(requestBody).toMatchObject({
+    engine: 'dots',
+    voice_id: 'voice-clone-de',
+  });
 });
 
 test('transcription renders model-backed timestamps', async ({ page }) => {

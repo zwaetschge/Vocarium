@@ -1,7 +1,7 @@
 """GPU Queue — serializes GPU operations across configured inference services.
 
-GPU placement is defined in Docker Compose via GPU_TTS_*, GPU_ASR, GPU_MUSIC,
-and GPU_SFX. On single-GPU deployments, idle-unload keeps large models from
+GPU placement is defined in Docker Compose via GPU_TTS_*, GPU_DOTS_TTS,
+GPU_ASR, GPU_MUSIC, and GPU_SFX. On single-GPU deployments, idle-unload keeps large models from
 coexisting in VRAM. Music and SFX evict each other since both need a large
 chunk of GPU memory. Jobs are processed FIFO; before each job, only services
 that cannot coexist with the incoming service are unloaded.
@@ -78,6 +78,7 @@ def _service_need_mib(service_type: str) -> int:
         # footprint estimate, not additional free memory required beside an
         # already-running TTS CUDA context.
         "tts": 5500,
+        "dots": 9000,
         "asr": 2500,
         "music": 8000,
         "sfx": 7000,
@@ -106,6 +107,7 @@ def _gpu_id(name: str, default: str = "0") -> str:
 def _service_gpus() -> dict[str, str]:
     gpus = {
         "tts": _gpu_id("GPU_TTS_PRIMARY", _gpu_id("GPU_TTS_1", "0")),
+        "dots": _gpu_id("GPU_DOTS_TTS", "0"),
         "asr": _gpu_id("GPU_ASR", "0"),
         "music": _gpu_id("GPU_MUSIC", "0"),
         "sfx": _gpu_id("GPU_SFX", "0"),
@@ -248,6 +250,7 @@ def _gpu_protection_reasons(gpu: dict[str, Any]) -> list[str]:
 def _service_container_names(service_type: str) -> set[str]:
     return {
         "tts": {"qwen3-tts"},
+        "dots": {"dots-tts"},
         "tts_extra": {"qwen3-tts-2"},
         "asr": {"qwen3-asr"},
         "music": {"acestep"},
@@ -429,7 +432,7 @@ def register_cancel_checker(callback: Callable[[str], bool] | None):
 @dataclass
 class Job:
     job_id: str
-    service_type: str  # "tts" | "tts_extra" | "asr" | "music" | "sfx"
+    service_type: str  # "tts" | "tts_extra" | "dots" | "asr" | "music" | "sfx"
     description: str
     user_id: int | None = None
     request_id: str | None = None
@@ -799,7 +802,7 @@ class GpuQueue:
         service_counts: dict[str, int] = {}
         for job in pending:
             service_counts[job.service_type] = service_counts.get(job.service_type, 0) + 1
-        for service_type in ("tts", "tts_extra", "asr", "music", "sfx"):
+        for service_type in ("tts", "tts_extra", "dots", "asr", "music", "sfx"):
             set_gauge(
                 "vocarium_gpu_queue_length_by_service",
                 float(service_counts.get(service_type, 0)),
