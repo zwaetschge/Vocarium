@@ -722,8 +722,18 @@ class ASRLifecycleContractTest(unittest.TestCase):
         source = parsed_source(self.SOURCE)
         proxy = find_function(source, "proxy", is_async=True)
         request_call = find_method_call(source, proxy, {"request"})
+        body_read = next(
+            call
+            for call in ordered_nodes(proxy, ast.Call)
+            if expression_name(call.func) == "request.body"
+        )
         acquisition = find_thread_offload(source, proxy, "acquire_backend")
         request_try = find_try_containing(source, proxy, request_call)
+        self.assertLess(
+            direct_statement_index(source, proxy, body_read),
+            direct_statement_index(source, proxy, acquisition),
+            f"{self.SOURCE}:proxy: request body must be buffered before acquiring the backend",
+        )
         self.assertLess(
             direct_statement_index(source, proxy, acquisition),
             direct_statement_index(source, proxy, request_try),

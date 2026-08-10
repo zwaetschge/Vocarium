@@ -344,10 +344,13 @@ async def shutdown():
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy(request: Request, path: str):
+    # Buffer the upload before reserving/starting the GPU backend. A client can
+    # disconnect while Starlette reads the body; acquiring first would leak an
+    # active request because that failure happens before the release ``try``.
+    body = await request.body()
     await asyncio.to_thread(acquire_backend)
 
     url = f"http://{BACKEND_HOST}:{BACKEND_PORT}/{path}"
-    body = await request.body()
     headers = dict(request.headers)
     headers.pop("host", None)
 
