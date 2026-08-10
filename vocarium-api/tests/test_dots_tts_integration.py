@@ -70,6 +70,16 @@ class DotsTtsIntegrationContractTest(unittest.TestCase):
         self.assertIn('@app.post("/unload")', source)
         self.assertIn('asyncio.to_thread', source)
 
+    def test_worker_pins_official_transformers_runtime(self):
+        dockerfile = (REPO_ROOT / "dots-tts" / "Dockerfile").read_text(
+            encoding="utf-8"
+        )
+
+        # dots.tts 0.2.1 publishes this exact version in its recommended
+        # constraints. Newer major versions can tokenize the Mistral regex
+        # differently and produce unintelligible speech without failing.
+        self.assertIn("transformers==4.57.0", dockerfile)
+
     def test_speech_ui_exposes_both_engines_and_sends_selection(self):
         source = (REPO_ROOT / "vocarium-ui" / "src" / "pages" / "SpeechPage.tsx").read_text(
             encoding="utf-8"

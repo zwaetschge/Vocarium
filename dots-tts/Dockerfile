@@ -16,6 +16,7 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
       --index-url https://download.pytorch.org/whl/cu128 && \
     pip install --no-cache-dir \
       dots.tts==0.2.1 \
+      transformers==4.57.0 \
       fastapi==0.116.1 \
       "uvicorn[standard]==0.35.0" \
       python-multipart==0.0.20 \
