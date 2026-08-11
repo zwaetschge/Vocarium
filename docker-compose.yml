@@ -126,38 +126,6 @@ services:
     networks:
       - voice-network
 
-  # --- dots.tts (clone comparison, lazy-loaded on the RTX 3060) ------------
-  dots-tts:
-    init: true
-    build:
-      context: ./dots-tts
-      dockerfile: Dockerfile
-    container_name: dots-tts
-    runtime: nvidia
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=${GPU_DOTS_TTS:-0}
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      - VOICES_DIR=/app/voices
-      - DOTS_TTS_MODEL=${DOTS_TTS_MODEL:-dots-studio/dots.tts-soar}
-      - DOTS_TTS_MODEL_REVISION=${DOTS_TTS_MODEL_REVISION:-e3520f75254d0020a0406db31c51a79d00d22d55}
-      - DOTS_TTS_PRECISION=${DOTS_TTS_PRECISION:-bfloat16}
-      - DOTS_TTS_NUM_STEPS=${DOTS_TTS_NUM_STEPS:-10}
-      - IDLE_TIMEOUT=${DOTS_TTS_IDLE_TIMEOUT:-120}
-      - PYTHONDONTWRITEBYTECODE=1
-      - PYTHONUNBUFFERED=1
-    ports:
-      - "127.0.0.1:${DOTS_TTS_PORT:-8205}:8890"
-    volumes:
-      - ${HF_CACHE_DIR:-./models}:/root/.cache/huggingface
-      - ./dots-tts/server.py:/app/server.py:ro
-      - voices-data:/app/voices:ro
-      - type: tmpfs
-        target: /app/__pycache__
-    shm_size: "4g"
-    restart: unless-stopped
-    networks:
-      - voice-network
-
   # --- ACE-Step (music) ------------------------------------------------------
   acestep:
     init: true
@@ -215,13 +183,11 @@ services:
     environment:
       <<: *podcast-env
       TTS_URL: http://qwen3-tts:8880
-      DOTS_TTS_URL: http://dots-tts:8890
       TTS_URL_2: ${TTS_URL_2:-}
       ASR_URL: http://qwen3-asr:8000
       MUSIC_URL: http://acestep:8003
       SFX_URL: http://mmaudio:8004
       GPU_TTS_PRIMARY: ${GPU_TTS_1:-0}
-      GPU_DOTS_TTS: ${GPU_DOTS_TTS:-0}
       GPU_TTS_EXTRA: ${GPU_TTS_2:-1}
       GPU_ASR: ${GPU_ASR:-0}
       GPU_MUSIC: ${GPU_MUSIC:-0}
@@ -234,7 +200,6 @@ services:
       GPU_PROTECTED_PROCESS_PATTERNS: ${GPU_PROTECTED_PROCESS_PATTERNS:-comfyui}
       GPU_PROTECTED_UNKNOWN_USED_MIB: ${GPU_PROTECTED_UNKNOWN_USED_MIB:-1024}
       GPU_ESTIMATE_MIB_TTS: ${GPU_ESTIMATE_MIB_TTS:-5500}
-      GPU_ESTIMATE_MIB_DOTS: ${GPU_ESTIMATE_MIB_DOTS:-9000}
       GPU_GUARD_MEMORY_TOLERANCE_MIB_TTS: ${GPU_GUARD_MEMORY_TOLERANCE_MIB_TTS:-512}
       GPU_ESTIMATE_MIB_ASR: ${GPU_ESTIMATE_MIB_ASR:-2500}
       GPU_ESTIMATE_MIB_MUSIC: ${GPU_ESTIMATE_MIB_MUSIC:-8000}
@@ -273,7 +238,6 @@ services:
     restart: unless-stopped
     depends_on:
       - qwen3-tts
-      - dots-tts
     networks:
       - voice-network
       - subwave-internal
@@ -290,13 +254,11 @@ services:
       # Keep the RTX 3060 service primary on every API replica. The RTX 5060
       # Ti endpoint is only attempted after a real primary request failure.
       TTS_URL: http://qwen3-tts:8880
-      DOTS_TTS_URL: http://dots-tts:8890
       TTS_URL_2: http://qwen3-tts-2:8880
       ASR_URL: http://qwen3-asr:8000
       MUSIC_URL: http://acestep:8003
       SFX_URL: http://mmaudio:8004
       GPU_TTS_PRIMARY: ${GPU_TTS_1:-0}
-      GPU_DOTS_TTS: ${GPU_DOTS_TTS:-0}
       GPU_TTS_EXTRA: ${GPU_TTS_2:-1}
       GPU_ASR: ${GPU_ASR:-0}
       GPU_MUSIC: ${GPU_MUSIC:-0}
@@ -309,7 +271,6 @@ services:
       GPU_PROTECTED_PROCESS_PATTERNS: ${GPU_PROTECTED_PROCESS_PATTERNS:-comfyui}
       GPU_PROTECTED_UNKNOWN_USED_MIB: ${GPU_PROTECTED_UNKNOWN_USED_MIB:-1024}
       GPU_ESTIMATE_MIB_TTS: ${GPU_ESTIMATE_MIB_TTS:-5500}
-      GPU_ESTIMATE_MIB_DOTS: ${GPU_ESTIMATE_MIB_DOTS:-9000}
       GPU_GUARD_MEMORY_TOLERANCE_MIB_TTS: ${GPU_GUARD_MEMORY_TOLERANCE_MIB_TTS:-512}
       GPU_ESTIMATE_MIB_ASR: ${GPU_ESTIMATE_MIB_ASR:-2500}
       GPU_ESTIMATE_MIB_MUSIC: ${GPU_ESTIMATE_MIB_MUSIC:-8000}
@@ -348,7 +309,6 @@ services:
     restart: unless-stopped
     depends_on:
       - qwen3-tts
-      - dots-tts
     networks:
       - voice-network
 

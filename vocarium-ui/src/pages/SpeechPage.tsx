@@ -13,7 +13,6 @@ export default function SpeechPage() {
   const [voices, setVoices] = useState<Voice[]>([]);
   const [languages, setLanguages] = useState<string[]>([]);
   const [selectedVoice, setSelectedVoice] = useState('default');
-  const [selectedEngine, setSelectedEngine] = useState<'qwen' | 'dots'>('qwen');
   const [selectedLang, setSelectedLang] = useState('');
   const [text, setText] = useState('');
   const [generating, setGenerating] = useState(false);
@@ -27,12 +26,7 @@ export default function SpeechPage() {
   const [streamTotal, setStreamTotal] = useState(0);
   const audioChunksRef = useRef<Uint8Array[]>([]);
   const audio = useAudio();
-  const generationVoices = useMemo(
-    () => selectedEngine === 'dots'
-      ? voices.filter((voice) => voice.source === 'clone' && voice.has_audio)
-      : withDefaultVoice(voices),
-    [selectedEngine, voices],
-  );
+  const generationVoices = useMemo(() => withDefaultVoice(voices), [voices]);
   const selectedModel = '1.7b-base';
 
   useEffect(() => {
@@ -47,11 +41,6 @@ export default function SpeechPage() {
     }).catch(() => {});
     getLanguages().then(setLanguages).catch(() => setLanguages(['English', 'Chinese', 'German']));
   }, []);
-
-  useEffect(() => {
-    if (generationVoices.some((voice) => voice.id === selectedVoice)) return;
-    setSelectedVoice(generationVoices[0]?.id || '');
-  }, [generationVoices, selectedVoice]);
 
   const base64ToBytes = useCallback((b64: string): Uint8Array => {
     const binary = atob(b64);
@@ -154,7 +143,6 @@ export default function SpeechPage() {
         text: text.trim(),
         voice_id: selectedVoice,
         model_id: selectedModel,
-        engine: selectedEngine,
         language: selectedLang || undefined,
       });
       setMeta(result.meta);
@@ -186,7 +174,6 @@ export default function SpeechPage() {
           text: text.trim(),
           voice_id: selectedVoice,
           model_id: selectedModel,
-          engine: selectedEngine,
           language: selectedLang || undefined,
         },
         (chunk: StreamChunk) => {
@@ -313,34 +300,6 @@ export default function SpeechPage() {
         </div>
       </div>
 
-      {/* Engine comparison */}
-      <div
-        className="glass"
-        style={{
-          padding: '14px',
-          borderRadius: 'var(--radius-panel)',
-          display: 'grid',
-          gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
-          gap: '10px',
-        }}
-      >
-        <EngineOption
-          active={selectedEngine === 'qwen'}
-          name="Qwen3-TTS"
-          description="All voices · clone, custom and default"
-          onClick={() => setSelectedEngine('qwen')}
-        />
-        <EngineOption
-          active={selectedEngine === 'dots'}
-          name="dots.tts"
-          description="Only cloned voices · direct A/B comparison"
-          onClick={() => {
-            setSelectedEngine('dots');
-            setStreaming(false);
-          }}
-        />
-      </div>
-
       {/* Control bar */}
       <div
         className="glass speech-control-grid"
@@ -355,9 +314,6 @@ export default function SpeechPage() {
             className="input-field"
             style={selectStyle}
           >
-            {generationVoices.length === 0 && (
-              <option value="">No compatible clone voice available</option>
-            )}
             {generationVoices.map((v) => (
               <option key={v.id} value={v.id}>
                 {v.name} · {voiceSourceLabel(v)}
@@ -382,9 +338,8 @@ export default function SpeechPage() {
           <button
             type="button"
             onClick={() => setStreaming(!streaming)}
-            disabled={selectedEngine === 'dots'}
             aria-pressed={streaming}
-            title={selectedEngine === 'dots' ? 'Streaming is available with Qwen3-TTS' : 'Stream long texts chunk by chunk for faster first audio'}
+            title="Stream long texts chunk by chunk for faster first audio"
             style={{
               height: '42px',
               padding: '0 14px',
@@ -392,7 +347,6 @@ export default function SpeechPage() {
               border: `1px solid ${streaming ? 'rgba(123,97,255,0.4)' : 'rgba(255,255,255,0.08)'}`,
               background: streaming ? 'var(--color-accent-dim)' : 'rgba(255,255,255,0.03)',
               color: streaming ? 'var(--color-accent-hover)' : 'var(--color-text-secondary)',
-              opacity: selectedEngine === 'dots' ? 0.5 : 1,
               fontSize: '12.5px',
               fontWeight: 500,
               display: 'inline-flex',
@@ -406,7 +360,7 @@ export default function SpeechPage() {
               className={streaming ? 'status-dot status-dot-online' : 'status-dot'}
               style={streaming ? undefined : { background: 'var(--color-text-dim)' }}
             />
-            {selectedEngine === 'dots' ? 'Qwen only' : streaming ? 'On' : 'Off'}
+            {streaming ? 'On' : 'Off'}
           </button>
         </Field>
 
@@ -680,61 +634,6 @@ const selectStyle: React.CSSProperties = {
   backgroundPosition: 'right 12px center',
   paddingRight: '30px',
 };
-
-function EngineOption({
-  active,
-  name,
-  description,
-  onClick,
-}: {
-  active: boolean;
-  name: string;
-  description: string;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      aria-pressed={active}
-      onClick={onClick}
-      style={{
-        minHeight: '72px',
-        padding: '13px 15px',
-        borderRadius: '13px',
-        border: `1px solid ${active ? 'rgba(123,97,255,0.5)' : 'rgba(255,255,255,0.07)'}`,
-        background: active
-          ? 'linear-gradient(135deg, rgba(123,97,255,0.2), rgba(70,199,255,0.08))'
-          : 'rgba(255,255,255,0.025)',
-        boxShadow: active ? '0 8px 30px rgba(57,39,138,0.16)' : 'none',
-        color: 'var(--color-text)',
-        textAlign: 'left',
-        cursor: 'pointer',
-        display: 'flex',
-        alignItems: 'center',
-        gap: '12px',
-        transition: 'border-color 0.18s ease, background 0.18s ease, box-shadow 0.18s ease',
-      }}
-    >
-      <span
-        aria-hidden
-        style={{
-          width: '9px',
-          height: '9px',
-          borderRadius: '999px',
-          flex: '0 0 auto',
-          background: active ? 'var(--color-accent-hover)' : 'var(--color-text-faint)',
-          boxShadow: active ? '0 0 14px rgba(123,97,255,0.85)' : 'none',
-        }}
-      />
-      <span style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-        <span style={{ fontSize: '13.5px', fontWeight: 650 }}>{name}</span>
-        <span style={{ fontSize: '11.5px', color: 'var(--color-text-dim)', lineHeight: 1.35 }}>
-          {description}
-        </span>
-      </span>
-    </button>
-  );
-}
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (

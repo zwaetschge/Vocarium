@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (Claude.ai/code) when working with co
 
 ## What this repo is
 
-Self-hosted, ElevenLabs-compatible voice platform named **Vocarium**. A Docker Compose stack that orchestrates a central FastAPI gateway (`vocarium-api`), a React/Vite UI, and five GPU inference workers (Qwen TTS, dots.tts, ASR, music, SFX). A second Qwen TTS replica (`qwen3-tts-2`) and a second API (`vocarium-api-2`) are gated behind the `dual-gpu` Compose profile and only start when explicitly enabled. Inter-service traffic runs on the `voice-network` bridge; public traffic lands on the gateway.
+Self-hosted, ElevenLabs-compatible voice platform named **Vocarium**. A Docker Compose stack that orchestrates a central FastAPI gateway (`vocarium-api`), a React/Vite UI, and four GPU inference workers (TTS, ASR, music, SFX). A second TTS replica (`qwen3-tts-2`) and a second API (`vocarium-api-2`) are gated behind the `dual-gpu` Compose profile and only start when explicitly enabled. Inter-service traffic runs on the `voice-network` bridge; public traffic lands on the gateway.
 
 The stack also includes a **Podcast Studio** (`/podcasts` endpoints): an LLM-driven script generator that turns uploaded documents into a multi-speaker dialogue script, then renders the script to audio with optional failover to the second TTS replica.
 
@@ -13,7 +13,6 @@ The stack also includes a **Podcast Studio** (`/podcasts` endpoints): an LLM-dri
 ```
 UI (3100) ──► vocarium-api (8280) ──► gpu_queue ──┬─► qwen3-tts     (8880 internal, 8201 host)
                    │                               ├─► qwen3-tts-2   (dual-gpu profile only)
-                   │                               ├─► dots-tts      (8890 internal, 8205 host)
                    │                               ├─► qwen3-asr     (8000 internal, 8200 host)
                    │                               ├─► acestep       (8003 internal, 8203 host)
                    │                               └─► mmaudio       (8004 internal, 8204 host)
@@ -21,15 +20,15 @@ UI (3100) ──► vocarium-api (8280) ──► gpu_queue ──┬─► qwen
                    └── Shared voices volume: /app/voices (custom voice metadata + ref audio)
 ```
 
-Inter-container URLs use service names on `voice-network`: `http://qwen3-tts:8880`, `http://dots-tts:8890`, `http://qwen3-asr:8000`, `http://acestep:8003`, `http://mmaudio:8004`. `TTS_URL_2` is empty by default; in dual-GPU mode it's set to `http://qwen3-tts-2:8880`.
+Inter-container URLs use service names on `voice-network`: `http://qwen3-tts:8880`, `http://qwen3-asr:8000`, `http://acestep:8003`, `http://mmaudio:8004`. `TTS_URL_2` is empty by default; in dual-GPU mode it's set to `http://qwen3-tts-2:8880`.
 
 ### GPU coordination (non-obvious)
 
-GPU placement is env-driven (`GPU_TTS_1`, `GPU_TTS_2`, `GPU_DOTS_TTS`, `GPU_ASR`, `GPU_MUSIC`, `GPU_SFX`). Defaults put everything on GPU 0; idle-unload timeouts are what make that viable.
+GPU placement is env-driven (`GPU_TTS_1`, `GPU_TTS_2`, `GPU_ASR`, `GPU_MUSIC`, `GPU_SFX`). Defaults put everything on GPU 0; idle-unload timeouts are what make that viable.
 
-- **Single-GPU (default)**: All workers target GPU 0. Qwen and dots.tts are separate queue services and evict one another before loading. dots.tts reads existing clone `ref_audio.wav` and `metadata.json` files directly and does not maintain a second voice library. Both TTS workers use `IDLE_TIMEOUT=120`, while ASR/music/SFX use their own lazy-unload policies.
+- **Single-GPU (default)**: All workers target GPU 0. `qwen3-tts` uses `IDLE_TIMEOUT=120` so sequential podcast segments reuse the loaded model without a 20s reload, while still freeing VRAM after idle so ASR/music/SFX can claim the GPU. `qwen3-asr` runs as a lazy-start proxy (`asr_proxy.py`) — spins up vLLM on first `/v1/models` request, unloads after `IDLE_TIMEOUT=300s`. ACE-Step/MMAudio are similarly lazy; they request TTS eviction before starting, mutually exclude each other, and both unload after 600s idle.
 - **Emergency fallback (opt-in via `COMPOSE_PROFILES=dual-gpu` + `TTS_URL_2=http://qwen3-tts-2:8880`)**: `qwen3-tts-2` is available on GPU 1 (`GPU_TTS_2=1`), but every API replica always tries the RTX 3060 service first. The RTX 5060 Ti is contacted only after a real primary TTS request failure. ASR/music/SFX remain pinned to GPU 0.
-- **`vocarium-api/gpu_queue.py`** is an env-aware FIFO coordinator that serializes GPU work. It reads `GPU_TTS_PRIMARY`, `GPU_TTS_EXTRA`, `GPU_DOTS_TTS`, `GPU_ASR`, `GPU_MUSIC`, and `GPU_SFX`; before running a job it unloads services assigned to the same GPU.
+- **`vocarium-api/gpu_queue.py`** is an env-aware FIFO coordinator that serializes GPU work. It reads `GPU_TTS_PRIMARY`, `GPU_TTS_EXTRA`, `GPU_ASR`, `GPU_MUSIC`, and `GPU_SFX`; before running a job it unloads services assigned to the same GPU.
 - **Podcast TTS uses one queue job per audio render, not one per segment** — generated music/SFX assets are rendered first through `gpu_queue`; then the speech/reaction phase runs inside a single `tts` queue job. `VocariumTTSGenerator` always sends segments to `qwen3-tts` on the RTX 3060 first and only retries a failed request on optional `qwen3-tts-2`.
 
 ### Podcast Data Flow

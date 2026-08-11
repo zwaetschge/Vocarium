@@ -6,8 +6,6 @@ third party. One Docker Compose stack gives you:
 
 - **TTS** — Qwen3-TTS 1.7B in three flavours: voice cloning, voice design
   from a description, and 9 prebuilt speakers with emotion steering.
-- **TTS comparison** — dots.tts SOAR reuses the same saved clone recordings
-  and transcripts; switch engines directly on the Speech page.
 - **ASR** — Qwen3-ASR transcription for voice cloning and arbitrary audio.
 - **Music** — ACE-Step text-to-music with optional lyrics.
 - **SFX** — MMAudio sound effects from text prompts.
@@ -110,14 +108,12 @@ Everything is in `.env`. Highlights:
 |--------------------|----------------|-----------------------------------------------------------|
 | `VOCARIUM_UI_PORT` | `3100`         | Public UI port.                                           |
 | `VOCARIUM_API_PORT`| `8280`         | Gateway API.                                              |
-| `GPU_TTS_1`        | `0`            | GPU index for the primary Qwen TTS replica.               |
-| `GPU_DOTS_TTS`     | `0`            | GPU index for lazy-loaded dots.tts (clone voices only).   |
+| `GPU_TTS_1`        | `0`            | GPU index for the primary TTS replica.                    |
 | `GPU_ASR`          | `0`            | GPU index for ASR. Coexists with TTS via idle-unload.     |
 | `GPU_MUSIC` / `GPU_SFX` | `0` / `0` | Default: same GPU as TTS. Re-pin to `1` for dual-GPU.     |
 | `COMPOSE_PROFILES` | (empty)        | Set to `dual-gpu` to enable a second TTS replica.         |
 | `TTS_URL_2`        | (empty)        | Set to `http://qwen3-tts-2:8880` in dual-GPU mode.        |
 | `TTS_IDLE_TIMEOUT` | `120` s        | Auto-unload after this idle period. `0` = never.          |
-| `DOTS_TTS_IDLE_TIMEOUT` | `120` s   | Auto-unload dots.tts so GPU 0 returns to Vocarium.        |
 | `ALLOW_ANONYMOUS`  | `true`         | Single-user fallback when no `Remote-User` header.        |
 | `CORS_ORIGINS`     | `*`            | Restrict to your UI origins in production.                |
 | `MAX_VOICE_UPLOAD_BYTES` | `52428800` | Max reference-audio upload size.                         |

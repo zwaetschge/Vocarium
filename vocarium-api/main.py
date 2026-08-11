@@ -62,7 +62,6 @@ logger = logging.getLogger(__name__)
 
 API_INSTANCE_ID = os.environ.get("VOCARIUM_INSTANCE_ID") or socket.gethostname()
 TTS_URL = os.environ.get("TTS_URL", "http://qwen3-tts:8880")
-DOTS_TTS_URL = os.environ.get("DOTS_TTS_URL", "http://dots-tts:8890")
 # Optional second TTS replica (set when running with COMPOSE_PROFILES=dual-gpu).
 # Empty/unset means single-GPU mode — all TTS goes through TTS_URL.
 TTS_URL_2 = os.environ.get("TTS_URL_2", "").strip()
@@ -85,7 +84,7 @@ MAX_MUSIC_ENHANCE_BODY_BYTES = int(
 )
 TTS_RESPONSE_FORMATS = {"wav", "mp3", "flac", "opus", "aac", "pcm"}
 MUSIC_RESPONSE_FORMATS = {"wav", "mp3", "flac"}
-SUPPORTED_TTS_ENGINES = {"qwen", "dots"}
+SUPPORTED_TTS_ENGINES = {"qwen"}
 SUPPORTED_MUSIC_ENGINES = {"acestep"}
 SUPPORTED_SFX_ENGINES = {"mmaudio"}
 VOICE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
@@ -336,8 +335,6 @@ def _select_tts_backend(req_model: str | None, req_engine: str | None) -> tuple[
     else:
         engine = "qwen"
 
-    if engine == "dots":
-        return DOTS_TTS_URL, "dots"
     return TTS_URL, "qwen"
 
 
@@ -500,11 +497,6 @@ async def _unload_tts():
     await _post_unload(TTS_URL, "Qwen3-TTS", "was_loaded", wait_if_busy=True)
 
 
-async def _unload_dots_tts():
-    """Unload dots.tts if idle so other Vocarium services can use GPU 0."""
-    await _post_unload(DOTS_TTS_URL, "dots.tts", "was_loaded", wait_if_busy=True)
-
-
 async def _unload_extra_tts():
     """Unload the optional secondary TTS model if configured and idle."""
     if TTS_URL_2:
@@ -556,13 +548,7 @@ async def tts_json(method: str, path: str, **kwargs) -> dict:
     return json.loads(body)
 
 
-async def _run_tts_job(
-    description: str,
-    work_maker,
-    *,
-    tts_url: str = TTS_URL,
-    service_type: str = "tts",
-):
+async def _run_tts_job(description: str, work_maker, *, tts_url: str = TTS_URL):
     """Run a TTS job on the GPU TTS service via the shared GPU queue.
 
     work_maker(tts_url) → coroutine that performs the actual TTS work.
@@ -570,7 +556,7 @@ async def _run_tts_job(
     async def work():
         return await work_maker(tts_url)
 
-    _, future = await gpu_queue.submit(service_type, description, work)
+    _, future = await gpu_queue.submit("tts", description, work)
     return await future
 
 
@@ -702,7 +688,6 @@ async def startup():
     # both unload only what can actually collide.
     unloaders = {
         "tts": _unload_tts,
-        "dots": _unload_dots_tts,
         "asr": _unload_asr,
         "music": _unload_music,
         "sfx": _unload_sfx,
@@ -1361,25 +1346,6 @@ def _voice_source(voice_id: str, user_id: int | None = None) -> str:
     return (row[0] or "clone").lower()
 
 
-def _is_dots_clone_voice(voice_id: str, user_id: int) -> bool:
-    """Return whether the user owns a complete clone usable by dots.tts.
-
-    ``default`` is also Qwen's built-in base-voice identifier, so its name
-    alone is not sufficient. Require the user-scoped clone row, transcript,
-    and shared reference WAV before routing it to dots.tts.
-    """
-    row = get_db().execute(
-        "SELECT source, ref_text FROM voices WHERE id=? AND user_id=?",
-        (voice_id, user_id),
-    ).fetchone()
-    return bool(
-        row
-        and (row[0] or "clone").lower() == "clone"
-        and (row[1] or "").strip()
-        and _voice_has_audio(voice_id)
-    )
-
-
 def _custom_tts_payload(
     *,
     text: str,
@@ -1404,7 +1370,6 @@ async def _tts_generate_for_voice(
     text: str,
     voice_id: str,
     source: str,
-    engine: str,
     response_format: str,
     user_id: int,
     model_id: str | None = None,
@@ -1413,22 +1378,6 @@ async def _tts_generate_for_voice(
     response_format = _validate_audio_format(
         response_format, allowed=TTS_RESPONSE_FORMATS
     )
-    if engine == "dots":
-        if source != "clone" or not _is_dots_clone_voice(voice_id, user_id):
-            raise HTTPException(400, "dots.tts supports cloned voices only")
-        if response_format != "wav":
-            raise HTTPException(400, "dots.tts currently supports WAV output only")
-        payload = {
-            "input": text,
-            "voice": voice_id,
-            "response_format": "wav",
-        }
-        if language:
-            payload["language"] = language
-        return await tts_request(
-            "POST", "/v1/audio/speech", url=tts_url, json=payload
-        )
-
     if source == "custom":
         return await tts_request(
             "POST",
@@ -1473,17 +1422,15 @@ async def generate_speech_stream(req: GenerateRequest, request: Request):
     _require_text_limit(req.text)
     _verify_voice_exists(req.voice_id, user_id=user["id"])
     source = _voice_source(req.voice_id, user_id=user["id"])
-    selected_url, selected_engine = _select_tts_backend(req.model_id, req.engine)
     event_queue: asyncio.Queue[str | None] = asyncio.Queue()
 
     async def work_maker(tts_url):
-        if source == "custom" or selected_engine == "dots":
+        if source == "custom":
             status, headers, body = await _tts_generate_for_voice(
                 tts_url=tts_url,
                 text=req.text,
                 voice_id=req.voice_id,
                 source=source,
-                engine=selected_engine,
                 response_format="wav",
                 user_id=user["id"],
                 language=req.language,
@@ -1545,17 +1492,7 @@ async def generate_speech_stream(req: GenerateRequest, request: Request):
 
     async def worker():
         try:
-            if selected_engine == "dots":
-                await _run_tts_job(
-                    "dots.tts Stream",
-                    work_maker,
-                    tts_url=selected_url,
-                    service_type="dots",
-                )
-            else:
-                await _run_tts_job(
-                    "TTS Stream", work_maker, tts_url=selected_url
-                )
+            await _run_tts_job("TTS Stream", work_maker)
         except Exception as exc:
             logger.exception("TTS stream failed")
             await event_queue.put(_sse_event("error", {"error": str(exc)}))
@@ -1597,7 +1534,6 @@ async def generate_speech(req: GenerateRequest, request: Request):
             text=req.text,
             voice_id=req.voice_id,
             source=source,
-            engine=selected_engine,
             response_format=req.response_format,
             user_id=user["id"],
             model_id=req.model_id,
@@ -1609,18 +1545,7 @@ async def generate_speech(req: GenerateRequest, request: Request):
         content_type = headers.get("Content-Type", headers.get("content-type", "audio/wav"))
         return {"body": body, "media_type": content_type, "headers": resp_headers}
 
-    if selected_engine == "dots":
-        result = await _run_tts_job(
-            "dots.tts Generate",
-            work_maker,
-            tts_url=selected_url,
-            service_type="dots",
-        )
-    else:
-        result = await _run_tts_job(
-            "TTS Generate", work_maker, tts_url=selected_url
-        )
-    result["headers"]["X-TTS-Engine"] = selected_engine
+    result = await _run_tts_job("TTS Generate", work_maker, tts_url=selected_url)
     return Response(content=result["body"], media_type=result["media_type"], headers=result["headers"])
 
 
@@ -2558,17 +2483,7 @@ async def _openai_speech_proxy(
         content_type = headers.get("Content-Type", headers.get("content-type", "audio/wav"))
         return {"body": body, "media_type": content_type, "voice": voice}
 
-    if selected_engine == "dots":
-        result = await _run_tts_job(
-            f"dots.tts {description}",
-            work_maker,
-            tts_url=selected_url,
-            service_type="dots",
-        )
-    else:
-        result = await _run_tts_job(
-            description, work_maker, tts_url=selected_url
-        )
+    result = await _run_tts_job(description, work_maker)
     headers = {}
     headers["X-TTS-Engine"] = selected_engine
     if result.get("voice") and result["voice"] != requested_voice:

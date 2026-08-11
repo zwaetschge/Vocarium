@@ -20,12 +20,8 @@ export function benchmarkVoices(voices: Voice[]): Voice[] {
   );
 }
 
-export function voiceSourceLabel(
-  voice: Pick<Voice, 'id' | 'source'> & Partial<Pick<Voice, 'has_audio'>>,
-): string {
-  if (voice.id === DEFAULT_VOICE.id) {
-    return voice.source === 'clone' && voice.has_audio ? 'Cloned default' : 'Base';
-  }
+export function voiceSourceLabel(voice: Pick<Voice, 'id' | 'source'>): string {
+  if (voice.id === DEFAULT_VOICE.id) return 'Base';
   if (voice.source === 'clone') return 'Cloned';
   if (voice.source === 'design') return 'Designed';
   if (voice.source === 'custom') return 'Custom';
