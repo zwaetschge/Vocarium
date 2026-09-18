@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.Vocarium" parent="Theme.AppCompat.NoActionBar">
+        <item name="android:windowBackground">#0C1019</item>
+        <item name="android:statusBarColor">#0C1019</item>
+        <item name="android:navigationBarColor">#0C1019</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="colorPrimary">#AEBEFF</item>
+        <item name="colorAccent">#AEBEFF</item>
+        <item name="colorControlActivated">#AEBEFF</item>
+        <item name="colorControlNormal">#A9B4C8</item>
+        <item name="android:textColorPrimary">#F2F4FA</item>
+        <item name="android:textColorSecondary">#A9B4C8</item>
+        <item name="android:textColorHint">#7F8AA3</item>
+        <item name="alertDialogTheme">@style/Theme.Vocarium.Dialog</item>
+        <item name="android:alertDialogTheme">@style/Theme.Vocarium.Dialog</item>
+        <item name="dialogTheme">@style/Theme.Vocarium.Dialog</item>
+    </style>
+    <style name="Theme.Vocarium.Dialog" parent="Theme.AppCompat.Dialog.Alert">
+        <item name="colorPrimary">#AEBEFF</item>
+        <item name="colorAccent">#AEBEFF</item>
+        <item name="colorControlActivated">#AEBEFF</item>
+        <item name="colorControlNormal">#A9B4C8</item>
+        <item name="android:windowBackground">@drawable/dialog_bg</item>
+        <item name="android:textColorPrimary">#F2F4FA</item>
+        <item name="android:textColorSecondary">#A9B4C8</item>
+        <item name="android:textColorHint">#7F8AA3</item>
+        <item name="android:windowMinWidthMajor">70%</item>
+        <item name="android:windowMinWidthMinor">92%</item>
+    </style>
+</resources>

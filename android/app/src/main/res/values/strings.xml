@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Vocarium</string>
+<string name="shortcut_books">Hörbücher</string>
+<string name="shortcut_podcasts">Podcasts</string>
+<string name="shortcut_plays">Hörspiele</string>
+<string name="shortcut_lab">Sprachstudio</string>
+</resources>

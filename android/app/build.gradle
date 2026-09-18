@@ -1,0 +1,38 @@
+apply plugin: 'com.android.application'
+apply plugin: 'org.jetbrains.kotlin.android'
+
+android {
+    compileSdk = 36
+    namespace 'ch.zwaetschge.vocarium'
+
+    defaultConfig {
+        applicationId 'ch.zwaetschge.vocarium'
+        minSdk 26
+        targetSdk 34
+        versionCode 17
+        versionName '3.0.0-dev.13'
+    }
+
+    kotlinOptions { jvmTarget = '11' }
+    compileOptions {
+        encoding 'UTF-8'
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+
+    buildFeatures { buildConfig = true }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+}
+
+dependencies {
+    implementation 'androidx.core:core-ktx:1.13.1'
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'androidx.webkit:webkit:1.11.0'
+    implementation 'androidx.swiperefreshlayout:swiperefreshlayout:1.1.0'
+    implementation 'androidx.media:media:1.7.0'
+}
