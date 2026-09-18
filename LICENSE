@@ -39,8 +39,6 @@ own license — review them before any production or commercial use:
   - ACE-Step (music generation)
       https://github.com/ACE-Step/ACE-Step-1.5
 
-  - MMAudio (sound-effect generation)
-      https://github.com/hkchengrex/MMAudio
 
 Vocarium itself bundles no model weights. Models are pulled at install time
 into a local cache directory.

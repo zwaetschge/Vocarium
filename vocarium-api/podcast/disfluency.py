@@ -7,12 +7,14 @@ import random
 import re
 import time
 import uuid
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from typing import Literal
 
 logger = logging.getLogger(__name__)
 
 
+# "sfx" ist Altlast: die Soundgenerierung wurde entfernt. Der Wert bleibt
+# akzeptiert, damit bereits gespeicherte Skripte weiter laden.
 SegmentType = Literal["speech", "reaction", "pause", "sfx", "music"]
 Language = Literal["german", "english"]
 ReactionType = Literal[
@@ -43,7 +45,7 @@ class ScriptSegment:
     # Mixing offset relative to the previous segment's end (ms).
     # 0 = use the contextual gap; <0 = overlap (interruption); >0 = forced gap.
     overlap_ms: int = 0
-    # Audio-track fields. Used by type="music" and type="sfx" with prompt.
+    # Audio-track fields. Used by type="music" with prompt.
     prompt: str | None = None
     duration_ms: int = 0
     volume_db: float = 0.0
@@ -89,21 +91,23 @@ FILL_WORDS: dict[Language, dict[str, list[str]]] = {
 
 
 REACTIONS: dict[Language, dict[ReactionType, list[str]]] = {
+    # Reaktionen tragen OmniVoice-Tags: "[confirmation-en]" klingt wie ein
+    # echtes "mhm", das ausgeschriebene Wort dagegen wie Vorlesen.
     "german": {
-        "agreement": ["Mhm", "Ja", "Genau", "Absolut", "Stimmt", "Richtig", "Ja genau", "Ja klar"],
-        "surprise": ["Echt jetzt?", "Wirklich?", "Krass", "Wow", "Oh", "Echt?", "Nein oder?"],
-        "thought": ["Hmm", "Interessant", "Okay", "Aha", "Ich seh schon"],
-        "amusement": ["Haha ja", "Das stimmt", "Ja genau", "Oh ja"],
-        "encouraging": ["Und?", "Dann?", "Erzähl weiter", "Ja und?", "Was dann?"],
-        "understanding": ["Aha", "Oh okay", "Ah verstehe", "Klar", "Natürlich", "Macht Sinn"],
+        "agreement": ["[confirmation-en]", "[confirmation-en] Genau", "[confirmation-en] Ja", "Genau", "Absolut", "Stimmt", "[confirmation-en] Ja klar"],
+        "surprise": ["[surprise-oh] Echt jetzt?", "[surprise-ah] Wirklich?", "[surprise-wa] Krass", "[surprise-oh]", "[surprise-wa]", "[surprise-oh] Nein oder?"],
+        "thought": ["[question-en]", "[question-en] Interessant", "[question-en] Okay", "[surprise-ah] Aha", "[question-en] Ich seh schon"],
+        "amusement": ["[laughter]", "[laughter] Ja", "[laughter] Das stimmt", "[laughter] Oh ja"],
+        "encouraging": ["[question-ah] Und?", "[question-oh] Dann?", "Erzähl weiter", "[question-en] Ja und?", "[question-ei] Was dann?"],
+        "understanding": ["[surprise-ah] Verstehe", "[confirmation-en] Okay", "[surprise-ah] Ah verstehe", "[confirmation-en] Klar", "[confirmation-en] Macht Sinn"],
     },
     "english": {
-        "agreement": ["Mhm", "Yeah", "Exactly", "Absolutely", "Right", "True", "Totally"],
-        "surprise": ["Really?", "Wow", "No way?", "Seriously?", "Oh"],
-        "thought": ["Hmm", "Interesting", "Okay", "I see"],
-        "amusement": ["Haha yeah", "That's true", "Oh yeah", "Exactly"],
-        "encouraging": ["And then?", "Go on", "Tell me more"],
-        "understanding": ["Oh I see", "Ah okay", "Got it", "Makes sense"],
+        "agreement": ["[confirmation-en]", "[confirmation-en] Yeah", "Exactly", "Absolutely", "[confirmation-en] Right", "True", "Totally"],
+        "surprise": ["[surprise-oh] Really?", "[surprise-wa] Wow", "[surprise-oh] No way?", "[surprise-ah] Seriously?", "[surprise-oh]"],
+        "thought": ["[question-en]", "[question-en] Interesting", "[question-en] Okay", "[surprise-ah] I see"],
+        "amusement": ["[laughter]", "[laughter] Yeah", "[laughter] That's true", "[laughter] Oh yeah"],
+        "encouraging": ["[question-ah] And then?", "[question-oh] Go on", "Tell me more"],
+        "understanding": ["[surprise-oh] I see", "[surprise-ah] Okay", "[confirmation-en] Got it", "[confirmation-en] Makes sense"],
     },
 }
 
@@ -279,7 +283,12 @@ class DisfluencyEngine:
         if self.options.level == 0:
             return segments, stats
 
-        lang: Language = "german" if self.options.language.startswith("de") else "english"
+        # Die Sprache kommt je nach Aufrufer als ISO-Code ("de"), englischem
+        # Namen ("German") oder deutschem Namen ("Deutsch"); alles davon ist
+        # Deutsch. Ein Fehlgriff hier streut englische Zwischenrufe wie
+        # "Exactly" in ein deutsches Gespraech.
+        raw = (self.options.language or "").strip().lower()
+        lang: Language = "german" if raw.startswith(("de", "ger")) else "english"
         processed = self._cap_segment_lengths(list(segments))
 
         if self.options.level >= 1:

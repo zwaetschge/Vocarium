@@ -1,0 +1,145 @@
+{
+  "series": {
+    "title": "Dragon Ball",
+    "year": 1986
+  },
+  "preferred_names": [
+    "Son Goku",
+    "Bulma"
+  ],
+  "known_character_names": [
+    "Son Goku",
+    "Goku",
+    "Bulma"
+  ],
+  "narration_density": "audio_drama",
+  "episode_contexts": [
+    {
+      "episode_id": "6557",
+      "synopsis": "Son Goku begegnet nach einem Zusammenstoß im Bergwald erstmals Bulma.",
+      "continuity_before": "Der Serienerzähler hat Gokus abgeschiedenes Leben, das Holzsammeln, seine Kampfausbildung und seinen Hunger bereits hörbar erklärt.",
+      "major_beats": [
+        "Goku trägt Holz zur Hütte.",
+        "Bulmas Auto erfasst Goku und seinen Fisch.",
+        "Goku wirft das vermeintliche Monsterauto zur Seite.",
+        "Bulma feuert auf Goku und erkennt seine Widerstandskraft."
+      ],
+      "character_introductions": [
+        {
+          "name": "Son Goku",
+          "role": "Der allein in den Bergen lebende Protagonist.",
+          "distinguishing_traits": "Außergewöhnlich stark, naiv und weltfremd.",
+          "visual_description": "Kleiner, drahtiger Junge mit schwarzem, stachelig abstehendem Haar; trägt ein oranges Kampfgewand und besitzt einen braunen affenartigen Schwanz.",
+          "first_appearance": "Er trägt einen überbreiten Baumstamm am Flussufer zur Hütte.",
+          "introduction_required": true
+        },
+        {
+          "name": "Bulma",
+          "role": "Stadtmädchen auf der Suche nach den Dragon Balls.",
+          "distinguishing_traits": "Technisch versiert, direkt und selbstbewusst.",
+          "visual_description": "Jugendliches Mädchen mit türkisfarbenem Haar; trägt in der ersten Szene Kleidung mit ihrem Namen und dem Capsule-Corporation-Logo.",
+          "first_appearance": "Sie fährt in einem grünen Auto durch den Bergwald.",
+          "introduction_required": true
+        }
+      ]
+    }
+  ],
+  "cues": [
+    {
+      "id": "c001",
+      "order": 1,
+      "text": "Son Goku trägt einen Baumstamm am Fluss entlang.",
+      "source_context": "Son Goku stapfte am Ufer entlang und trug einen Baumstamm über der Schulter, der breiter war als sein ganzer Körper. Er war ein kleiner, drahtiger Junge mit wildem schwarzem Stachelhaar und orangefarbenem Kampfgewand. Hinter seinem Rücken ragte ein brauner Affenschwanz aus der Hose und schwang im Takt seiner Schritte.",
+      "proposed_episode_id": "6557",
+      "proposed_anchor_ms": 60000,
+      "nearby_subtitles": "Unsere Geschichte spielt irgendwo im tiefsten Gebirge. In dieser einsamen Gegend lebt ganz allein ein kleiner Junge. Dieser kleine Junge hieß Son Goku. Früh morgens ging er Holz für seinen Ofen sammeln und dann hackte er es klein. Aber nicht mit einer Axt: Er spaltet das Holz mit seinen Fäusten.",
+      "book_edge": "none"
+    },
+    {
+      "id": "c002",
+      "order": 2,
+      "text": "Bulma kommt im Auto durch den Wald.",
+      "source_context": "Am Steuer des grünen Autos saß Bulma, ein jugendliches Mädchen mit türkisfarbenem Haar. Auf ihrer Kleidung standen ihr Name und das Capsule-Corporation-Logo. In einer Hand hielt sie eine kleine runde Anzeige mit drei blinkenden Lichtpunkten.",
+      "proposed_episode_id": "6557",
+      "proposed_anchor_ms": 165000,
+      "nearby_subtitles": "Soweit hatte er es nicht mehr bis zur Hütte, als Son Goku ein merkwürdiges Geräusch hinter sich hörte. Es klang wie ein Brummen und wurde immer lauter. [Musik]",
+      "book_edge": "none"
+    },
+    {
+      "id": "c003",
+      "order": 3,
+      "text": "Goku schleudert das Auto von der Straße.",
+      "source_context": "Mit einem wütenden Ruf stürmte Goku hinterher, packte das Heck des grünen Autos und hob es an. Bulma schrie auf. Goku schleuderte den Wagen zur Seite; er überschlug sich und blieb verbeult zwischen den Bäumen liegen.",
+      "proposed_episode_id": "6557",
+      "proposed_anchor_ms": 215000,
+      "nearby_subtitles": "Du willst mir meine Beute klauen? Aber da hast du dich geschnitten, du Monster. Wenn du sie haben willst, versuch sie doch zu holen. Na warte. [Applaus] Oh, bist du wahnsinnig geworden?",
+      "book_edge": "none"
+    },
+    {
+      "id": "c004",
+      "order": 4,
+      "text": "Bulma weicht nach den Schüssen zurück.",
+      "source_context": "Als Goku wieder aufsprang, wich Bulma einen Schritt zurück und umklammerte die Pistole mit beiden Händen. Ihr Blick blieb auf dem Jungen geheftet.",
+      "proposed_episode_id": "6557",
+      "proposed_anchor_ms": 255000,
+      "nearby_subtitles": "Was war das denn? Nur Gummikugeln. Habe ich dir etwa weh getan? Du mir weh getan? Sowas macht mir doch nichts aus. Aber du hast mir einen riesen Schrecken eingejagt.",
+      "book_edge": "none"
+    }
+  ],
+  "segments": [
+    {
+      "id": "s001",
+      "episode_id": "6557",
+      "episode_order": 1,
+      "start_ms": 60000,
+      "end_ms": 76000,
+      "text": "Dieser kleine Junge hieß Son Goku. Früh morgens ging er Holz für seinen Ofen sammeln."
+    },
+    {
+      "id": "s002",
+      "episode_id": "6557",
+      "episode_order": 1,
+      "start_ms": 90000,
+      "end_ms": 100000,
+      "text": "Aber nicht mit einer Axt. Nein, er spaltet das Holz mit seinen Fäusten."
+    },
+    {
+      "id": "s003",
+      "episode_id": "6557",
+      "episode_order": 1,
+      "start_ms": 165000,
+      "end_ms": 173000,
+      "text": "[Musik]"
+    },
+    {
+      "id": "s004",
+      "episode_id": "6557",
+      "episode_order": 1,
+      "start_ms": 185000,
+      "end_ms": 192000,
+      "text": "Vorsicht! Ah! Ich habe ihn überfahren."
+    },
+    {
+      "id": "s005",
+      "episode_id": "6557",
+      "episode_order": 1,
+      "start_ms": 215000,
+      "end_ms": 225000,
+      "text": "Na warte. Oh, bist du wahnsinnig geworden?"
+    },
+    {
+      "id": "s006",
+      "episode_id": "6557",
+      "episode_order": 1,
+      "start_ms": 255000,
+      "end_ms": 267000,
+      "text": "Du mir weh getan? Sowas macht mir doch nichts aus. Aber du hast mir einen riesen Schrecken eingejagt."
+    }
+  ],
+  "execution": {
+    "provider": "codex",
+    "model": "gpt-5.6-sol",
+    "reasoning_effort": "xhigh",
+    "timeout_seconds": 1800
+  }
+}

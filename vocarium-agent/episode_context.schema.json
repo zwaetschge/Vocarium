@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "series_title": { "type": "string" },
+    "episode_contexts": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "properties": {
+          "episode_id": { "type": "string" },
+          "synopsis": { "type": "string" },
+          "continuity_before": { "type": "string" },
+          "major_beats": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "character_introductions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string" },
+                "role": { "type": "string" },
+                "distinguishing_traits": { "type": "string" },
+                "visual_description": { "type": "string" },
+                "first_appearance": { "type": "string" },
+                "introduction_required": { "type": "boolean" }
+              },
+              "required": [
+                "name",
+                "role",
+                "distinguishing_traits",
+                "visual_description",
+                "first_appearance",
+                "introduction_required"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "sources": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "properties": {
+                "url": { "type": "string" },
+                "title": { "type": "string" },
+                "claim": { "type": "string" }
+              },
+              "required": ["url", "title", "claim"],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "episode_id",
+          "synopsis",
+          "continuity_before",
+          "major_beats",
+          "character_introductions",
+          "sources"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "notes": { "type": "array", "items": { "type": "string" } }
+  },
+  "required": ["series_title", "episode_contexts", "notes"],
+  "additionalProperties": false
+}

@@ -6,7 +6,6 @@ import json
 import logging
 import re
 import time
-import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal
@@ -15,6 +14,7 @@ from .disfluency import DisfluencyOptions, ScriptSegment, create_disfluency_engi
 from .embedding_client import EmbeddingClient, get_embedding_client
 from .helpers import count_words, estimate_speaking_duration, top_k_by_similarity
 from .llm_client import LLMClient, LLMMessage, get_llm_client
+from .tags import TAG_CATALOG, enrich_tags, sanitize as sanitize_tags
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +151,7 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _normalize_segment_type(raw: str | None) -> Literal["speech", "reaction", "pause", "sfx"]:
+def _normalize_segment_type(raw: str | None) -> Literal["speech", "reaction", "pause"]:
     norm = (raw or "speech").lower()
     if norm in ("speech", "speaking", "dialogue"):
         return "speech"
@@ -159,9 +159,17 @@ def _normalize_segment_type(raw: str | None) -> Literal["speech", "reaction", "p
         return "reaction"
     if norm in ("pause", "silence", "break"):
         return "pause"
-    if norm in ("sfx", "sound", "effect"):
-        return "sfx"
     return "speech"
+
+
+def _lang_code(language: str | None) -> str:
+    """ISO-Kurzcode aus "de", "de-CH", "German" oder "Deutsch"."""
+    raw = (language or "de").strip().lower()
+    if raw.startswith(("de", "ger")):
+        return "de"
+    if raw.startswith(("en", "eng")):
+        return "en"
+    return raw.split("-")[0] or "de"
 
 
 class ScriptGenerator:
@@ -189,13 +197,18 @@ class ScriptGenerator:
 
         source_context = self._build_source_context(relevant_chunks, context.sources)
         llm = self._resolve_llm(user_id=user_id)
+        logger.info(
+            "Calling LLM %s at %s with %d chars of source context",
+            llm.config.model, llm.config.base_url, len(source_context),
+        )
         raw_segments = await self._generate_script_segments(source_context, context, llm=llm)
+        logger.info("LLM returned %d raw segments", len(raw_segments))
 
         segments, _stats = self._apply_disfluency(
             raw_segments,
             context.options.disfluency_level,
             context.options.format,
-            context.options.language or "de",
+            _lang_code(context.options.language),
         )
 
         total_words = sum(s.word_count for s in segments)
@@ -221,11 +234,28 @@ class ScriptGenerator:
         self, context: ScriptGenerationContext
     ) -> list[SourceChunk]:
         with_emb = [c for c in context.chunks if c.embedding]
+        logger.info(
+            "Chunk selection: %d chunks, %d with embeddings (endpoint %s)",
+            len(context.chunks), len(with_emb), self.embeddings.config.base_url,
+        )
+        if not with_emb and context.chunks:
+            # Der Import lief ohne Embedding-Dienst durch; statt blind die
+            # ersten 20 Chunks zu nehmen, wird hier nachgebettet (nicht
+            # persistiert, wenige Sekunden auf der CPU).
+            try:
+                vectors = await self.embeddings.embed_batch([c.content for c in context.chunks])
+                for chunk, vector in zip(context.chunks, vectors, strict=True):
+                    chunk.embedding = vector
+                with_emb = [c for c in context.chunks if c.embedding]
+                logger.info("Embedded %d chunks on demand", len(with_emb))
+            except Exception as exc:
+                logger.warning("On-demand embedding failed, using first chunks: %s", exc)
         if not with_emb:
             return context.chunks[:20]
 
         query_text = self._create_query_from_sources(context.sources)
         query_embedding = await self.embeddings.embed_single(query_text)
+        logger.info("Query embedding ready (%d dims)", len(query_embedding))
 
         top_k = min(30, len(with_emb))
         return top_k_by_similarity(with_emb, query_embedding, top_k)
@@ -277,7 +307,7 @@ class ScriptGenerator:
 
     def _get_system_prompt(self, options: ScriptGenerationOptions) -> str:
         base_prompt = self._get_base_system_prompt(options)
-        examples = self._get_disfluency_examples(options.language or "de")
+        examples = self._get_disfluency_examples(_lang_code(options.language))
         return f"{base_prompt}\n\n{examples}"
 
     @staticmethod
@@ -301,8 +331,11 @@ class ScriptGenerator:
         speaker_label_list = " | ".join(f'"{l}"' for l in speaker_labels)
         second_label = speaker_labels[1] if len(speaker_labels) > 1 else speaker_labels[0]
         segment_counts = _SEGMENT_COUNTS
+        tag_list = "\n".join(f"- `[{tag}]` — {label}: {hint}" for tag, label, hint in TAG_CATALOG)
+        # Zielzahl an Tags aus der Skriptlaenge: ein Laut je drei Segmente.
+        tag_target = {"short": 8, "medium": 15, "long": 25}.get(str(options.duration), 12)
 
-        lang_code = (options.language or "de").lower().split("-")[0]
+        lang_code = _lang_code(options.language)
         lang_name, forbidden, preferred = _language_meta(lang_code)
         forbidden_list = ", ".join(f'"{w}"' for w in forbidden) if forbidden else "(none listed — but any English/non-target-language phrase is banned)"
         preferred_list = ", ".join(f'"{w}"' for w in preferred) if preferred else "(use natural target-language fillers)"
@@ -319,7 +352,7 @@ EVERY single `text` field — speech, reactions, fillers, interjections, exclama
 **USE THESE INSTEAD for reactions/fillers/backchannels in {lang_name}:**
 {preferred_list}
 
-Also write the `notes` field in {lang_name} (describing emotion/tone) — this steers the TTS and must match the target language register.
+Also write the `notes` field in {lang_name} (describing emotion/tone) — it is an editorial note for the human editor, not a TTS instruction.
 
 **Why this is critical:** The TTS engine receives `language={lang_name}` and matches its pronunciation model to that. If you embed English words like "Seriously?" or "Go on" in the text, the model tries to pronounce them with a {lang_name} phonetic model and produces garbled, accented output. A single English word destroys an entire segment.
 
@@ -403,7 +436,7 @@ Wenn die analytische Arbeit steht, leg natürliche Sprache drauf:
 - Selbstkorrekturen und Satzneustarts
 - Reaktionen, die Engagement zeigen ("mhm", "warte mal", "okay aber--")
 - Ungleichmäßiges Tempo — manche Gedanken schnell, andere kreisen
-- TTS-relevante Tags in dynamischen Momenten
+- Nonverbale Tags (siehe Output Format) überall dort, wo ein Mensch hörbar reagieren würde: Lachen, Seufzen, ein zustimmendes „mhm", ein überraschtes „oh!", ein genervtes „hnn"
 
 ABER: Das ist FARBE, nicht STRUKTUR. Ein natürlich klingender Plot-Recap bleibt ein Plot-Recap.
 
@@ -414,26 +447,35 @@ ABER: Das ist FARBE, nicht STRUKTUR. Ein natürlich klingender Plot-Recap bleibt
 Return ONLY a JSON array of segments. Each segment must have:
 - `speaker`: Eines von: {speaker_label_list} — NUR diese Labels verwenden, exakt geschrieben
 - `text`: The spoken text (with natural disfluencies included) — **100 % in {lang_name}** (see LANGUAGE CONTRACT above)
-- `type`: One of "speech", "reaction", "pause", "sfx"
-- `notes`: PFLICHT AUF JEDEM SEGMENT (auch `reaction` und `pause`)! Emotion/Tonfall-Anweisung für TTS, geschrieben in {lang_name}. MUSS zur Persönlichkeit des SPEZFISCHEN Sprechers passen. NIEMALS `null`, NIEMALS leer. Bei Reactions ein kurzes Tonfall-Wort reichen (z.B. "zustimmend", "überrascht").
+- `type`: One of "speech", "reaction", "pause"
+- `notes`: Kurze Regie-Notiz in {lang_name} (Tonfall, Haltung). Sie steht im Editor neben dem Segment und hilft beim Redigieren — sie steuert die Stimme NICHT. Wer eine Emotion hörbar machen will, schreibt sie in den `text`.
 
-**Expression-Steuerung (PFLICHT):**
-Jeder Speaker hat eine EIGENE Expression-Palette basierend auf ihrer Persönlichkeit. Die `notes` MÜSSEN charakterspezifisch sein:
+**Nonverbale Tags — so klingt Emotion:**
+Die Sprachsynthese rendert diese Symbole als echten Laut, wenn sie mitten im `text` stehen; vorgelesen werden sie nie. Erlaubt ist ausschließlich diese Liste:
+{tag_list}
 
-- Wenn der Text WUT oder Kritik ausdrückt: EINER der Sprecher klingt "schnell aufsteigend, hitzig" (Vivian/Dylan), ein ANDERER "trocken sarkastisch" (Serena/Eric)
-- Wenn der Text NEUGIER zeigt: EINER "begeistert aufsteigend" (Dylan/Sohee), ein ANDERER "langsam grübelnd" (Serena)
-- NIEMALS generische "skeptisch" ohne Charakter-Bezug. WER ist skeptisch und WIE drückt diese Person Skepsis aus?
+Wann welches Tag:
+- `[laughter]` — echter Lacher, auch mitten im Satz, wenn etwas absurd oder komisch ist
+- `[sigh]` — Resignation, Erleichterung, „das ist anstrengend"
+- `[confirmation-en]` — das zustimmende „mhm" beim Zuhören; ersetzt ein ausgeschriebenes „Mhm"
+- `[question-en]` / `[question-ah]` / `[question-oh]` — nachdenkliches oder ungläubiges „hm?", „ah?", „oh?"
+- `[surprise-ah]` / `[surprise-oh]` / `[surprise-wa]` / `[surprise-yo]` — Überraschung, von leise bis laut
+- `[dissatisfaction-hnn]` — Unmut, Widerspruch, „das kaufe ich nicht"
 
-Die Expression-Matrix muss pro Segment aufgelöst werden: Welche Figur spricht, und wie spricht DIESE Figur in DIESEM Moment.
-
-JEDES Segment MUSS ein `notes`-Feld haben! Keine Ausnahmen.
+Regeln:
+- ZIEL: in etwa jedem dritten Segment ein Tag, insgesamt mindestens {tag_target} Tags im Skript, verteilt auf beide Sprecher. Ein Gespräch ohne Laute klingt wie eine Lesung.
+- Höchstens ZWEI Tags pro Segment. Zwei gleiche Tags direkt hintereinander sind verboten.
+- Das Tag steht dort, wo der Laut fällt — nicht pauschal am Anfang: „Das war-- [laughter] das war wirklich absurd."
+- Ausgeschriebene Laute („Haha", „Hmm", „Mhm", „Oh!", „Puh") gibt es nicht: an ihrer Stelle steht immer das Tag.
+- Ein `reaction`-Segment besteht bevorzugt aus einem Tag plus höchstens drei Wörtern: „[confirmation-en] Genau.", „[surprise-oh] Echt jetzt?", „[laughter]".
+- Erfinde keine weiteren Tags und schreibe keine Regieanweisungen in eckige Klammern. Alles außerhalb der Liste wird verworfen.
 
 Example structure (replace speaker-Labels mit den oben whitelisted):
 ```json
 [
-  {{"speaker": "{speaker_labels[0]}", "text": "Okay, ich muss mit Seite 47 anfangen, weil ich dachte, ich spinne.", "type": "speech", "notes": "energisch bestürzt, Stimme leicht aufsteigend"}},
-  {{"speaker": "{second_label}", "text": "Mhm, welche Stelle?", "type": "reaction", "notes": "ruhig anspannend, gedämpft neugierig"}},
-  {{"speaker": "{speaker_labels[0]}", "text": "Wo er behauptet, Freiheit und Verantwortung seien dasselbe. Das-- das ist doch lazy, oder?", "type": "speech", "notes": "pointiert lässig, leicht amüsiert, eine Augenbraue hochziehend"}}
+  {{"speaker": "{speaker_labels[0]}", "text": "Okay, ich muss mit Seite 47 anfangen, weil ich dachte, ich spinne.", "type": "speech", "notes": "energisch bestürzt"}},
+  {{"speaker": "{second_label}", "text": "Mhm, welche Stelle?", "type": "reaction", "notes": "gedämpft neugierig"}},
+  {{"speaker": "{speaker_labels[0]}", "text": "Wo er behauptet, Freiheit und Verantwortung seien dasselbe. Das-- [laughter] das ist doch lazy, oder?", "type": "speech", "notes": "amüsiert, pointiert"}}
 ]
 ```
 
@@ -802,7 +844,7 @@ REMEMBER: Include fill words, reactions, self-corrections, and natural speech pa
             custom = f"\n\n## Additional Instructions\n{context.options.custom_prompt}\n"
 
         segment_count = _SEGMENT_COUNTS[context.options.duration]
-        lang_code = (context.options.language or "de").lower().split("-")[0]
+        lang_code = _lang_code(context.options.language)
         lang_name, _forbidden, _preferred = _language_meta(lang_code)
 
         return f"""You are analyzing the source material below for an analytical discussion podcast. This is NOT an assignment to summarize or retell — this is a critical discussion that dissects the material.
@@ -878,7 +920,9 @@ Return ONLY the JSON array, no additional text."""
             if not isinstance(data, dict):
                 continue
             speaker = data.get("speaker") or self._get_default_speaker(context.options)
-            text = data.get("text") or ""
+            # Erfundene Tags fliegen hier raus — sonst stünden sie im Editor
+            # und würden von der Engine später stillschweigend verworfen.
+            text = enrich_tags(sanitize_tags(data.get("text") or "", engine="omnivoice"))
             seg_type = _normalize_segment_type(data.get("type"))
             notes = data.get("notes") or None
             words = count_words(text)
@@ -984,7 +1028,7 @@ Return ONLY the JSON array, no additional text."""
             max_tokens=500,
         )
 
-        new_text = response.strip().strip("\"'")
+        new_text = sanitize_tags(response.strip().strip("\"'"), engine="omnivoice")
         words = count_words(new_text)
 
         return ScriptSegment(
@@ -1027,9 +1071,6 @@ Return ONLY the JSON array, no additional text."""
         for seg in segments:
             if seg.type == "pause":
                 md.append(f"*[{seg.notes or 'pause'}]*\n")
-                continue
-            if seg.type == "sfx":
-                md.append(f"*[SFX: {seg.notes or seg.text}]*\n")
                 continue
 
             if seg.speaker != current_speaker:

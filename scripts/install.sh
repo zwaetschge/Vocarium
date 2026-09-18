@@ -4,7 +4,7 @@
 # Steps:
 #   1. Verify prerequisites (Docker, Compose v2, NVIDIA Container Toolkit).
 #   2. Bootstrap .env from .env.example if missing.
-#   3. Pre-pull the Qwen3 TTS + ASR weights (skip with --skip-models).
+#   3. Pre-pull the Whisper + embedding weights (skip with --skip-models).
 #   4. Build container images.
 #   5. Start the stack and run a smoke test.
 #

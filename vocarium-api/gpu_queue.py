@@ -1,9 +1,8 @@
 """GPU Queue — serializes GPU operations across configured inference services.
 
-GPU placement is defined in Docker Compose via GPU_TTS_*, GPU_ASR, GPU_MUSIC,
-and GPU_SFX. On single-GPU deployments, idle-unload keeps large models from
-coexisting in VRAM. Music and SFX evict each other since both need a large
-chunk of GPU memory. Jobs are processed FIFO; before each job, only services
+GPU placement is defined in Docker Compose via GPU_TTS_*, GPU_ASR (Whisper-STT)
+and GPU_MUSIC. On single-GPU deployments, idle-unload keeps large models from
+coexisting in VRAM. Jobs are processed FIFO; before each job, only services
 that cannot coexist with the incoming service are unloaded.
 """
 
@@ -71,18 +70,38 @@ def _csv(name: str, default: str = "") -> list[str]:
     return [v.strip() for v in (os.environ.get(name, default) or "").split(",") if v.strip()]
 
 
-def _service_need_mib(service_type: str) -> int:
+def _service_need_mib(service_type: str, override_mib: int | None = None) -> int:
     kind = "tts" if service_type == "tts_extra" else service_type
     defaults = {
-        "tts": 8500,
+        # Qwen3-TTS 1.7B uses about 4.7 GiB on the RTX 3060. This is a total
+        # footprint estimate, not additional free memory required beside an
+        # already-running TTS CUDA context.
+        "tts": 5500,
         "asr": 2500,
         "music": 8000,
-        "sfx": 7000,
     }
     default = defaults.get(kind, 0)
     if default <= 0:
         return 0
-    return _env_int(f"GPU_ESTIMATE_MIB_{kind.upper()}", default)
+    configured = _env_int(f"GPU_ESTIMATE_MIB_{kind.upper()}", default)
+    # A per-service constant has to assume the worst request that service can
+    # take. A caller that knows its own footprint may say so; it can only ask
+    # for *less* than the configured ceiling.
+    if override_mib is not None and override_mib > 0:
+        return min(configured, int(override_mib))
+    return configured
+
+
+def _service_memory_tolerance_mib(service_type: str) -> int:
+    """Allow for small gputasks/driver accounting differences.
+
+    The TTS 1.7B worker is measured at roughly 4.7 GiB on the RTX 3060, while
+    the conservative configured estimate remains 5.5 GiB. A 512 MiB tolerance
+    prevents false denials without weakening the estimate by a full GiB.
+    """
+    kind = "tts" if service_type == "tts_extra" else service_type
+    default = 512 if kind == "tts" else 0
+    return max(0, _env_int(f"GPU_GUARD_MEMORY_TOLERANCE_MIB_{kind.upper()}", default))
 
 def _gpu_id(name: str, default: str = "0") -> str:
     return (os.environ.get(name, default) or default).strip()
@@ -93,7 +112,6 @@ def _service_gpus() -> dict[str, str]:
         "tts": _gpu_id("GPU_TTS_PRIMARY", _gpu_id("GPU_TTS_1", "0")),
         "asr": _gpu_id("GPU_ASR", "0"),
         "music": _gpu_id("GPU_MUSIC", "0"),
-        "sfx": _gpu_id("GPU_SFX", "0"),
     }
     if os.environ.get("TTS_URL_2", "").strip():
         gpus["tts_extra"] = _gpu_id("GPU_TTS_EXTRA", _gpu_id("GPU_TTS_2", "1"))
@@ -203,7 +221,8 @@ def _gpu_protection_reasons(gpu: dict[str, Any]) -> list[str]:
         v.lower()
         for v in _csv(
             "GPU_GUARD_ALLOWED_CONTAINERS",
-            "qwen3-tts,qwen3-tts-2,qwen3-asr,acestep,mmaudio,vocarium-api,vocarium-api-2",
+            "qwen3-tts,qwen3-tts-2,whisper-stt,omnivoice-tts,kikiri-tts,"
+            "acestep,vocarium-api,vocarium-api-2",
         )
     }
     unknown_used = 0
@@ -234,9 +253,8 @@ def _service_container_names(service_type: str) -> set[str]:
     return {
         "tts": {"qwen3-tts"},
         "tts_extra": {"qwen3-tts-2"},
-        "asr": {"qwen3-asr"},
+        "asr": {"whisper-stt"},
         "music": {"acestep"},
-        "sfx": {"mmaudio"},
     }.get(service_type, set())
 
 
@@ -254,9 +272,11 @@ def _service_used_mib(gpu: dict[str, Any], service_type: str) -> int:
 def _decision_for_service(
     service_type: str,
     status: dict[str, Any],
+    need_mib: int | None = None,
 ) -> dict[str, Any]:
     target = _service_gpus().get(service_type)
-    need = _service_need_mib(service_type)
+    need = _service_need_mib(service_type, need_mib)
+    tolerance = _service_memory_tolerance_mib(service_type)
     candidates: list[dict[str, Any]] = []
     selected: dict[str, Any] | None = None
 
@@ -265,10 +285,10 @@ def _decision_for_service(
         reclaimable = _service_used_mib(gpu, service_type)
         effective_free = memory["free"] + reclaimable
         reasons = _gpu_protection_reasons(gpu)
-        if need > 0 and effective_free < need:
+        if need > 0 and effective_free + tolerance < need:
             reasons.append(
                 f"only {memory['free']} MiB free plus {reclaimable} MiB reclaimable, "
-                f"estimated need is {need} MiB"
+                f"estimated need is {need} MiB with {tolerance} MiB telemetry tolerance"
             )
         candidate = {
             "index": gpu.get("index"),
@@ -277,6 +297,7 @@ def _decision_for_service(
             "free_mib": memory["free"],
             "effective_free_mib": effective_free,
             "reclaimable_mib": reclaimable,
+            "memory_tolerance_mib": tolerance,
             "used_mib": memory["used"],
             "total_mib": memory["total"],
             "protected": _is_protected_gpu(gpu),
@@ -346,11 +367,13 @@ async def get_resource_status() -> dict[str, Any]:
     }
 
 
-async def require_gpu_resources(service_type: str) -> None:
+async def require_gpu_resources(
+    service_type: str, need_mib: int | None = None
+) -> None:
     """Block queued work when the selected GPU is protected or too full."""
     if not _env_bool("GPU_GUARD_ENABLED", True):
         return
-    if _service_need_mib(service_type) <= 0:
+    if _service_need_mib(service_type, need_mib) <= 0:
         return
 
     try:
@@ -368,7 +391,7 @@ async def require_gpu_resources(service_type: str) -> None:
         }
         raise GpuResourceError(service_type, decision)
 
-    decision = _decision_for_service(service_type, status)
+    decision = _decision_for_service(service_type, status, need_mib)
     if not decision["allowed"]:
         raise GpuResourceError(service_type, decision)
 
@@ -412,7 +435,7 @@ def register_cancel_checker(callback: Callable[[str], bool] | None):
 @dataclass
 class Job:
     job_id: str
-    service_type: str  # "tts" | "tts_extra" | "asr" | "music" | "sfx"
+    service_type: str  # "tts" | "tts_extra" | "asr" | "music"
     description: str
     user_id: int | None = None
     request_id: str | None = None
@@ -429,6 +452,7 @@ class Job:
     attempt_count: int = 0
     max_attempts: int = field(default_factory=lambda: max(1, _env_int("GPU_QUEUE_MAX_ATTEMPTS", 1)))
     cancel_requested: bool = False
+    need_mib: int | None = None
 
     def snapshot(self, *, queue_position: int | None = None) -> dict[str, Any]:
         return {
@@ -474,6 +498,7 @@ class GpuQueue:
         user_id: int | None = None,
         request_id: str | None = None,
         max_attempts: int | None = None,
+        need_mib: int | None = None,
     ) -> tuple[str, asyncio.Future]:
         """Submit a GPU job. Returns (job_id, future).
 
@@ -493,6 +518,7 @@ class GpuQueue:
             future=loop.create_future(),
             work_fn=work_fn,
             heartbeat_at=time.time(),
+            need_mib=need_mib,
         )
         if max_attempts is not None:
             job.max_attempts = max(1, int(max_attempts))
@@ -642,7 +668,9 @@ class GpuQueue:
                 await self._unload_conflicts(job.service_type)
                 if self._is_cancel_requested(job):
                     raise asyncio.CancelledError("cancelled")
-                await self._require_resources_with_self_unload(job.service_type)
+                await self._require_resources_with_self_unload(
+                    job.service_type, job.need_mib
+                )
                 if self._is_cancel_requested(job):
                     raise asyncio.CancelledError("cancelled")
                 result = await job.work_fn()
@@ -717,7 +745,9 @@ class GpuQueue:
                 if isinstance(result, Exception):
                     logger.warning("Unload callback for %s failed: %s", svc, result)
 
-    async def _require_resources_with_self_unload(self, service_type: str) -> None:
+    async def _require_resources_with_self_unload(
+        self, service_type: str, need_mib: int | None = None
+    ) -> None:
         """Verify GPU resources, unloading the incoming service once if needed.
 
         gputasks can report VRAM as used without process/container attribution.
@@ -727,7 +757,7 @@ class GpuQueue:
         blocked while avoiding false denials on repeated same-service jobs.
         """
         try:
-            await require_gpu_resources(service_type)
+            await require_gpu_resources(service_type, need_mib)
             return
         except GpuResourceError as first_error:
             unload = _unload_callbacks.get(service_type)
@@ -749,7 +779,7 @@ class GpuQueue:
                 )
                 raise first_error from unload_error
 
-        await require_gpu_resources(service_type)
+        await require_gpu_resources(service_type, need_mib)
 
     def _evict_old(self):
         """Remove old completed/failed jobs to bound memory."""
@@ -782,7 +812,7 @@ class GpuQueue:
         service_counts: dict[str, int] = {}
         for job in pending:
             service_counts[job.service_type] = service_counts.get(job.service_type, 0) + 1
-        for service_type in ("tts", "tts_extra", "asr", "music", "sfx"):
+        for service_type in ("tts", "tts_extra", "asr", "music"):
             set_gauge(
                 "vocarium_gpu_queue_length_by_service",
                 float(service_counts.get(service_type, 0)),

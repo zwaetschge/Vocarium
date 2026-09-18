@@ -15,6 +15,11 @@ from dataclasses import dataclass
 LabelValue = tuple[tuple[str, str], ...]
 
 
+def route_path_label(route: object | None) -> str:
+    value = getattr(route, "path", None)
+    return str(value) if value else "__unmatched__"
+
+
 def _label_value(labels: dict[str, object] | None) -> LabelValue:
     if not labels:
         return ()

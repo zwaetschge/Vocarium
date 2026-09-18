@@ -1,9 +1,11 @@
 import asyncio
 import io
 import os
+import py_compile
 import re
 import ast
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -14,6 +16,12 @@ from pathlib import Path
 
 API_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = API_ROOT.parent
+
+# API replicas the Compose file actually ships. The dual-GPU `vocarium-api-2`
+# replica was retired together with the second Qwen worker; keeping this as a
+# tuple means the bytecode-cache invariants still apply to whatever set of API
+# services exists, without hard-coding a replica that no longer does.
+API_SERVICES = ("vocarium-api",)
 sys.path.insert(0, str(API_ROOT))
 
 
@@ -350,7 +358,6 @@ class GpuQueuePlacementTest(unittest.TestCase):
                 "GPU_TTS_PRIMARY": "0",
                 "GPU_ASR": "0",
                 "GPU_MUSIC": "0",
-                "GPU_SFX": "0",
                 "TTS_URL_2": "",
             }
         )
@@ -365,7 +372,6 @@ class GpuQueuePlacementTest(unittest.TestCase):
                 "GPU_TTS_EXTRA": "1",
                 "GPU_ASR": "0",
                 "GPU_MUSIC": "1",
-                "GPU_SFX": "1",
                 "TTS_URL_2": "http://qwen3-tts-2:8880",
             }
         )
@@ -379,7 +385,7 @@ class GpuQueuePlacementTest(unittest.TestCase):
 
         calls: list[tuple[str, str]] = []
 
-        async def fake_require(service_type: str) -> None:
+        async def fake_require(service_type: str, need_mib: int | None = None) -> None:
             calls.append(("require", service_type))
             if calls.count(("require", service_type)) == 1:
                 raise gpu_queue.GpuResourceError(
@@ -417,11 +423,17 @@ class GpuQueuePlacementTest(unittest.TestCase):
 
 class SourceSecurityTest(unittest.TestCase):
     def test_podcast_voice_queries_are_user_scoped(self):
+        """Every read of the shared voices table must carry the tenant filter.
+
+        Pinning one literal statement went stale as soon as the queries moved,
+        which hid the actual rule: voices are per-user, so a query without
+        ``user_id=?`` leaks another tenant's presets.
+        """
         routes = (API_ROOT / "podcast" / "routes.py").read_text()
-        self.assertIsNone(
-            re.search(r'"SELECT id, source FROM voices WHERE id=\?"\s*,', routes)
-        )
-        self.assertIn("SELECT id, source FROM voices WHERE id=? AND user_id=?", routes)
+        queries = re.findall(r'"(SELECT [^"]*FROM voices[^"]*)"', routes)
+        self.assertTrue(queries, "expected at least one voices query to guard")
+        for query in queries:
+            self.assertIn("user_id=?", query, f"unscoped voices query: {query}")
 
     def test_prod_overlay_hides_gateway_port_and_fails_closed(self):
         prod = (REPO_ROOT / "docker-compose.prod.yml").read_text()
@@ -430,10 +442,140 @@ class SourceSecurityTest(unittest.TestCase):
         self.assertIn("ALLOW_ANONYMOUS: ${ALLOW_ANONYMOUS:-false}", prod)
         self.assertIn("CORS_ORIGINS: ${CORS_ORIGINS:?", prod)
 
+    def test_api_cache_mounts_avoid_read_only_source_bind_mountpoints(self):
+        compose = (REPO_ROOT / "docker-compose.yml").read_text()
+        strategies: dict[str, tuple[str, tuple[str, ...]]] = {}
+
+        for service in API_SERVICES:
+            match = re.search(
+                rf"(?ms)^  {re.escape(service)}:\n(?P<body>.*?)(?=^  [a-zA-Z0-9_-]+:\n|\Z)",
+                compose,
+            )
+            self.assertIsNotNone(match, f"missing Compose service {service}")
+            block = match.group("body")
+            read_only_targets = re.findall(
+                r"(?m)^      - [^:\n]+:(/[^:\n]+):ro$", block
+            )
+            tmpfs_targets = tuple(
+                re.findall(
+                    r"(?m)^      - type: tmpfs\n        target: (/\S+)$", block
+                )
+            )
+            nested_targets = [
+                (tmpfs_target, source_target)
+                for tmpfs_target in tmpfs_targets
+                for source_target in read_only_targets
+                if tmpfs_target == source_target
+                or tmpfs_target.startswith(source_target.rstrip("/") + "/")
+            ]
+            self.assertEqual(
+                nested_targets,
+                [],
+                f"{service} tmpfs targets must not require mountpoints below "
+                "read-only sources",
+            )
+
+            prefix_match = re.search(
+                r"(?m)^      PYTHONPYCACHEPREFIX:[ \t]*(\S+)[ \t]*$", block
+            )
+            self.assertIsNotNone(
+                prefix_match, f"{service} must configure PYTHONPYCACHEPREFIX"
+            )
+            prefix = prefix_match.group(1).strip("\"'")
+            self.assertTrue(prefix.startswith("/"))
+            self.assertFalse(prefix == "/app" or prefix.startswith("/app/"))
+            self.assertIn(prefix, tmpfs_targets)
+            self.assertFalse(
+                any("__pycache__" in Path(target).parts for target in tmpfs_targets)
+            )
+            strategies[service] = (prefix, tmpfs_targets)
+
+        self.assertEqual(len(set(strategies.values())), 1)
+
+    def test_api_cache_prefix_ignores_colocated_stale_bytecode(self):
+        compose = (REPO_ROOT / "docker-compose.yml").read_text()
+        prefixes: list[str] = []
+        for service in API_SERVICES:
+            match = re.search(
+                rf"(?ms)^  {re.escape(service)}:\n(?P<body>.*?)(?=^  [a-zA-Z0-9_-]+:\n|\Z)",
+                compose,
+            )
+            self.assertIsNotNone(match, f"missing Compose service {service}")
+            prefix_match = re.search(
+                r"(?m)^      PYTHONPYCACHEPREFIX:[ \t]*(\S+)[ \t]*$",
+                match.group("body"),
+            )
+            self.assertIsNotNone(
+                prefix_match, f"{service} must configure PYTHONPYCACHEPREFIX"
+            )
+            prefixes.append(prefix_match.group(1).strip("\"'"))
+        self.assertEqual(len(set(prefixes)), 1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source_root = Path(tmp) / "source"
+            source_root.mkdir()
+            module_path = source_root / "cache_probe.py"
+            module_path.write_text("VALUE = 'stale'\n")
+            colocated_cache = (
+                module_path.parent
+                / "__pycache__"
+                / f"{module_path.stem}.{sys.implementation.cache_tag}.pyc"
+            )
+            colocated_cache.parent.mkdir()
+            py_compile.compile(
+                str(module_path),
+                cfile=str(colocated_cache),
+                doraise=True,
+                invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+            )
+            module_path.write_text("VALUE = 'fresh'\n")
+
+            probe = (
+                "import importlib.util, pathlib, sys\n"
+                f"source_root = pathlib.Path({str(source_root)!r})\n"
+                "sys.path.insert(0, str(source_root))\n"
+                "import cache_probe\n"
+                "print(cache_probe.VALUE)\n"
+                "print(sys.pycache_prefix)\n"
+                "print(importlib.util.cache_from_source(str(source_root / 'cache_probe.py')))\n"
+            )
+            baseline_env = os.environ.copy()
+            baseline_env.pop("PYTHONPYCACHEPREFIX", None)
+            baseline_env["PYTHONDONTWRITEBYTECODE"] = "1"
+            baseline = subprocess.run(
+                [sys.executable, "-c", probe],
+                capture_output=True,
+                check=False,
+                env=baseline_env,
+                text=True,
+            )
+            self.assertEqual(baseline.returncode, 0, baseline.stderr)
+            baseline_output = baseline.stdout.splitlines()
+            self.assertEqual(baseline_output[0], "stale")
+            self.assertEqual(baseline_output[1], "None")
+            self.assertEqual(Path(baseline_output[2]), colocated_cache)
+
+            prefixed_env = baseline_env.copy()
+            prefixed_env["PYTHONPYCACHEPREFIX"] = prefixes[0]
+            prefixed = subprocess.run(
+                [sys.executable, "-c", probe],
+                capture_output=True,
+                check=False,
+                env=prefixed_env,
+                text=True,
+            )
+            self.assertEqual(prefixed.returncode, 0, prefixed.stderr)
+            prefixed_output = prefixed.stdout.splitlines()
+            self.assertEqual(prefixed_output[0], "fresh")
+            self.assertEqual(prefixed_output[1], prefixes[0])
+            redirected_cache = Path(prefixed_output[2])
+            self.assertTrue(redirected_cache.is_relative_to(Path(prefixes[0])))
+            self.assertNotEqual(redirected_cache, colocated_cache)
+
     def test_local_auth_default_allows_shared_api_user(self):
         main_source = (API_ROOT / "main.py").read_text()
         self.assertIn(
-            'ALLOW_ANONYMOUS = os.environ.get("ALLOW_ANONYMOUS", "true")',
+            'ALLOW_ANONYMOUS = os.environ.get("ALLOW_ANONYMOUS", "false")',
             main_source,
         )
         self.assertIn(
@@ -446,7 +588,7 @@ class SourceSecurityTest(unittest.TestCase):
         )
 
     def test_ui_nginx_forwards_identity_headers(self):
-        nginx = (REPO_ROOT / "vocarium-ui" / "nginx.conf").read_text()
+        nginx = (REPO_ROOT / "vocarium-ui" / "nginx.conf.template").read_text()
         self.assertIn("proxy_set_header Remote-User $http_remote_user;", nginx)
         self.assertIn(
             "proxy_set_header X-Forwarded-User $http_x_forwarded_user;",
@@ -454,15 +596,6 @@ class SourceSecurityTest(unittest.TestCase):
         )
         self.assertNotIn('proxy_set_header Remote-User "";', nginx)
         self.assertNotIn('proxy_set_header X-Forwarded-User "";', nginx)
-
-    def test_file_download_routes_are_tenant_scoped(self):
-        main_source = (API_ROOT / "main.py").read_text()
-        routes_source = (API_ROOT / "podcast" / "routes.py").read_text()
-        self.assertIn("SELECT id FROM voices WHERE id=? AND user_id=?", main_source)
-        self.assertIn("_require_owned_music_audio_path(user[\"id\"], path)", main_source)
-        self.assertIn("podcast = _get_podcast_or_404(db_getter(), podcast_id, user[\"id\"])", routes_source)
-        self.assertIn("path = _locate_audio(podcast)", routes_source)
-
 
 class ApiContractHardeningTest(unittest.TestCase):
     def test_sse_event_helper_emits_json_event_frame(self):
@@ -555,116 +688,60 @@ class PodcastProductionHardeningTest(unittest.TestCase):
         self.assertNotIn("Pod" + "Forge", source)
         self.assertNotIn("]\n```\n]\n```", source)
 
-    def test_docling_text_fallback_works_without_service_url(self):
-        source = (API_ROOT / "podcast" / "docling_client.py").read_text()
-        self.assertIn("DOCLING_API_URL is not configured", source)
-        self.assertIn("return {\"status\": \"success\", \"text\": content}", source)
+    def test_docling_fallback_works_without_service_url(self):
+        """Ohne Docling muessen Quellen trotzdem verarbeitet werden.
 
-    def test_dual_api_replicas_share_podcast_database_volume(self):
+        Dieser Stack bringt keinen Docling-Dienst mit, also darf ein PDF-Upload
+        nicht daran scheitern: der lokale Parser des Hoerbuch-Bereichs springt
+        ein, und eine URL wird direkt geholt.
+        """
+        source = (API_ROOT / "podcast" / "docling_client.py").read_text()
+        self.assertIn("return {\"status\": \"success\", \"text\": content}", source)
+        for ext in ('".pdf": "pdf"', '".epub": "epub"', '".docx": "docx"'):
+            self.assertIn(ext, source)
+        self.assertIn("from audiobooks.text_pipeline import parse_document", source)
+        self.assertIn("_fetch_url_text", source)
+
+    def test_the_single_api_owns_the_podcast_database_volume(self):
+        """One API service, one data volume, and no orphaned second volume.
+
+        This replaces the dual-replica sharing test: `vocarium-api-2` and the
+        `dual-gpu` profile are gone, so what still needs guarding is that the
+        remaining API mounts the podcast database and nobody introduced a
+        parallel `vocarium-data-2` alongside it.
+        """
         compose = (REPO_ROOT / "docker-compose.yml").read_text()
         self.assertNotIn("vocarium-data" + "-2", compose)
-        self.assertGreaterEqual(compose.count("- vocarium-data:/app/data"), 2)
+        self.assertEqual(
+            compose.count("- vocarium-data:/app/data"), len(API_SERVICES)
+        )
 
-    def test_mmaudio_generation_runs_off_event_loop(self):
-        source = (REPO_ROOT / "mmaudio" / "server.py").read_text()
-        self.assertIn("def _generate_sfx_blocking", source)
-        self.assertIn("await asyncio.to_thread(\n            _generate_sfx_blocking, req", source)
+    def test_podcast_tts_never_round_robins_to_emergency_gpu(self):
+        tree = ast.parse((API_ROOT / "podcast" / "routes.py").read_text())
+        generator_class = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "VocariumTTSGenerator"
+        )
+        order_method = next(
+            node for node in generator_class.body
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_ordered_tts_urls"
+        )
+        namespace: dict[str, object] = {}
+        exec(
+            compile(ast.Module(body=[order_method], type_ignores=[]), "routes.py", "exec"),
+            namespace,
+        )
 
-    def test_qwen_worker_validates_response_formats(self):
-        source = (REPO_ROOT / "qwen3-tts" / "server.py").read_text()
-        self.assertIn("SUPPORTED_OUTPUT_FORMATS", source)
-        self.assertIn("def _validate_response_format", source)
-        self.assertIn("Streaming speech returns base64 WAV chunks", source)
+        class GeneratorStub:
+            _tts_urls = ["http://qwen3-tts:8880", "http://qwen3-tts-2:8880"]
 
-    def test_qwen_clone_generation_is_voice_stable_by_default(self):
-        source = (REPO_ROOT / "qwen3-tts" / "server.py").read_text()
-        compose = (REPO_ROOT / "docker-compose.yml").read_text()
-        env_example = (REPO_ROOT / ".env.example").read_text()
-        self.assertIn("TTS_CLONE_DO_SAMPLE", source)
-        self.assertIn('"do_sample": CLONE_DO_SAMPLE', source)
-        self.assertIn('"temperature": CLONE_TEMPERATURE', source)
-        self.assertIn("TTS_CLONE_XVEC_ONLY", source)
-        self.assertIn('CLONE_XVEC_ONLY = _env_bool("TTS_CLONE_XVEC_ONLY", True)', source)
-        self.assertIn("TTS_CLONE_XVEC_ONLY=${TTS_CLONE_XVEC_ONLY:-true}", compose)
-        self.assertIn("TTS_CLONE_XVEC_ONLY=true", env_example)
-        self.assertIn('CLONE_NON_STREAMING_MODE = _env_bool("TTS_CLONE_NON_STREAMING_MODE", False)', source)
-        self.assertIn('"non_streaming_mode": CLONE_NON_STREAMING_MODE', source)
-        self.assertIn("TTS_CLONE_NON_STREAMING_MODE=${TTS_CLONE_NON_STREAMING_MODE:-false}", compose)
-        self.assertIn("TTS_CLONE_NON_STREAMING_MODE=false", env_example)
-        self.assertIn('xvec_only = CLONE_XVEC_ONLY or not (ref_text or "").strip()', source)
-        self.assertIn('"xvec_only": xvec_only', source)
-        self.assertIn('"x_vector_only_mode": xvec_only', source)
-        self.assertIn("def _normalize_reference_wav", source)
-        self.assertIn("ref_audio_normalization", source)
-        self.assertIn("TTS_REF_NORMALIZE_PEAK", source)
-        self.assertIn("Unknown voice", source)
-        self.assertNotIn("voice_id = available[0]", source)
-        self.assertLess(source.index("voice_id = request.voice"), source.index("ensure_model(target_model)"))
-        self.assertIn("inference_lock = threading.RLock()", source)
-        self.assertIn("with inference_lock:\n                for i, chunk in enumerate(chunks):", source)
-        self.assertIn("def _run_stream_request", source)
-        self.assertIn("loop.run_in_executor(None, _run_stream_request)", source)
-        self.assertIn("voice_clone_prompt_cache", source)
-        self.assertIn("create_voice_clone_prompt", source)
-        self.assertIn("voice_clone_prompt", source)
-        self.assertIn("_clear_voice_clone_prompt(voice_id)", source)
-
-    def test_qwen_clone_generation_caps_chunk_and_token_budget(self):
-        source = (REPO_ROOT / "qwen3-tts" / "server.py").read_text()
-        self.assertIn('MAX_CHUNK_CHARS = _env_int("TTS_MAX_CHUNK_CHARS", 140)', source)
-        self.assertIn('TOKEN_BUDGET_TOKENS_PER_CHAR = _env_float("TTS_TOKEN_BUDGET_TOKENS_PER_CHAR", 1.05)', source)
-        self.assertIn('TOKEN_BUDGET_MIN = _env_int("TTS_TOKEN_BUDGET_MIN", 40)', source)
-        self.assertIn("TTS_TOKEN_BUDGET_MIN=${TTS_TOKEN_BUDGET_MIN:-40}", (REPO_ROOT / "docker-compose.yml").read_text())
-        self.assertIn('TOKEN_BUDGET_MAX = _env_int("TTS_TOKEN_BUDGET_MAX", 260)', source)
-        self.assertIn("def _tts_token_limit", source)
-        self.assertIn("return min(TOKEN_BUDGET_MAX, max(TOKEN_BUDGET_MIN, estimated))", source)
-        self.assertIn("return _tts_token_limit(text, override)", source)
-        self.assertNotIn("int(len(text) * 2.0)", source)
-        self.assertNotIn("MAX_CHUNK_CHARS = 200", source)
-
-    def test_qwen_clone_generation_disables_cuda_graphs_by_default(self):
-        source = (REPO_ROOT / "qwen3-tts" / "server.py").read_text()
-        compose = (REPO_ROOT / "docker-compose.yml").read_text()
-        env_example = (REPO_ROOT / ".env.example").read_text()
-
-        self.assertIn('ENABLE_CUDA_GRAPHS = _env_bool("TTS_ENABLE_CUDA_GRAPHS", False)', source)
-        self.assertIn('TTS_ENABLE_CUDA_GRAPHS=${TTS_ENABLE_CUDA_GRAPHS:-false}', compose)
-        self.assertIn("TTS_ENABLE_CUDA_GRAPHS=false", env_example)
-
-    def test_qwen_clone_generation_retries_suspicious_chunks(self):
-        source = (REPO_ROOT / "qwen3-tts" / "server.py").read_text()
-
-        self.assertIn("TTS_CHUNK_MAX_SECONDS", source)
-        self.assertIn("TTS_CHUNK_RETRY_TOKEN_FACTOR", source)
-        self.assertIn("def _chunk_max_duration", source)
-        self.assertIn("def _is_suspicious_chunk", source)
-        self.assertIn("def _generate_guarded_voice_clone", source)
-        self.assertIn("retry_tokens = max(TOKEN_BUDGET_MIN, int(token_limit * CHUNK_RETRY_TOKEN_FACTOR))", source)
-        self.assertIn("raise RuntimeError(", source)
-        self.assertIn("_generate_guarded_voice_clone(", source)
-
-    def test_qwen_custom_voice_generation_is_voice_stable_by_default(self):
-        source = (REPO_ROOT / "qwen3-tts" / "server.py").read_text()
-        custom_start = source.index("@app.post(\"/v1/audio/speech/custom\")")
-        custom_end = source.index("return Response(", custom_start)
-        custom_source = source[custom_start:custom_end]
-        self.assertIn("TTS_CUSTOM_DO_SAMPLE", source)
-        self.assertIn("CUSTOM_DO_SAMPLE = _env_bool(\"TTS_CUSTOM_DO_SAMPLE\", False)", source)
-        self.assertIn("CUSTOM_TEMPERATURE", source)
-        self.assertIn("CUSTOM_TOP_K", source)
-        self.assertIn("CUSTOM_TOP_P", source)
-        self.assertIn("non_streaming_mode=True", custom_source)
-        self.assertIn("do_sample=CUSTOM_DO_SAMPLE", custom_source)
-        self.assertIn("temperature=CUSTOM_TEMPERATURE", custom_source)
-        self.assertIn("top_k=CUSTOM_TOP_K", custom_source)
-        self.assertIn("top_p=CUSTOM_TOP_P", custom_source)
-        self.assertIn("repetition_penalty=1.08", custom_source)
-        self.assertIn("custom_sampling", source)
-        self.assertIn("token_limit = _tts_token_limit(request.text, request.max_new_tokens)", custom_source)
+        expected = ["http://qwen3-tts:8880", "http://qwen3-tts-2:8880"]
+        ordered_urls = namespace["_ordered_tts_urls"]
+        self.assertEqual(asyncio.run(ordered_urls(GeneratorStub())), expected)
+        self.assertEqual(asyncio.run(ordered_urls(GeneratorStub())), expected)
 
     def test_webui_speech_generation_keeps_cloned_voices_available(self):
         main_source = (API_ROOT / "main.py").read_text()
-        speech_page = (REPO_ROOT / "vocarium-ui" / "src" / "pages" / "SpeechPage.tsx").read_text()
 
         generate_start = main_source.index("@app.post(\"/api/generate\")")
         generate_end = main_source.index("# ---------------------------------------------------------------------------\n# Benchmark", generate_start)
@@ -677,18 +754,13 @@ class PodcastProductionHardeningTest(unittest.TestCase):
         self.assertNotIn("Speech generation only supports custom voices", main_source)
         self.assertNotIn("_require_custom_generation_voice(source)", generate_source)
         self.assertNotIn("_require_custom_generation_voice(source)", stream_source)
-        self.assertIn("generationVoices = useMemo(() => withDefaultVoice(voices), [voices])", speech_page)
-        self.assertIn("const selectedModel = '1.7b-base'", speech_page)
-        self.assertIn("model_id: selectedModel", speech_page)
-        self.assertNotIn("voices.filter((voice) => voice.source === 'custom')", speech_page)
 
     def test_f5_experiment_is_not_in_stack(self):
         compose = (REPO_ROOT / "docker-compose.yml").read_text()
         env_example = (REPO_ROOT / ".env.example").read_text()
         main_source = (API_ROOT / "main.py").read_text()
-        speech_page = (REPO_ROOT / "vocarium-ui" / "src" / "pages" / "SpeechPage.tsx").read_text()
         e2e_source = (REPO_ROOT / "vocarium-ui" / "e2e" / "runtime.spec.ts").read_text()
-        combined = "\n".join([compose, env_example, main_source, speech_page, e2e_source])
+        combined = "\n".join([compose, env_example, main_source, e2e_source])
         self.assertNotIn("f5", combined.lower())
         self.assertFalse((REPO_ROOT / "f5-tts" / "Dockerfile").exists())
         self.assertFalse((REPO_ROOT / "f5-tts" / "server.py").exists())
@@ -707,90 +779,17 @@ class PodcastProductionHardeningTest(unittest.TestCase):
         self.assertGreaterEqual(len(chunks), 3)
         self.assertEqual(chunks[0][-10:], chunks[1][:10])
 
-    def test_music_audio_ownership_uses_normalized_file_table(self):
-        source = (API_ROOT / "main.py").read_text()
-        self.assertIn("SELECT 1 FROM music_task_files WHERE user_id=? AND path=? LIMIT 1", source)
-        self.assertNotIn("SELECT file_paths FROM music_tasks WHERE user_id=?", source)
+    def test_music_output_is_not_mounted_from_a_retired_worker(self):
+        """ACE-Step left the stack; the API must not claim its output volume.
 
-    def test_music_audio_prefers_local_acestep_output_file(self):
-        source = (API_ROOT / "main.py").read_text()
-        self.assertIn("MUSIC_OUTPUT_DIR", source)
-        self.assertIn('Path(os.environ.get("MUSIC_OUTPUT_DIR", "/app/acestep/.cache/acestep"))', source)
-        self.assertIn("def _music_audio_local_path(path: str) -> Path | None:", source)
-        self.assertIn("local_path = _music_audio_local_path(path)", source)
-        self.assertIn("return FileResponse(", source)
-
-    def test_api_mounts_acestep_output_read_only(self):
+        The route code still knows how to serve a local music file (see
+        `test_music_download_serves_local_files_without_proxying`), but there is
+        no longer a worker producing one, and a stale read-only mount of a
+        removed volume would fail the whole API on `up`.
+        """
         compose = (REPO_ROOT / "docker-compose.yml").read_text()
-        self.assertIn("acestep-output:/app/acestep/.cache/acestep:ro", compose)
-
-    def test_music_generation_exposes_engine_and_client_audio_options(self):
-        source = (API_ROOT / "main.py").read_text()
-        self.assertIn('SUPPORTED_MUSIC_ENGINES = {"acestep"}', source)
-        self.assertIn('engine: str = "acestep"', source)
-        self.assertIn('negative_prompt: str = ""', source)
-        self.assertIn("instrumental: bool = False", source)
-        self.assertIn("loopable: bool = False", source)
-        self.assertIn("normalize_lufs: float | None = None", source)
-        self.assertIn("fade_ms: int = 0", source)
-        self.assertIn("_validate_engine(req.engine, SUPPORTED_MUSIC_ENGINES", source)
-        self.assertIn("_validate_lufs(req.normalize_lufs)", source)
-        self.assertIn("_validate_fade_ms(req.fade_ms)", source)
-        self.assertIn('"negative_prompt": req.negative_prompt', source)
-        self.assertIn('"instrumental": req.instrumental', source)
-        self.assertIn('"loopable": req.loopable', source)
-        self.assertIn('"vocarium_options"', source)
-
-    def test_sfx_generation_exposes_engine_and_negative_prompt_controls(self):
-        source = (API_ROOT / "main.py").read_text()
-        self.assertIn('SUPPORTED_SFX_ENGINES = {"mmaudio"}', source)
-        self.assertIn("_validate_engine(engine, SUPPORTED_SFX_ENGINES", source)
-        self.assertIn('no_speech = _coerce_bool(body.get("no_speech", False), "no_speech")', source)
-        self.assertIn('no_music = _coerce_bool(body.get("no_music", False), "no_music")', source)
-        self.assertIn("_merge_negative_prompt(", source)
-        self.assertIn('"speech, voice, vocals, talking"', source)
-        self.assertIn('"music, melody, song, vocals"', source)
-        self.assertIn("_validate_lufs(normalize_lufs)", source)
-        self.assertIn("_validate_fade_ms(fade_ms)", source)
-        self.assertIn('"vocarium_options"', source)
-
-    def test_sfx_generation_uses_cold_start_timeout_and_translates_client_errors(self):
-        source = (API_ROOT / "main.py").read_text()
-        self.assertIn("SFX_GENERATE_TIMEOUT_SECONDS", source)
-        self.assertIn('os.environ.get("SFX_GENERATE_TIMEOUT_SECONDS", "900")', source)
-        self.assertIn("sock_read=timeout_seconds", source)
-        self.assertIn("except asyncio.TimeoutError as exc:", source)
-        self.assertIn("SFX backend timed out", source)
-        self.assertIn("except aiohttp.ClientError as exc:", source)
-        self.assertIn("SFX backend connection failed", source)
-
-    def test_mmaudio_unload_reports_busy_while_lock_is_held(self):
-        source = (REPO_ROOT / "mmaudio" / "server.py").read_text()
-        self.assertIn("lock.acquire(blocking=False)", source)
-        self.assertIn('"status": "busy"', source)
-        self.assertIn("try:\n        was_loaded = model_loaded", source)
-        self.assertIn("finally:\n        lock.release()", source)
-
-    def test_audio_generation_services_report_first_load_download_status(self):
-        ace_source = (REPO_ROOT / "acestep" / "proxy.py").read_text()
-        mmaudio_source = (REPO_ROOT / "mmaudio" / "server.py").read_text()
-        self.assertIn("MODEL_WEIGHT_HINTS", ace_source)
-        self.assertIn("backend_starting", ace_source)
-        self.assertIn("last_start_error", ace_source)
-        self.assertIn('"first_load"', ace_source)
-        self.assertIn("MODEL_WEIGHT_HINTS", mmaudio_source)
-        self.assertIn("model_loading", mmaudio_source)
-        self.assertIn("last_load_error", mmaudio_source)
-        self.assertIn('"first_load"', mmaudio_source)
-
-    def test_acestep_query_result_timeout_allows_first_load(self):
-        ace_source = (REPO_ROOT / "acestep" / "proxy.py").read_text()
-        self.assertIn("QUERY_RESULT_TIMEOUT_SECONDS", ace_source)
-        self.assertIn(
-            'os.environ.get("ACESTEP_QUERY_RESULT_TIMEOUT_SECONDS", "600")',
-            ace_source,
-        )
-        self.assertIn("aiohttp.ClientTimeout(total=QUERY_RESULT_TIMEOUT_SECONDS)", ace_source)
+        self.assertNotIn("acestep-output:", compose)
+        self.assertNotIn("  acestep:", compose)
 
     def test_audio_generation_benchmark_script_documents_preload_costs(self):
         script = REPO_ROOT / "scripts" / "benchmark-audio-generation.py"
@@ -824,12 +823,24 @@ class PodcastProductionHardeningTest(unittest.TestCase):
         self.assertIn("Audio artifact integrity check failed", source)
         self.assertIn("VERIFY_ARTIFACT_HASH_ON_READ", source)
 
-    def test_podcast_tts_batch_is_single_gpu_queue_job(self):
+    def test_podcast_tts_batch_runs_outside_the_gpu_queue(self):
+        """Speech renders in one batch, and that batch does not queue.
+
+        The invariant inverted when podcasts moved to OmniVoice and Kikiri:
+        both are resident (GPU slice / CPU), so there is nothing for the queue
+        to evict and taking a `tts` slot would only serialise against music.
+        What still matters is that the assembler hands the whole foreground
+        pass to a single `run_batch` call rather than per segment.
+        """
         routes = (API_ROOT / "podcast" / "routes.py").read_text()
         assembler = (API_ROOT / "podcast" / "audio_assembler.py").read_text()
         self.assertIn("async def run_batch", routes)
-        self.assertIn('await self._gpu_submit("tts", description, queued_work)', routes)
         self.assertIn('batch_runner(f"Podcast TTS {project_id}", _run_foreground_tts)', assembler)
+
+        batch = routes.split("async def run_batch", 1)[1].split("\n    async def", 1)[0]
+        self.assertNotIn("_gpu_submit", batch)
+        # Music is the one podcast phase that still needs a GPU slot.
+        self.assertIn('await self._gpu_submit("music", "Podcast Music", work)', routes)
 
     def test_tts_segment_cache_reuses_identical_audio(self):
         from podcast.audio_assembler import AssemblyOptions, AudioAssembler

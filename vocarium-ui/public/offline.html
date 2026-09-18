@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Vocarium — offline</title>
+  <style>
+    body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+           background: #09090b; color: rgba(255,255,255,0.85); font-family: system-ui, sans-serif; }
+    .box { text-align: center; padding: 32px; }
+    h1 { font-size: 22px; margin: 0 0 8px; }
+    p { font-size: 14px; opacity: 0.65; margin: 0 0 20px; }
+    button { padding: 10px 22px; border-radius: 10px; border: none; cursor: pointer;
+             background: #7b61ff; color: #fff; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h1>Keine Verbindung</h1>
+    <p>Vocarium ist gerade nicht erreichbar. Bereits gehörte Segmente bleiben im Cache verfügbar.</p>
+    <button onclick="location.reload()">Erneut versuchen</button>
+    <button onclick="location.href='/audiobooks'" style="background:rgba(255,255,255,0.12);margin-left:8px">Zur Bibliothek</button>
+  </div>
+</body>
+</html>

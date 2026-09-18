@@ -1,32 +1,33 @@
 """Vocarium API Gateway.
 
 Central voice management API. Stores voice metadata in SQLite,
-proxies generation requests to Qwen3-TTS, and orchestrates
-cloning / design / benchmark workflows.
+proxies generation requests to the speech engines (OmniVoice, Kikiri),
+and orchestrates cloning / benchmark workflows.
 """
 
 import asyncio
 import base64
-import io
 import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import socket
 import time
 import uuid
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import urlparse
 
 import aiohttp
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form, Response, Query
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+import user_settings
+from access_control import is_admin_username
 from artifact_cleanup import cleanup_artifacts
 from database import (
     gpu_queue_quota_decision,
@@ -39,7 +40,7 @@ from database import (
     mark_interrupted_gpu_jobs,
     request_cancel_gpu_queue_job,
     upsert_gpu_queue_job,
-    backfill_hosts_for_all_users,
+    retire_legacy_qwen_hosts_for_all_users,
 )
 from gpu_queue import (
     GpuResourceError,
@@ -51,25 +52,56 @@ from gpu_queue import (
     register_quota_checker,
     register_unloaders,
 )
-from metrics import inc, observe, render_prometheus
+from health_public import build_public_health
+from metrics import inc, observe, render_prometheus, route_path_label
 from podcast.routes import create_podcast_router
 from request_context import request_id_var, user_id_var
 from url_security import URLValidationError, normalize_http_base_url
 
 logger = logging.getLogger(__name__)
+# Uvicorn konfiguriert nur seine eigenen Logger; ohne Root-Handler
+# verschwindet jedes logger.info() des Gateways spurlos.
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
 API_INSTANCE_ID = os.environ.get("VOCARIUM_INSTANCE_ID") or socket.gethostname()
-TTS_URL = os.environ.get("TTS_URL", "http://qwen3-tts:8880")
+# Qwen3-TTS is retired (2026-08-28). Empty is the supported default: the
+# backend selector raises 503 rather than dialling a host that is not there.
+# Set it back to http://qwen3-tts:8880 (plus QWEN_TTS_ENABLED=true and the
+# Compose service) to resurrect the engine.
+TTS_URL = os.environ.get("TTS_URL", "").strip()
+KIKIRI_TTS_URL = os.environ.get("KIKIRI_TTS_URL", "http://kikiri-tts:8881").strip()
+# Kikiri is the default speech engine: it runs on CPU, so it never queues behind
+# GPU work. Qwen stays available as the fallback for everything Kikiri cannot do
+# (cloned voices, voice design, non-WAV output) and can always be forced with
+# engine="qwen".
+DEFAULT_TTS_ENGINE = os.environ.get("DEFAULT_TTS_ENGINE", "omnivoice").strip().lower()
+KIKIRI_MODEL_CACHE_SECONDS = float(os.environ.get("KIKIRI_MODEL_CACHE_SECONDS", "30"))
+# VibeVoice-Realtime: retired together with Qwen (its clones were migrated to
+# OmniVoice). Empty default, otherwise every voice resolution pays a DNS lookup
+# against a host that no longer exists.
+VIBEVOICE_TTS_URL = os.environ.get("VIBEVOICE_TTS_URL", "").strip()
+# OmniVoice: zero-shot cloning from short reference audio, resident on GPU 0.
+OMNIVOICE_TTS_URL = os.environ.get("OMNIVOICE_TTS_URL", "http://omnivoice-tts:8880").strip()
+# Qwen TTS retirement switch: with the worker gone, its DB voices (clones,
+# designs, prebuilt custom speakers) would clutter the picker as dead entries.
+# The rows stay in the database — flip this back on to resurrect them.
+QWEN_TTS_ENABLED = os.environ.get("QWEN_TTS_ENABLED", "false").strip().lower() in ("1", "true", "yes")
 # Optional second TTS replica (set when running with COMPOSE_PROFILES=dual-gpu).
 # Empty/unset means single-GPU mode — all TTS goes through TTS_URL.
 TTS_URL_2 = os.environ.get("TTS_URL_2", "").strip()
 EXTRA_TTS_URLS = [TTS_URL_2] if TTS_URL_2 else []
-ASR_URL = os.environ.get("ASR_URL", "http://qwen3-asr:8000")
-MUSIC_URL = os.environ.get("MUSIC_URL", "http://acestep:8003")
-SFX_URL = os.environ.get("SFX_URL", "http://mmaudio:8004")
-SFX_GENERATE_TIMEOUT_SECONDS = int(os.environ.get("SFX_GENERATE_TIMEOUT_SECONDS", "900"))
+# Einziger STT-Dienst (faster-whisper large-v3, lazy + Idle-Unload).
+WHISPER_URL = os.environ.get("WHISPER_URL", "http://whisper-stt:8000").strip()
+# ACE-Step ist aus dem Compose-Stack raus, deshalb ist der Default leer:
+# ein gesetzter Wert wuerde die Podcast-Musikbruecke gegen einen toten Host
+# verdrahten, statt Musiksegmente sauber zu ueberspringen. Wer Musik wieder
+# will, setzt MUSIC_URL explizit.
+MUSIC_URL = os.environ.get("MUSIC_URL", "").strip()
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
-MUSIC_OUTPUT_DIR = Path(os.environ.get("MUSIC_OUTPUT_DIR", "/app/acestep/.cache/acestep"))
 VOICES_DIR = Path(os.environ.get("VOICES_DIR", "/app/voices"))
 MAX_VOICE_UPLOAD_BYTES = int(os.environ.get("MAX_VOICE_UPLOAD_BYTES", str(50 * 1024 * 1024)))
 MAX_TRANSCRIBE_UPLOAD_BYTES = int(
@@ -82,9 +114,8 @@ MAX_MUSIC_ENHANCE_BODY_BYTES = int(
 )
 TTS_RESPONSE_FORMATS = {"wav", "mp3", "flac", "opus", "aac", "pcm"}
 MUSIC_RESPONSE_FORMATS = {"wav", "mp3", "flac"}
-SUPPORTED_TTS_ENGINES = {"qwen"}
+SUPPORTED_TTS_ENGINES = {"qwen", "kikiri", "vibevoice", "omnivoice"}
 SUPPORTED_MUSIC_ENGINES = {"acestep"}
-SUPPORTED_SFX_ENGINES = {"mmaudio"}
 VOICE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 REQUEST_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
 TRACE_HEADER = "X-Request-ID"
@@ -97,10 +128,32 @@ OPENAI_TTS_DEFAULT_VOICE_PERSONA_ALIASES = {
 
 # `true` allows local single-user setups to fall back to a shared "api" user
 # when no Remote-User header is present. Disable for multi-user deployments.
-ALLOW_ANONYMOUS = os.environ.get("ALLOW_ANONYMOUS", "true").lower() in ("1", "true", "yes")
+ALLOW_ANONYMOUS = os.environ.get("ALLOW_ANONYMOUS", "false").lower() in ("1", "true", "yes")
+VOCARIUM_ADMIN_USERS = os.environ.get("VOCARIUM_ADMIN_USERS", "")
+
+
+def _load_proxy_secret() -> str:
+    """Nachweis, dass ``Remote-User`` wirklich vom Identity-Proxy stammt.
+
+    Jeder Container im selben Docker-Netz kann den Header setzen. Ist ein
+    Secret konfiguriert, zaehlt der Header nur noch zusammen mit
+    ``X-Vocarium-Proxy-Secret``; Nginx in vocarium-ui haengt ihn an.
+    """
+    value = os.environ.get("VOCARIUM_PROXY_SECRET", "").strip()
+    if value:
+        return value
+    secret_file = Path(os.environ.get("VOCARIUM_PROXY_SECRET_FILE", "/app/data/proxy-secret"))
+    try:
+        return secret_file.read_text("utf-8").strip()
+    except OSError:
+        return ""
+
+
+VOCARIUM_PROXY_SECRET = _load_proxy_secret()
 
 # Comma-separated list, or "*" for all (only safe in dev). Set per-deployment.
-_cors = os.environ.get("CORS_ORIGINS", "*").strip()
+# Ohne Angabe gibt es kein CORS: die UI ist same-origin hinter Nginx.
+_cors = os.environ.get("CORS_ORIGINS", "").strip()
 CORS_ORIGINS = ["*"] if _cors == "*" else [o.strip() for o in _cors.split(",") if o.strip()]
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -189,8 +242,7 @@ async def metrics_middleware(request: Request, call_next):
         response.headers[TRACE_HEADER] = request_id
         return response
     finally:
-        route = request.scope.get("route")
-        route_path = getattr(route, "path", request.url.path)
+        route_path = route_path_label(request.scope.get("route"))
         labels = {
             "method": request.method,
             "path": route_path,
@@ -227,6 +279,12 @@ def get_current_user(request: Request, allow_anonymous: bool = True) -> dict:
         or request.headers.get("X-Forwarded-User")
         or ""
     ).strip()
+    if username and VOCARIUM_PROXY_SECRET:
+        presented = request.headers.get("X-Vocarium-Proxy-Secret", "")
+        if not secrets.compare_digest(presented, VOCARIUM_PROXY_SECRET):
+            # Ein Identitaets-Header ohne Proxy-Nachweis ist ein Spoof-Versuch
+            # oder ein Direktzugriff; beides zaehlt wie "kein Header".
+            username = ""
     if not username and allow_anonymous and ALLOW_ANONYMOUS:
         user = get_or_create_user("api")
         user_id_var.set(user["id"])
@@ -239,6 +297,13 @@ def get_current_user(request: Request, allow_anonymous: bool = True) -> dict:
     user = get_or_create_user(username)
     user_id_var.set(user["id"])
     request.state.user = user
+    return user
+
+
+def _require_admin(request: Request) -> dict:
+    user = get_current_user(request)
+    if not is_admin_username(user["username"], VOCARIUM_ADMIN_USERS):
+        raise HTTPException(403, "Administrator access required")
     return user
 
 
@@ -319,14 +384,334 @@ def _validate_engine(engine: str, supported: set[str], field: str = "engine") ->
     return value
 
 
-def _select_tts_backend(req_model: str | None, req_engine: str | None) -> tuple[str, str]:
-    engine = (req_engine or "").strip().lower()
-    if engine:
-        engine = _validate_engine(engine, SUPPORTED_TTS_ENGINES)
-    else:
-        engine = "qwen"
+_kikiri_models_cache: tuple[float, dict[str, dict[str, str]]] = (0.0, {})
 
-    return TTS_URL, "qwen"
+
+async def _kikiri_models(*, force: bool = False) -> dict[str, dict[str, str]]:
+    """Map Kikiri model id → metadata, refreshed on a short TTL.
+
+    A fine-tune dropped into kikiri-tts/models/ has to show up without restarting
+    the API, but the listing is on the hot path of every speech request, so it is
+    cached rather than fetched per call.
+
+    The value carries ``name``/``group``/``gender``/``backend``. Everything
+    Kikiri serves is the CPU fallback for when OmniVoice cannot run; ``group``
+    only separates the two Kokoro fine-tunes (``kikiri``) from the Piper preset
+    bank (``fallback``) so pickers can sort the better ones first.
+    """
+    global _kikiri_models_cache
+    if not KIKIRI_TTS_URL:
+        return {}
+    fetched_at, cached = _kikiri_models_cache
+    if not force and cached and time.time() - fetched_at < KIKIRI_MODEL_CACHE_SECONDS:
+        return cached
+    try:
+        timeout = aiohttp.ClientTimeout(total=5)
+        async with _http_session().get(f"{KIKIRI_TTS_URL}/v1/models", timeout=timeout) as response:
+            response.raise_for_status()
+            payload = await response.json()
+        models = {
+            str(item["id"]): {
+                "name": str(item.get("description") or item["id"]),
+                "group": str(item.get("group") or "kikiri"),
+                "gender": str(item.get("gender") or "neutral"),
+                "backend": str(item.get("backend") or "kokoro"),
+                "notes": str(item.get("notes") or ""),
+            }
+            for item in payload.get("data", [])
+            if item.get("id")
+        }
+    except Exception as exc:
+        logger.warning(
+            "Kikiri model listing failed (%r); keeping %d cached models",
+            exc, len(cached),
+        )
+        _kikiri_models_cache = (time.time(), cached)
+        return cached
+    _kikiri_models_cache = (time.time(), models)
+    return models
+
+
+_vibevoice_models_cache: tuple[float, dict[str, str]] = (0.0, {})
+
+
+async def _vibevoice_models(*, force: bool = False) -> dict[str, str]:
+    """Map VibeVoice voice id → display name, refreshed on a short TTL.
+
+    Only the scanned ``.pt`` voice prompts count ("vibevoice-native"); the
+    OpenAI-name aliases would duplicate them and mean nothing to users.
+    """
+    global _vibevoice_models_cache
+    if not VIBEVOICE_TTS_URL:
+        return {}
+    fetched_at, cached = _vibevoice_models_cache
+    if not force and cached and time.time() - fetched_at < KIKIRI_MODEL_CACHE_SECONDS:
+        return cached
+    try:
+        timeout = aiohttp.ClientTimeout(total=5)
+        async with _http_session().get(f"{VIBEVOICE_TTS_URL}/v1/audio/voices", timeout=timeout) as response:
+            response.raise_for_status()
+            payload = await response.json()
+        models = {
+            str(item["voice_id"]): str(item.get("name") or item["voice_id"])
+            for item in payload.get("voices", [])
+            if item.get("voice_id") and item.get("type") == "vibevoice-native"
+        }
+    except Exception as exc:
+        logger.warning(
+            "VibeVoice voice listing failed (%r); keeping %d cached voices",
+            exc, len(cached),
+        )
+        # Stale beats empty: the worker blocks for seconds while generating,
+        # and a timed-out refresh must not make its voices vanish mid-request.
+        _vibevoice_models_cache = (time.time(), cached)
+        return cached
+    _vibevoice_models_cache = (time.time(), models)
+    return models
+
+
+_omnivoice_models_cache: tuple[float, dict[str, str]] = (0.0, {})
+# Referenztranskript je Klonstimme, aus derselben Antwort wie die Namensliste.
+# Getrennt gehalten, damit `_omnivoice_models` seinen id→name-Vertrag behält,
+# den `_is_omnivoice_voice` und die Auto-Weiche mitbenutzen.
+_omnivoice_reference_text: dict[str, str] = {}
+
+
+async def _omnivoice_models(*, force: bool = False) -> dict[str, str]:
+    """Map OmniVoice voice id → display name, same contract as the other caches."""
+    global _omnivoice_models_cache
+    if not OMNIVOICE_TTS_URL:
+        return {}
+    fetched_at, cached = _omnivoice_models_cache
+    if not force and cached and time.time() - fetched_at < KIKIRI_MODEL_CACHE_SECONDS:
+        return cached
+    try:
+        timeout = aiohttp.ClientTimeout(total=5)
+        async with _http_session().get(f"{OMNIVOICE_TTS_URL}/v1/audio/voices", timeout=timeout) as response:
+            response.raise_for_status()
+            payload = await response.json()
+        models = {
+            str(item["voice_id"]): str(item.get("name") or item["voice_id"])
+            for item in payload.get("voices", [])
+            if item.get("voice_id")
+        }
+        _omnivoice_reference_text.clear()
+        _omnivoice_reference_text.update({
+            str(item["voice_id"]): str(item["ref_text"]).strip()
+            for item in payload.get("voices", [])
+            if item.get("voice_id") and item.get("ref_text")
+        })
+    except Exception as exc:
+        logger.warning(
+            "OmniVoice voice listing failed (%r); keeping %d cached voices",
+            exc, len(cached),
+        )
+        _omnivoice_models_cache = (time.time(), cached)
+        return cached
+    _omnivoice_models_cache = (time.time(), models)
+    return models
+
+
+def _is_omnivoice_voice(voice_id: str) -> bool:
+    return bool(voice_id) and voice_id in _omnivoice_models_cache[1]
+
+
+def _is_vibevoice_voice(voice_id: str) -> bool:
+    return bool(voice_id) and voice_id in _vibevoice_models_cache[1]
+
+
+def _is_kikiri_voice(voice_id: str) -> bool:
+    """Whether the id names a published Kikiri fine-tune.
+
+    Reads the cached listing rather than the network so the sync validation
+    helpers stay sync; callers on the speech path refresh it first.
+    """
+    return bool(voice_id) and voice_id in _kikiri_models_cache[1]
+
+
+def _engine_voice(engine: str, voice: str | None, selected_model: str | None) -> str:
+    """Stimme, die der gewaehlte Engine-Container wirklich kennt.
+
+    Kikiri adressiert Stimmen ueber ``model``; OmniVoice kennt kein
+    ``default`` und bekommt die Stimme, die ``_select_tts_backend`` fuer
+    diesen Fall bereits bestimmt hat.
+    """
+    if engine == "kikiri":
+        return "default"
+    cleaned = (voice or "").strip()
+    if engine == "omnivoice" and cleaned in ("", "default") and selected_model:
+        return selected_model
+    return cleaned or "default"
+
+
+def _upstream_detail(body: bytes) -> str:
+    """Fehlertext eines Engine-Containers ohne doppelte JSON-Huelle."""
+    text = body.decode(errors="replace")
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return text
+    if isinstance(parsed, dict) and isinstance(parsed.get("detail"), str):
+        return parsed["detail"]
+    return text
+
+
+async def _select_tts_backend(
+    req_model: str | None,
+    req_engine: str | None,
+    *,
+    voice_id: str | None = None,
+    voice_source: str | None = None,
+    response_format: str | None = None,
+) -> tuple[str, str, str | None]:
+    """Pick the speech backend and, for Kikiri, the concrete fine-tune.
+
+    Returns ``(url, engine, kikiri_model_id)``. Selection is voice-driven:
+    OmniVoice is the main engine, Kikiri is the CPU fallback bank, and a voice
+    id picks its own engine. Qwen is the historical catch-all and is retired by
+    default, so that last branch raises 503 unless TTS_URL is configured again.
+    """
+    requested_engine = (req_engine or "").strip().lower()
+    if requested_engine:
+        requested_engine = _validate_engine(requested_engine, SUPPORTED_TTS_ENGINES)
+    model_name = (req_model or "").strip()
+    voice = (voice_id or "").strip()
+
+    if requested_engine == "qwen":
+        if not TTS_URL:
+            raise HTTPException(503, "Qwen TTS is retired (TTS_URL is not configured)")
+        return TTS_URL, "qwen", None
+
+    vibevoice = await _vibevoice_models() if VIBEVOICE_TTS_URL else {}
+
+    def resolve_vibevoice(name: str) -> str | None:
+        if not name:
+            return None
+        if name in vibevoice:
+            return name
+        lowered = name.casefold()
+        for vid, display in vibevoice.items():
+            if lowered in (vid.casefold(), display.casefold()):
+                return vid
+        return None
+
+    vv_chosen = resolve_vibevoice(voice) or resolve_vibevoice(model_name)
+    vv_exact = voice if voice in vibevoice else (model_name if model_name in vibevoice else None)
+    if requested_engine == "vibevoice":
+        if not VIBEVOICE_TTS_URL:
+            raise HTTPException(503, "VibeVoice TTS is not configured")
+        if not vibevoice:
+            raise HTTPException(503, "VibeVoice TTS has no voices available")
+        if voice_source == "custom":
+            raise HTTPException(400, "VibeVoice serves its own cloned voice prompts, not Qwen custom voices")
+        if vv_chosen is None:
+            raise HTTPException(404, f"Unknown VibeVoice voice {voice or model_name!r}")
+        return VIBEVOICE_TTS_URL, "vibevoice", vv_chosen
+
+    omnivoice = await _omnivoice_models() if OMNIVOICE_TTS_URL else {}
+
+    def resolve_omnivoice(name: str) -> str | None:
+        if not name:
+            return None
+        if name in omnivoice:
+            return name
+        lowered = name.casefold()
+        for vid, display in omnivoice.items():
+            if lowered in (vid.casefold(), display.casefold()):
+                return vid
+        return None
+
+    ov_chosen = resolve_omnivoice(voice) or resolve_omnivoice(model_name)
+    ov_exact = voice if voice in omnivoice else (model_name if model_name in omnivoice else None)
+    if requested_engine == "omnivoice":
+        if not OMNIVOICE_TTS_URL:
+            raise HTTPException(503, "OmniVoice TTS is not configured")
+        if not omnivoice:
+            raise HTTPException(503, "OmniVoice TTS has no voices available")
+        if voice_source == "custom":
+            raise HTTPException(400, "OmniVoice serves its own cloned voices, not Qwen custom voices")
+        if ov_chosen is None:
+            raise HTTPException(404, f"Unknown OmniVoice voice {voice or model_name!r}")
+        return OMNIVOICE_TTS_URL, "omnivoice", ov_chosen
+
+    kikiri_supported = (
+        voice_source != "custom"
+        and (response_format or "wav").strip().lower() == "wav"
+    )
+    models = await _kikiri_models() if KIKIRI_TTS_URL else {}
+
+    def resolve(name: str) -> str | None:
+        if not name:
+            return None
+        if name in models:
+            return name
+        lowered = name.casefold()
+        for model_id, meta in models.items():
+            if lowered in (model_id.casefold(), meta["name"].casefold()):
+                return model_id
+        return None
+
+    chosen = resolve(model_name) or resolve(voice)
+    if model_name.casefold() == "kikiri" and models:
+        chosen = chosen or next(iter(sorted(models)))
+
+    if requested_engine == "kikiri":
+        if not KIKIRI_TTS_URL:
+            raise HTTPException(503, "Kikiri TTS is not configured")
+        if not models:
+            raise HTTPException(503, "Kikiri TTS has no models available")
+        if not kikiri_supported:
+            raise HTTPException(
+                400,
+                "Kikiri serves fine-tuned voices as WAV only — use engine='qwen' "
+                "for cloned voices or other formats",
+            )
+        if chosen is None:
+            raise HTTPException(404, f"Unknown Kikiri voice {voice or model_name!r}")
+        return KIKIRI_TTS_URL, "kikiri", chosen
+
+    # Automatic selection matches exact voice ids only: "David" (OmniVoice) and
+    # "david" (a Kikiri fine-tune) are different voices, and a fuzzy match here
+    # would silently reroute one user's voice to another engine.
+    kikiri_exact = voice if voice in models else (model_name if model_name in models else None)
+    if kikiri_exact is None and chosen is not None and model_name.casefold() == "kikiri":
+        kikiri_exact = chosen
+
+    wants_wav = (response_format or "wav").strip().lower() == "wav"
+    # OmniVoice serves WAV only; other formats used to fall through to Qwen.
+    omnivoice_ok = ov_exact is not None and voice_source != "custom" and wants_wav
+    kikiri_ok = kikiri_exact is not None and kikiri_supported
+
+    if voice == "default" and not QWEN_TTS_ENABLED and not omnivoice_ok and not kikiri_ok:
+        # The built-in "default" voice belongs to no engine and would dead-end
+        # in retired Qwen. It goes to the main engine; the CPU fallback only
+        # catches it when OmniVoice has nothing to serve.
+        if omnivoice and voice_source != "custom" and wants_wav:
+            return OMNIVOICE_TTS_URL, "omnivoice", next(iter(sorted(omnivoice)))
+        if models and kikiri_supported:
+            return KIKIRI_TTS_URL, "kikiri", next(iter(sorted(models)))
+
+    # OmniVoice is the main engine, Kikiri the CPU fallback for when OmniVoice
+    # cannot run. Voice ids decide the engine on their own, so this order only
+    # settles a genuine tie -- and DEFAULT_TTS_ENGINE=kikiri can invert it when
+    # the GPU is deliberately kept out of the loop.
+    if omnivoice_ok and DEFAULT_TTS_ENGINE != "kikiri":
+        return OMNIVOICE_TTS_URL, "omnivoice", ov_exact
+    if kikiri_ok:
+        return KIKIRI_TTS_URL, "kikiri", kikiri_exact
+    if omnivoice_ok:
+        return OMNIVOICE_TTS_URL, "omnivoice", ov_exact
+    if vv_exact is not None and voice_source != "custom":
+        return VIBEVOICE_TTS_URL, "vibevoice", vv_exact
+    if not TTS_URL:
+        # Qwen used to absorb everything the other engines declined. With it
+        # retired, saying so beats posting to an empty URL.
+        raise HTTPException(
+            503,
+            f"No speech engine serves voice {voice or model_name or 'default'!r} "
+            f"in format {(response_format or 'wav')!r} (Qwen is retired)",
+        )
+    return TTS_URL, "qwen", None
 
 
 def _validate_lufs(normalize_lufs: float | None) -> float | None:
@@ -454,6 +839,9 @@ async def _post_unload(
     *,
     wait_if_busy: bool = False,
 ) -> None:
+    if not url:
+        # Engine retired / not configured — nothing to unload.
+        return
     attempts = 60 if wait_if_busy else 1
     for attempt in range(attempts):
         try:
@@ -495,18 +883,14 @@ async def _unload_extra_tts():
 
 
 async def _unload_asr():
-    """Tell the ASR proxy to unload its backend, freeing shared GPU VRAM."""
-    await _post_unload(ASR_URL, "Qwen3-ASR", "was_running")
+    """Tell Whisper to drop its model, freeing shared GPU VRAM."""
+    if WHISPER_URL:
+        await _post_unload(WHISPER_URL, "Whisper-STT", "was_running")
 
 
 async def _unload_music():
     """Tell ACE-Step proxy to unload backend, freeing shared GPU VRAM."""
     await _post_unload(MUSIC_URL, "ACE-Step", "was_running")
-
-
-async def _unload_sfx():
-    """Tell MMAudio to unload model, freeing shared GPU VRAM."""
-    await _post_unload(SFX_URL, "MMAudio", "was_loaded", wait_if_busy=True)
 
 
 async def tts_request(method: str, path: str, *, url: str | None = None, **kwargs) -> tuple[int, dict, bytes]:
@@ -539,11 +923,21 @@ async def tts_json(method: str, path: str, **kwargs) -> dict:
     return json.loads(body)
 
 
-async def _run_tts_job(description: str, work_maker, *, tts_url: str = TTS_URL):
+async def _run_tts_job(
+    description: str,
+    work_maker,
+    *,
+    tts_url: str = TTS_URL,
+    engine: str = "qwen",
+):
     """Run a TTS job on the GPU TTS service via the shared GPU queue.
 
     work_maker(tts_url) → coroutine that performs the actual TTS work.
+    Kikiri runs on CPU and therefore bypasses the queue entirely.
     """
+    if engine in ("kikiri", "vibevoice", "omnivoice"):
+        return await work_maker(tts_url)
+
     async def work():
         return await work_maker(tts_url)
 
@@ -561,9 +955,41 @@ podcast_router, audio_assembler = create_podcast_router(
     db_getter=get_db,
     gpu_submit=gpu_queue.submit,
     music_url=MUSIC_URL,
-    sfx_url=SFX_URL,
 )
 app.include_router(podcast_router)
+
+# ---------------------------------------------------------------------------
+# Audiobooks — Canto core rebuilt on the consolidated engines. The podcast TTS
+# bridge already knows how to resolve OmniVoice/Kikiri voices and synthesize
+# to a file, which is exactly the contract the audiobook worker needs.
+# ---------------------------------------------------------------------------
+from audiobooks.routes import create_audiobooks_router
+
+audiobooks_router = create_audiobooks_router(
+    get_current_user=get_current_user,
+    db_getter=get_db,
+    tts_bridge=audio_assembler.tts if hasattr(audio_assembler, "tts") else None,
+    data_dir=DATA_DIR,
+)
+app.include_router(audiobooks_router)
+from library import create_library_router
+app.include_router(create_library_router(get_current_user=get_current_user, db_getter=get_db))
+
+# ---------------------------------------------------------------------------
+# Hörspiele — portierte Szenenklang-Engine. Sie bringt eigene Hintergrund-
+# Threads mit, deshalb bekommt sie den Zustandsspeicher (SQLite statt der
+# alten state.json) und dieselbe TTS-Brücke wie die Hörbücher.
+# ---------------------------------------------------------------------------
+from hoerspiele import create_hoerspiele_router, start as hoerspiele_start
+
+hoerspiele_router = create_hoerspiele_router(
+    get_current_user=get_current_user,
+    db_getter=get_db,
+    tts_bridge=audio_assembler.tts if hasattr(audio_assembler, "tts") else None,
+    gpu_submit=gpu_queue.submit,
+    data_dir=DATA_DIR,
+)
+app.include_router(hoerspiele_router)
 
 
 # ---------------------------------------------------------------------------
@@ -641,7 +1067,7 @@ async def admin_artifact_cleanup(
 
     ``dry_run=true`` reports candidates without deleting them.
     """
-    get_current_user(request)
+    _require_admin(request)
     return await asyncio.to_thread(
         cleanup_artifacts,
         get_db(),
@@ -658,6 +1084,10 @@ async def admin_artifact_cleanup(
 @app.on_event("startup")
 async def startup():
     init_db(DATA_DIR / "vocarium.db")
+    try:
+        hoerspiele_start()
+    except Exception as exc:  # pragma: no cover - Bereich darf den Start nicht kippen
+        logger.error("Hörspiele konnten nicht initialisiert werden: %s", exc)
     interrupted = mark_interrupted_gpu_jobs(worker_id=API_INSTANCE_ID)
     if interrupted:
         logger.warning("Marked %d persisted GPU queue job(s) as interrupted", interrupted)
@@ -668,20 +1098,20 @@ async def startup():
     register_job_recorder(record_gpu_job)
     register_quota_checker(gpu_queue_quota_decision)
     register_cancel_checker(is_gpu_queue_cancel_requested)
-    # Backfill preset hosts for existing users (idempotent)
-    backfill = backfill_hosts_for_all_users()
-    if backfill:
-        logger.info("Backfilled %d preset host(s)", backfill)
+    # Alt-Hosts der stillgelegten Qwen-Sprecher zurückziehen (idempotent).
+    # Sprecher kommen jetzt aus dem Host-Hub, nicht mehr aus einem Auto-Seed.
+    retired = retire_legacy_qwen_hosts_for_all_users()
+    if retired:
+        logger.info("Retired %d legacy Qwen host(s)", retired)
     # Sync voices from TTS filesystem into SQLite if needed
     await _sync_voices_from_tts()
     # Start GPU queue with unload callbacks. The queue decides conflicts from
-    # GPU_TTS_*/GPU_ASR/GPU_MUSIC/GPU_SFX, so single-GPU and dual-GPU layouts
+    # GPU_TTS_*/GPU_ASR/GPU_MUSIC, so single-GPU and dual-GPU layouts
     # both unload only what can actually collide.
     unloaders = {
         "tts": _unload_tts,
         "asr": _unload_asr,
         "music": _unload_music,
-        "sfx": _unload_sfx,
     }
     if TTS_URL_2:
         unloaders["tts_extra"] = _unload_extra_tts
@@ -749,12 +1179,18 @@ async def _sync_voices_from_tts():
 @app.get("/api/models")
 async def list_models(request: Request):
     get_current_user(request)
+    # Model switching is a Qwen concept. With Qwen retired the service is not
+    # even in the Compose file, so proxying would 500 on DNS.
+    if not QWEN_TTS_ENABLED:
+        return {"models": []}
     return await tts_json("GET", "/v1/models")
 
 
 @app.get("/api/models/current")
 async def current_model(request: Request):
     get_current_user(request)
+    if not QWEN_TTS_ENABLED:
+        return {"id": "", "path": "", "type": "", "params": "", "loaded": False}
     return await tts_json("GET", "/v1/models/current")
 
 
@@ -764,7 +1200,7 @@ class SwitchModelRequest(BaseModel):
 
 @app.post("/api/models/switch")
 async def switch_model(req: SwitchModelRequest, request: Request):
-    get_current_user(request)
+    _require_admin(request)
 
     async def work():
         return await tts_json("POST", "/v1/models/load", json={"model_id": req.model_id})
@@ -787,11 +1223,63 @@ async def list_voices(request: Request):
     ).fetchall()
     voices = []
     for r in rows:
+        if not QWEN_TTS_ENABLED:
+            continue
         voices.append({
             "id": r[0], "name": r[1], "language": r[2], "source": r[3],
             "design_prompt": r[4], "ref_text": r[5],
             "speaker": r[6], "instruct": r[7], "created_at": r[8],
             "has_audio": _voice_has_audio(r[0]),
+        })
+    for voice_id, display_name in sorted((await _omnivoice_models(force=True)).items()):
+        voices.append({
+            "id": voice_id,
+            "name": display_name,
+            "language": "Auto",
+            "source": "omnivoice",
+            "design_prompt": None,
+            "ref_text": _omnivoice_reference_text.get(voice_id),
+            "speaker": None,
+            "instruct": None,
+            "created_at": None,
+            # Das Referenzpaar auf der Platte *ist* die Stimme — es taugt als
+            # Vorschau, ohne dafür erst die GPU zu bemühen.
+            "has_audio": True,
+            "engine": "omnivoice",
+        })
+    for voice_id, display_name in sorted((await _vibevoice_models(force=True)).items()):
+        voices.append({
+            "id": voice_id,
+            "name": display_name,
+            "language": "Auto",
+            "source": "vibevoice",
+            "design_prompt": None,
+            "ref_text": None,
+            "speaker": None,
+            "instruct": None,
+            "created_at": None,
+            "has_audio": False,
+            "engine": "vibevoice",
+        })
+    for model_id, meta in sorted((await _kikiri_models(force=True)).items()):
+        voices.append({
+            "id": model_id,
+            "name": meta["name"],
+            "language": "German",
+            "source": "kikiri",
+            "design_prompt": None,
+            "ref_text": None,
+            "speaker": None,
+            "instruct": None,
+            "created_at": None,
+            "has_audio": False,
+            "engine": "kikiri",
+            # `fallback` voices only exist for the case where OmniVoice is down;
+            # the UI groups on this rather than guessing from the id prefix.
+            "group": meta["group"],
+            "gender": meta["gender"],
+            "backend": meta["backend"],
+            "notes": meta["notes"] or None,
         })
     return {"voices": voices}
 
@@ -818,6 +1306,16 @@ async def get_voice(voice_id: str, request: Request):
 @app.delete("/api/voices/{voice_id}")
 async def delete_voice(voice_id: str, request: Request):
     user = get_current_user(request)
+    if _is_omnivoice_voice(voice_id):
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with _http_session().delete(
+            f"{OMNIVOICE_TTS_URL}/v1/audio/voices/{voice_id}", timeout=timeout
+        ) as resp:
+            payload = await resp.json()
+            if resp.status >= 400:
+                raise HTTPException(resp.status, payload.get("detail", "OmniVoice deletion failed"))
+        await _omnivoice_models(force=True)
+        return {"status": "deleted", "voice_id": voice_id}
     db = get_db()
     r = db.execute("SELECT id FROM voices WHERE id=? AND user_id=?", (voice_id, user["id"])).fetchone()
     if not r:
@@ -839,6 +1337,17 @@ async def delete_voice(voice_id: str, request: Request):
 @app.get("/api/voices/{voice_id}/audio")
 async def get_voice_audio(voice_id: str, request: Request):
     user = get_current_user(request)
+    if _is_omnivoice_voice(voice_id):
+        # OmniVoice-Klone haben keine DB-Zeile; ihr Referenzpaar liegt beim
+        # Worker. Durchreichen statt 404, sonst bleibt die Vorschau für alle
+        # sechzehn Klonstimmen tot.
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with _http_session().get(
+            f"{OMNIVOICE_TTS_URL}/v1/audio/voices/{voice_id}/reference", timeout=timeout
+        ) as resp:
+            if resp.status >= 400:
+                raise HTTPException(resp.status, "Reference audio not available")
+            return Response(await resp.read(), media_type="audio/wav")
     db = get_db()
     r = db.execute("SELECT id FROM voices WHERE id=? AND user_id=?", (voice_id, user["id"])).fetchone()
     if not r:
@@ -883,7 +1392,7 @@ async def _register_voice_on_tts(
 
 
 def _tts_registration_urls() -> list[str]:
-    return [TTS_URL, *EXTRA_TTS_URLS]
+    return [u for u in (TTS_URL, *EXTRA_TTS_URLS) if u]
 
 
 def _convert_reference_audio_to_wav(audio_bytes: bytes, audio_path: Path) -> None:
@@ -950,6 +1459,26 @@ async def clone_voice(
         if not ref_text:
             raise HTTPException(400, "Reference text is required and auto-transcription failed")
 
+        if not QWEN_TTS_ENABLED:
+            # Qwen is retired: register the clone on OmniVoice instead. The
+            # reference pair lives in the OmniVoice voices directory; no DB row —
+            # the voice surfaces through the engine listing like all its peers.
+            audio_bytes_wav = await asyncio.to_thread(audio_path.read_bytes)
+            form = aiohttp.FormData()
+            form.add_field("name", name)
+            form.add_field("ref_text", ref_text)
+            form.add_field("file", audio_bytes_wav, filename="ref.wav", content_type="audio/wav")
+            timeout = aiohttp.ClientTimeout(total=180)
+            async with _http_session().post(
+                f"{OMNIVOICE_TTS_URL}/v1/audio/voices", data=form, timeout=timeout
+            ) as resp:
+                payload = await resp.json()
+                if resp.status >= 400:
+                    raise HTTPException(resp.status, payload.get("detail", "OmniVoice registration failed"))
+            shutil.rmtree(voice_dir, ignore_errors=True)
+            await _omnivoice_models(force=True)
+            return {"status": "created", "voice_id": payload["voice_id"], "name": name}
+
         # Save metadata
         meta = {
             "name": name,
@@ -989,21 +1518,16 @@ async def clone_voice(
 
 
 async def _transcribe_audio(audio_path: Path) -> str:
-    """Send audio to ASR for transcription via GPU queue."""
+    """Transcribe reference audio for voice cloning.
+
+    Whisper verwaltet sein VRAM selbst (lazy laden, Idle-Unload), also ohne
+    gpu_queue-Slot.
+    """
+    if not WHISPER_URL:
+        raise HTTPException(503, "Kein STT-Dienst konfiguriert (WHISPER_URL)")
     audio_bytes = await asyncio.to_thread(audio_path.read_bytes)
-
-    async def work():
-        form = aiohttp.FormData()
-        form.add_field("file", audio_bytes, filename="audio.wav", content_type="audio/wav")
-        form.add_field("model", "Qwen/Qwen3-ASR-0.6B")
-        async with _http_session().post(f"{ASR_URL}/v1/audio/transcriptions", data=form) as resp:
-            if resp.status >= 400:
-                raise Exception(f"ASR error {resp.status}")
-            data = await resp.json()
-            return data.get("text", "").strip()
-
-    _, future = await gpu_queue.submit("asr", "Transcribe (clone)", work)
-    return await future
+    result = await _transcribe_wav_whisper(audio_bytes)
+    return result.get("text", "").strip()
 
 
 # ---------------------------------------------------------------------------
@@ -1030,7 +1554,7 @@ async def design_preview(req: DesignPreviewRequest, request: Request):
                   "language": req.language, "response_format": "wav"},
         )
         if status >= 400:
-            raise HTTPException(status, body.decode(errors="replace"))
+            raise HTTPException(status, _upstream_detail(body))
         return {"body": body, "headers": {k: v for k, v in headers.items() if k.startswith("X-")}}
 
     result = await _run_tts_job("Voice Design Preview", work_maker)
@@ -1141,7 +1665,7 @@ async def custom_voice_preview(req: CustomVoicePreviewRequest, request: Request)
             },
         )
         if status >= 400:
-            raise HTTPException(status, body.decode(errors="replace"))
+            raise HTTPException(status, _upstream_detail(body))
         return {"body": body, "headers": {k: v for k, v in headers.items() if k.startswith("X-")}}
 
     result = await _run_tts_job("Custom Voice Preview", work_maker)
@@ -1253,7 +1777,7 @@ async def openai_tts_custom(req: CustomSpeechRequest, request: Request):
             },
         )
         if status >= 400:
-            raise HTTPException(status, body.decode(errors="replace"))
+            raise HTTPException(status, _upstream_detail(body))
         content_type = headers.get("Content-Type", headers.get("content-type", "audio/wav"))
         return {"body": body, "media_type": content_type}
 
@@ -1278,6 +1802,8 @@ def _verify_voice_exists(voice_id: str, user_id: int | None = None):
     is provided, scopes the lookup to that user's voices."""
     if voice_id in ("default", ""):
         return
+    if _is_kikiri_voice(voice_id) or _is_vibevoice_voice(voice_id) or _is_omnivoice_voice(voice_id):
+        return
     db = get_db()
     if user_id is not None:
         r = db.execute(
@@ -1301,6 +1827,15 @@ def _verify_voice_source(voice_id: str, allowed_sources: tuple[str, ...], user_i
         if "clone" in allowed_sources:
             return
         raise HTTPException(403, "Default voice not allowed on this endpoint")
+    if "clone" in allowed_sources and (
+        _is_omnivoice_voice(voice_id)
+        or _is_kikiri_voice(voice_id)
+        or _is_vibevoice_voice(voice_id)
+    ):
+        # Since Qwen was retired, a "cloned voice" is an engine fact, not a
+        # database row: OmniVoice owns the clones, Kikiri the fine-tunes. Without
+        # this branch every real voice 404s on the OpenAI-compatible endpoint.
+        return
     db = get_db()
     if user_id is not None:
         r = db.execute(
@@ -1324,6 +1859,12 @@ def _voice_source(voice_id: str, user_id: int | None = None) -> str:
     """Return the stored voice source for routing generation endpoints."""
     if voice_id in ("default", ""):
         return "clone"
+    if _is_kikiri_voice(voice_id):
+        return "kikiri"
+    if _is_vibevoice_voice(voice_id):
+        return "vibevoice"
+    if _is_omnivoice_voice(voice_id):
+        return "omnivoice"
     db = get_db()
     if user_id is not None:
         row = db.execute(
@@ -1355,7 +1896,29 @@ def _custom_tts_payload(
     }
 
 
-async def _tts_generate_for_voice(
+def _backfill_timing_headers(headers: dict) -> dict:
+    """Ergänzt `X-Generation-Time` und `X-RTF`.
+
+    OmniVoice und Kikiri melden nur `X-Inference-Seconds` und
+    `X-Audio-Duration`; die beiden abgeleiteten Header stammen noch aus der
+    Qwen-Zeit. Ohne diese Ergänzung zeigen Clients dauerhaft 0.
+    """
+    h_lower = {k.lower(): v for k, v in headers.items()}
+    try:
+        gen = float(h_lower.get("x-generation-time") or h_lower.get("x-inference-seconds") or 0)
+        dur = float(h_lower.get("x-audio-duration") or 0)
+    except ValueError:
+        return headers
+    if gen <= 0:
+        return headers
+    if "x-generation-time" not in h_lower:
+        headers["X-Generation-Time"] = f"{gen:.3f}"
+    if "x-rtf" not in h_lower and dur > 0:
+        headers["X-RTF"] = f"{gen / dur:.4f}"
+    return headers
+
+
+async def _tts_generate_for_voice_raw(
     *,
     tts_url: str,
     text: str,
@@ -1365,10 +1928,38 @@ async def _tts_generate_for_voice(
     user_id: int,
     model_id: str | None = None,
     language: str | None = None,
+    engine: str = "qwen",
+    kikiri_model: str | None = None,
 ) -> tuple[int, dict, bytes]:
     response_format = _validate_audio_format(
         response_format, allowed=TTS_RESPONSE_FORMATS
     )
+    if engine in ("vibevoice", "omnivoice"):
+        return await tts_request(
+            "POST",
+            "/v1/audio/speech",
+            url=tts_url,
+            json={
+                "model": engine,
+                "input": text,
+                "voice": kikiri_model or voice_id,
+                "response_format": response_format,
+            },
+        )
+    if engine == "kikiri":
+        # Every Kikiri fine-tune carries exactly one voice; the model id is what
+        # selects the speaker.
+        return await tts_request(
+            "POST",
+            "/v1/audio/speech",
+            url=tts_url,
+            json={
+                "input": text,
+                "model": kikiri_model or voice_id,
+                "voice": "default",
+                "response_format": "wav",
+            },
+        )
     if source == "custom":
         return await tts_request(
             "POST",
@@ -1406,13 +1997,29 @@ async def _tts_generate_for_voice(
     return status, headers, body
 
 
+async def _tts_generate_for_voice(**kwargs) -> tuple[int, dict, bytes]:
+    status, headers, body = await _tts_generate_for_voice_raw(**kwargs)
+    if status < 400:
+        headers = _backfill_timing_headers(headers)
+    return status, headers, body
+
+
 @app.post("/api/generate/stream")
 async def generate_speech_stream(req: GenerateRequest, request: Request):
     """Stream speech generation via SSE while the GPU queue job is running."""
     user = get_current_user(request)
     _require_text_limit(req.text)
+    await _kikiri_models()
+    await _vibevoice_models()
+    await _omnivoice_models()
     _verify_voice_exists(req.voice_id, user_id=user["id"])
     source = _voice_source(req.voice_id, user_id=user["id"])
+    selected_url, selected_engine, selected_kikiri_model = await _select_tts_backend(
+        req.model_id,
+        req.engine,
+        voice_id=req.voice_id,
+        voice_source=source,
+    )
     event_queue: asyncio.Queue[str | None] = asyncio.Queue()
 
     async def work_maker(tts_url):
@@ -1425,6 +2032,8 @@ async def generate_speech_stream(req: GenerateRequest, request: Request):
                 response_format="wav",
                 user_id=user["id"],
                 language=req.language,
+                engine=selected_engine,
+                kikiri_model=selected_kikiri_model,
             )
             if status >= 400:
                 await event_queue.put(
@@ -1454,12 +2063,17 @@ async def generate_speech_stream(req: GenerateRequest, request: Request):
 
         payload = {
             "input": req.text,
-            "voice": req.voice_id,
+            "voice": _engine_voice(selected_engine, req.voice_id, selected_kikiri_model),
             "response_format": "wav",
         }
-        if req.model_id:
+        if selected_engine == "kikiri":
+            payload["model"] = selected_kikiri_model
+        elif selected_engine in ("vibevoice", "omnivoice"):
+            payload["model"] = selected_engine
+            payload["voice"] = selected_kikiri_model
+        elif req.model_id:
             payload["model_id"] = req.model_id
-        if req.language:
+        if req.language and selected_engine in ("qwen",):
             payload["language"] = req.language
 
         timeout = aiohttp.ClientTimeout(total=600, sock_connect=30, sock_read=600)
@@ -1483,7 +2097,12 @@ async def generate_speech_stream(req: GenerateRequest, request: Request):
 
     async def worker():
         try:
-            await _run_tts_job("TTS Stream", work_maker)
+            await _run_tts_job(
+                "TTS Stream",
+                work_maker,
+                tts_url=selected_url,
+                engine=selected_engine,
+            )
         except Exception as exc:
             logger.exception("TTS stream failed")
             await event_queue.put(_sse_event("error", {"error": str(exc)}))
@@ -1515,9 +2134,18 @@ async def generate_speech(req: GenerateRequest, request: Request):
     """Generate speech using a stored voice."""
     user = get_current_user(request)
     _require_text_limit(req.text)
+    await _kikiri_models()
+    await _vibevoice_models()
+    await _omnivoice_models()
     _verify_voice_exists(req.voice_id, user_id=user["id"])
     source = _voice_source(req.voice_id, user_id=user["id"])
-    selected_url, selected_engine = _select_tts_backend(req.model_id, req.engine)
+    selected_url, selected_engine, selected_kikiri_model = await _select_tts_backend(
+        req.model_id,
+        req.engine,
+        voice_id=req.voice_id,
+        voice_source=source,
+        response_format=req.response_format,
+    )
 
     async def work_maker(tts_url):
         status, headers, body = await _tts_generate_for_voice(
@@ -1529,14 +2157,21 @@ async def generate_speech(req: GenerateRequest, request: Request):
             user_id=user["id"],
             model_id=req.model_id,
             language=req.language,
+            engine=selected_engine,
+            kikiri_model=selected_kikiri_model,
         )
         if status >= 400:
-            raise HTTPException(status, body.decode(errors="replace"))
+            raise HTTPException(status, _upstream_detail(body))
         resp_headers = {k: v for k, v in headers.items() if k.lower().startswith("x-")}
+        # Not every backend stamps its engine (VibeVoice does not); the caller
+        # decided the routing, so the caller states it.
+        resp_headers.setdefault("X-TTS-Engine", selected_engine)
         content_type = headers.get("Content-Type", headers.get("content-type", "audio/wav"))
         return {"body": body, "media_type": content_type, "headers": resp_headers}
 
-    result = await _run_tts_job("TTS Generate", work_maker, tts_url=selected_url)
+    result = await _run_tts_job(
+        "TTS Generate", work_maker, tts_url=selected_url, engine=selected_engine
+    )
     return Response(content=result["body"], media_type=result["media_type"], headers=result["headers"])
 
 
@@ -1715,29 +2350,47 @@ def _download_media_url(url: str) -> bytes:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-async def _transcribe_wav_bytes(wav_bytes: bytes) -> dict:
-    """Send WAV bytes to ASR via the native /v1/audio/transcriptions endpoint."""
-    timeout = aiohttp.ClientTimeout(total=600, sock_connect=60, sock_read=600)
+async def _transcribe_wav_whisper(
+    wav_bytes: bytes, model: str = "", language: str = "", vad: str = ""
+) -> dict:
+    """Einziger STT-Pfad: faster-whisper large-v3 — liefert Text, Sprache und
+    Wort-/Segment-Timestamps in einem Aufruf (kein /align nötig).
+
+    `model` wählt das Profil (`german` oder `swiss`), `language` erzwingt eine
+    Sprache bzw. schaltet mit `auto` die Erkennung frei. Beide bleiben leer,
+    wenn der Aufrufer nichts angibt — dann gelten die Vorgaben des Workers.
+    """
+    timeout = aiohttp.ClientTimeout(total=1800, sock_connect=30, sock_read=1800)
     form = aiohttp.FormData()
     form.add_field("file", wav_bytes, filename="audio.wav", content_type="audio/wav")
-    form.add_field("model", "Qwen/Qwen3-ASR-0.6B")
+    if model.strip():
+        form.add_field("model", model.strip())
+    if language.strip():
+        form.add_field("language", language.strip())
+    if vad.strip():
+        # "auto" (Vorgabe im Worker), "on", "off": Silero-VAD verwirft Gesang,
+        # deshalb kann der Aufrufer den Sprachfilter abschalten.
+        form.add_field("vad", vad.strip())
     async with _http_session().post(
-        f"{ASR_URL}/v1/audio/transcriptions", data=form, timeout=timeout
+        f"{WHISPER_URL}/v1/audio/transcriptions", data=form, timeout=timeout
     ) as resp:
         if resp.status >= 400:
             body = await resp.read()
-            raise RuntimeError(f"ASR error {resp.status}: {body.decode(errors='replace')[:500]}")
+            raise RuntimeError(
+                f"Whisper error {resp.status}: {body.decode(errors='replace')[:500]}"
+            )
         data = await resp.json()
-        return {"text": _clean_asr_text(data.get("text", ""))}
-
-
-def _clean_asr_text(raw: str) -> str:
-    text = (raw or "").strip()
-    if "<asr_text>" in text:
-        text = text.split("<asr_text>", 1)[1]
-    for marker in ("</asr_text>", "<|endoftext|>"):
-        text = text.replace(marker, "")
-    return text.strip()
+    words = [
+        {"word": w.get("word", ""), "start": w.get("start", 0.0), "end": w.get("end", 0.0)}
+        for w in data.get("words", [])
+    ]
+    return {
+        "text": data.get("text", ""),
+        "language": data.get("language", "de"),
+        "model": data.get("model", model.strip() or "german"),
+        "words": words,
+        "segments": data.get("segments", []),
+    }
 
 
 @app.post("/api/transcribe")
@@ -1745,6 +2398,9 @@ async def transcribe(
     request: Request,
     file: UploadFile | None = File(None),
     url: str = Form(""),
+    model: str = Form(""),
+    language: str = Form(""),
+    vad: str = Form(""),
 ):
     """Transcribe audio/video files or supported media URLs."""
     get_current_user(request)  # auth check
@@ -1775,527 +2431,53 @@ async def transcribe(
     else:
         raise HTTPException(400, "Provide either a file or a URL")
 
-    async def work():
-        return await _transcribe_wav_bytes(wav_bytes)
-
-    _, future = await gpu_queue.submit("asr", "Transcribe", work)
-    return await future
+    # Whisper verwaltet sein VRAM selbst (lazy laden + Idle-Unload) und
+    # braucht deshalb keinen gpu_queue-Slot.
+    if not WHISPER_URL:
+        raise HTTPException(503, "Kein STT-Dienst konfiguriert (WHISPER_URL)")
+    try:
+        return await _transcribe_wav_whisper(wav_bytes, model=model, language=language, vad=vad)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502, f"Transkription fehlgeschlagen: {exc}")
 
 
 # ---------------------------------------------------------------------------
 # TTS Health proxy
 # ---------------------------------------------------------------------------
+async def _speech_engine_health() -> dict:
+    """Health of whatever engine actually serves speech.
+
+    This block used to be the Qwen worker's /health verbatim. With Qwen retired
+    that probe reports "unreachable" forever, which reads as an outage — so fall
+    back to OmniVoice, the engine every non-Kikiri voice runs on now.
+    """
+    if TTS_URL:
+        return await tts_json("GET", "/health")
+    if not OMNIVOICE_TTS_URL:
+        return {"status": "unreachable"}
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with _http_session().get(
+        f"{OMNIVOICE_TTS_URL}/health", timeout=timeout
+    ) as resp:
+        data = await resp.json()
+    voices = data.get("voices")
+    return {
+        "status": "ok" if data.get("status") in ("ok", "healthy") else "unreachable",
+        "model_loaded": bool(voices),
+        "voices_loaded": voices,
+    }
+
+
 @app.get("/api/health")
 async def health():
     try:
-        tts_health = await tts_json("GET", "/health")
+        tts_health = await _speech_engine_health()
     except Exception:
         tts_health = {"status": "unreachable"}
     gpu_resources = await get_resource_status()
-    return {"api": "ok", "tts": tts_health, "gpu_resources": gpu_resources}
-
-
-# ---------------------------------------------------------------------------
-# Music Generation (ACE-Step)
-# ---------------------------------------------------------------------------
-class MusicGenerateRequest(BaseModel):
-    prompt: str
-    engine: str = "acestep"
-    lyrics: str = ""
-    negative_prompt: str = ""
-    audio_duration: int = 60
-    bpm: int | None = None
-    key_scale: str | None = None
-    time_signature: str | None = None
-    thinking: bool = True
-    audio_format: str = "wav"
-    batch_size: int = 1
-    seed: int | None = None
-    instrumental: bool = False
-    loopable: bool = False
-    normalize_lufs: float | None = None
-    fade_ms: int = 0
-
-
-async def _music_request(method: str, path: str, **kwargs) -> tuple[int, bytes]:
-    timeout = aiohttp.ClientTimeout(total=120, sock_connect=30)
-    start = time.perf_counter()
-    status = 0
-    try:
-        async with _http_session().request(
-            method, f"{MUSIC_URL}{path}", timeout=timeout, **kwargs
-        ) as resp:
-            status = resp.status
-            body = await resp.read()
-            return resp.status, body
-    finally:
-        labels = {"path": path, "status": status or "error"}
-        inc("vocarium_music_requests_total", labels=labels)
-        observe("vocarium_music_seconds", time.perf_counter() - start, labels)
-
-
-def _normalize_music_audio_path(raw_path: str, *, strict: bool = True) -> str | None:
-    value = unquote((raw_path or "").strip())
-    if not value:
-        if strict:
-            raise HTTPException(400, "path is required")
-        return None
-
-    parsed = urlparse(value)
-    if parsed.query and parsed.path.endswith("/v1/audio"):
-        query_path = (parse_qs(parsed.query).get("path") or [""])[0]
-        value = unquote(query_path.strip())
-    elif value.startswith("/v1/audio?"):
-        query_path = (parse_qs(value.split("?", 1)[1]).get("path") or [""])[0]
-        value = unquote(query_path.strip())
-
-    if not value or "\x00" in value or len(value) > 2048:
-        if strict:
-            raise HTTPException(400, "invalid audio path")
-        return None
-    return value
-
-
-def _extract_music_audio_paths(payload: object) -> list[str]:
-    paths: list[str] = []
-
-    def visit(value: object) -> None:
-        if isinstance(value, dict):
-            file_ref = value.get("file")
-            if isinstance(file_ref, str):
-                path = _normalize_music_audio_path(file_ref, strict=False)
-                if path:
-                    paths.append(path)
-            for child in value.values():
-                visit(child)
-        elif isinstance(value, list):
-            for child in value:
-                visit(child)
-        elif isinstance(value, str):
-            stripped = value.strip()
-            if stripped.startswith("{") or stripped.startswith("["):
-                try:
-                    visit(json.loads(stripped))
-                except json.JSONDecodeError:
-                    return
-
-    visit(payload)
-    return sorted(set(paths))
-
-
-def _music_audio_content_type(path: str) -> str:
-    if path.endswith(".mp3"):
-        return "audio/mpeg"
-    if path.endswith(".wav"):
-        return "audio/wav"
-    if path.endswith(".flac"):
-        return "audio/flac"
-    return "audio/mpeg"
-
-
-def _music_audio_local_path(path: str) -> Path | None:
-    backend_root = Path("/app/acestep/.cache/acestep").resolve()
-    output_root = MUSIC_OUTPUT_DIR.resolve()
-    raw = Path(path)
-    try:
-        if raw.is_absolute():
-            relative = raw.resolve().relative_to(backend_root)
-        else:
-            relative = raw
-        local_path = (output_root / relative).resolve()
-        local_path.relative_to(output_root)
-    except (OSError, ValueError):
-        return None
-    return local_path if local_path.is_file() else None
-
-
-def _record_music_task(
-    user_id: int,
-    task_id: str,
-    status: str,
-    file_paths: list[str] | None = None,
-) -> None:
-    db = get_db()
-    now = time.strftime("%Y-%m-%dT%H:%M:%SZ")
-    if file_paths is None:
-        db.execute(
-            "INSERT INTO music_tasks (task_id, user_id, status, updated_at) "
-            "VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(task_id) DO UPDATE SET status=excluded.status, updated_at=excluded.updated_at "
-            "WHERE music_tasks.user_id=excluded.user_id",
-            (task_id, user_id, status, now),
-        )
-    else:
-        db.execute(
-            "INSERT INTO music_tasks (task_id, user_id, status, file_paths, updated_at) "
-            "VALUES (?, ?, ?, ?, ?) "
-            "ON CONFLICT(task_id) DO UPDATE SET "
-            "status=excluded.status, file_paths=excluded.file_paths, updated_at=excluded.updated_at "
-            "WHERE music_tasks.user_id=excluded.user_id",
-            (task_id, user_id, status, json.dumps(file_paths), now),
-        )
-    owner = db.execute(
-        "SELECT user_id FROM music_tasks WHERE task_id=?", (task_id,)
-    ).fetchone()
-    if not owner or owner[0] != user_id:
-        db.rollback()
-        raise RuntimeError("music task ownership conflict")
-    if file_paths is not None:
-        db.execute(
-            "DELETE FROM music_task_files WHERE task_id=? AND user_id=?",
-            (task_id, user_id),
-        )
-        db.executemany(
-            "INSERT OR IGNORE INTO music_task_files (task_id, user_id, path, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            [(task_id, user_id, path, now) for path in sorted(set(file_paths))],
-        )
-    db.commit()
-
-
-def _require_owned_music_tasks(user_id: int, task_ids: list[str]) -> None:
-    placeholders = ",".join("?" for _ in task_ids)
-    rows = get_db().execute(
-        f"SELECT task_id FROM music_tasks WHERE user_id=? AND task_id IN ({placeholders})",
-        (user_id, *task_ids),
-    ).fetchall()
-    owned = {row[0] for row in rows}
-    if owned != set(task_ids):
-        raise HTTPException(404, "Music task not found")
-
-
-def _sync_music_tasks_from_poll(user_id: int, poll: dict) -> None:
-    for task in poll.get("data") or []:
-        if not isinstance(task, dict):
-            continue
-        task_id = str(task.get("task_id") or "").strip()
-        if not task_id:
-            continue
-        status_code = task.get("status")
-        status = "completed" if status_code == 1 else "failed" if status_code == 2 else "running"
-        paths = _extract_music_audio_paths(task)
-        _record_music_task(user_id, task_id, status, paths if paths else None)
-
-
-def _require_owned_music_audio_path(user_id: int, path: str) -> None:
-    row = get_db().execute(
-        "SELECT 1 FROM music_task_files WHERE user_id=? AND path=? LIMIT 1",
-        (user_id, path),
-    ).fetchone()
-    if row:
-        return
-    raise HTTPException(404, "Music audio not found")
-
-
-@app.post("/api/music/generate")
-async def music_generate(req: MusicGenerateRequest, request: Request):
-    """Submit music generation, hold GPU lock until complete, return result."""
-    user = get_current_user(request)
-    engine = _validate_engine(req.engine, SUPPORTED_MUSIC_ENGINES)
-    if not req.prompt.strip():
-        raise HTTPException(400, "prompt is required")
-    if len(req.prompt) > 2000:
-        raise HTTPException(413, "prompt too long (max 2000 characters)")
-    if len(req.lyrics) > 10000:
-        raise HTTPException(413, "lyrics too long (max 10000 characters)")
-    if len(req.negative_prompt) > 2000:
-        raise HTTPException(413, "negative_prompt too long (max 2000 characters)")
-    if req.audio_duration < 10 or req.audio_duration > 300:
-        raise HTTPException(400, "audio_duration must be between 10 and 300 seconds")
-    if req.batch_size < 1 or req.batch_size > 4:
-        raise HTTPException(400, "batch_size must be between 1 and 4")
-    audio_format = _validate_audio_format(
-        req.audio_format, allowed=MUSIC_RESPONSE_FORMATS, field="audio_format"
-    )
-    normalize_lufs = _validate_lufs(req.normalize_lufs)
-    fade_ms = _validate_fade_ms(req.fade_ms)
-
-    prompt = req.prompt
-    if req.instrumental and "instrumental" not in prompt.casefold():
-        prompt = f"{prompt}, instrumental"
-    if req.loopable and "loop" not in prompt.casefold():
-        prompt = f"{prompt}, seamless loop"
-    negative_prompt = _merge_negative_prompt(
-        req.negative_prompt,
-        "vocals, singing, speech" if req.instrumental else "",
-    )
-    vocarium_options = {
-        "engine": engine,
-        "negative_prompt": req.negative_prompt,
-        "instrumental": req.instrumental,
-        "loopable": req.loopable,
-        "normalize_lufs": normalize_lufs,
-        "fade_ms": fade_ms,
-    }
-
-    payload = {
-        "prompt": prompt,
-        "lyrics": req.lyrics,
-        "audio_duration": req.audio_duration,
-        "thinking": req.thinking,
-        "model": "acestep-v15-turbo",
-        "inference_steps": 8,
-        "batch_size": req.batch_size,
-        "audio_format": audio_format,
-    }
-    if req.bpm is not None:
-        payload["bpm"] = req.bpm
-    if req.key_scale is not None:
-        payload["key_scale"] = req.key_scale
-    if req.time_signature is not None:
-        payload["time_signature"] = req.time_signature
-    if negative_prompt:
-        payload["negative_prompt"] = negative_prompt
-    if req.seed is not None:
-        payload["seed"] = req.seed
-        payload["use_random_seed"] = False
-    else:
-        payload["use_random_seed"] = True
-
-    async def work():
-        # Submit task
-        status, body = await _music_request("POST", "/release_task", json=payload)
-        if status >= 400:
-            raise HTTPException(status, body.decode(errors="replace"))
-        submit_result = json.loads(body)
-        task_id = submit_result.get("data", {}).get("task_id")
-        if not task_id:
-            return {
-                "submit": submit_result,
-                "vocarium_options": vocarium_options,
-            }  # no task_id means immediate result or error
-        _record_music_task(user["id"], task_id, "submitted")
-
-        # Poll until complete (holds GPU lock)
-        for _ in range(300):  # max ~10 min (2s * 300)
-            await asyncio.sleep(2)
-            s, b = await _music_request("POST", "/query_result", json={"task_id_list": [task_id]})
-            if s >= 400:
-                continue
-            poll = json.loads(b)
-            tasks = poll.get("data", [])
-            if not tasks:
-                continue
-            task = tasks[0]
-            if task.get("status") == 1:  # success
-                _sync_music_tasks_from_poll(user["id"], poll)
-                return {
-                    "submit": submit_result,
-                    "result": poll,
-                    "vocarium_options": vocarium_options,
-                }
-            if task.get("status") == 2:  # failed
-                _record_music_task(user["id"], task_id, "failed")
-                raise HTTPException(500, "Music generation failed")
-        raise HTTPException(504, "Music generation timed out")
-
-    _, future = await gpu_queue.submit("music", "Music Generate", work)
-    return await future
-
-
-class MusicStatusRequest(BaseModel):
-    task_ids: list[str]
-
-
-@app.post("/api/music/status")
-async def music_status(req: MusicStatusRequest, request: Request):
-    """Poll for music generation task status."""
-    user = get_current_user(request)
-    task_ids = [tid.strip() for tid in req.task_ids if tid and tid.strip()]
-    if not task_ids:
-        raise HTTPException(400, "at least one task_id is required")
-    if len(task_ids) > 20:
-        raise HTTPException(400, "at most 20 task_ids can be queried at once")
-    if any(len(tid) > 128 or "\x00" in tid for tid in task_ids):
-        raise HTTPException(400, "invalid task_id")
-    _require_owned_music_tasks(user["id"], task_ids)
-    status, body = await _music_request(
-        "POST", "/query_result",
-        json={"task_id_list": task_ids},
-    )
-    if status >= 400:
-        raise HTTPException(status, body.decode(errors="replace"))
-    poll = json.loads(body)
-    _sync_music_tasks_from_poll(user["id"], poll)
-    return poll
-
-
-@app.get("/api/music/audio")
-async def music_audio(path: str, request: Request):
-    """Download generated music audio file."""
-    user = get_current_user(request)
-    path = _normalize_music_audio_path(path)
-    assert path is not None
-    _require_owned_music_audio_path(user["id"], path)
-    local_path = _music_audio_local_path(path)
-    if local_path is not None:
-        return FileResponse(
-            str(local_path),
-            media_type=_music_audio_content_type(path),
-        )
-    status, body = await _music_request("GET", "/v1/audio", params={"path": path})
-    if status >= 400:
-        raise HTTPException(status, body.decode(errors="replace"))
-    return Response(content=body, media_type=_music_audio_content_type(path))
-
-
-@app.post("/api/music/enhance")
-async def music_enhance(request: Request):
-    """Enhance prompt/lyrics using ACE-Step's LM."""
-    get_current_user(request)  # auth check
-    body = await request.body()
-    if len(body) > MAX_MUSIC_ENHANCE_BODY_BYTES:
-        raise HTTPException(
-            413,
-            f"request body too large (max {_size_label(MAX_MUSIC_ENHANCE_BODY_BYTES)})",
-        )
-    status, resp_body = await _music_request(
-        "POST", "/format_input",
-        data=body, headers={"Content-Type": "application/json"},
-    )
-    if status >= 400:
-        raise HTTPException(status, resp_body.decode(errors="replace"))
-    return json.loads(resp_body)
-
-
-@app.get("/api/music/health")
-async def music_health():
-    """Check ACE-Step backend health."""
-    try:
-        status, body = await _music_request("GET", "/health")
-        return json.loads(body)
-    except Exception:
-        return {"status": "unreachable", "backend_running": False}
-
-
-# ---------------------------------------------------------------------------
-# Sound Effects (MMAudio)
-# ---------------------------------------------------------------------------
-async def _sfx_request(method: str, path: str, **kwargs) -> tuple[int, bytes]:
-    timeout_seconds = SFX_GENERATE_TIMEOUT_SECONDS if path == "/generate" else 30
-    timeout = aiohttp.ClientTimeout(
-        total=timeout_seconds,
-        sock_connect=30,
-        sock_read=timeout_seconds,
-    )
-    start = time.perf_counter()
-    status = 0
-    try:
-        async with _http_session().request(
-            method, f"{SFX_URL}{path}", timeout=timeout, **kwargs
-        ) as resp:
-            status = resp.status
-            body = await resp.read()
-            return resp.status, body
-    finally:
-        labels = {"path": path, "status": status or "error"}
-        inc("vocarium_sfx_requests_total", labels=labels)
-        observe("vocarium_sfx_seconds", time.perf_counter() - start, labels)
-
-
-@app.post("/api/sfx/generate")
-async def sfx_generate(request: Request):
-    """Generate a sound effect from a text prompt. Returns WAV audio."""
-    get_current_user(request)
-    try:
-        body = await request.json()
-    except json.JSONDecodeError:
-        raise HTTPException(400, "Invalid JSON body")
-    prompt = body.get("prompt", "").strip()
-    if not prompt:
-        raise HTTPException(400, "prompt is required")
-    if len(prompt) > 1000:
-        raise HTTPException(413, "prompt too long (max 1000 characters)")
-    engine = (body.get("engine") or "mmaudio").strip().lower()
-    engine = _validate_engine(engine, SUPPORTED_SFX_ENGINES)
-    negative_prompt = (body.get("negative_prompt") or "").strip()
-    if len(negative_prompt) > 1000:
-        raise HTTPException(413, "negative_prompt too long (max 1000 characters)")
-    no_speech = _coerce_bool(body.get("no_speech", False), "no_speech")
-    no_music = _coerce_bool(body.get("no_music", False), "no_music")
-
-    try:
-        duration = float(body.get("duration", 8.0))
-        cfg_strength = float(body.get("cfg_strength", 4.5))
-        num_steps = int(body.get("num_steps", 25))
-        normalize_lufs = (
-            None
-            if body.get("normalize_lufs") is None
-            else float(body.get("normalize_lufs"))
-        )
-        fade_ms = int(body.get("fade_ms", 0))
-    except (TypeError, ValueError):
-        raise HTTPException(
-            400,
-            "duration, cfg_strength, num_steps, normalize_lufs, and fade_ms must be numeric",
-        )
-    if duration < 1 or duration > 30:
-        raise HTTPException(400, "duration must be between 1 and 30 seconds")
-    if cfg_strength < 1 or cfg_strength > 10:
-        raise HTTPException(400, "cfg_strength must be between 1 and 10")
-    if num_steps < 1 or num_steps > 100:
-        raise HTTPException(400, "num_steps must be between 1 and 100")
-    normalize_lufs = _validate_lufs(normalize_lufs)
-    fade_ms = _validate_fade_ms(fade_ms)
-    negative_prompt = _merge_negative_prompt(
-        negative_prompt,
-        "speech, voice, vocals, talking" if no_speech else "",
-        "music, melody, song, vocals" if no_music else "",
-    )
-    vocarium_options = {
-        "engine": engine,
-        "no_speech": no_speech,
-        "no_music": no_music,
-        "normalize_lufs": normalize_lufs,
-        "fade_ms": fade_ms,
-    }
-
-    sfx_params = {
-        "prompt": prompt,
-        "negative_prompt": negative_prompt,
-        "duration": duration,
-        "cfg_strength": cfg_strength,
-        "num_steps": num_steps,
-        "seed": body.get("seed"),
-    }
-
-    async def work():
-        try:
-            status, resp_body = await _sfx_request("POST", "/generate", json=sfx_params)
-        except asyncio.TimeoutError as exc:
-            raise HTTPException(
-                504,
-                f"SFX backend timed out after {SFX_GENERATE_TIMEOUT_SECONDS}s while loading or generating audio",
-            ) from exc
-        except aiohttp.ClientError as exc:
-            raise HTTPException(
-                502,
-                f"SFX backend connection failed: {exc}",
-            ) from exc
-        if status >= 400:
-            raise HTTPException(status, detail=resp_body.decode(errors="replace"))
-        return resp_body
-
-    _, future = await gpu_queue.submit("sfx", "SFX Generate", work)
-    wav_bytes = await future
-    return Response(
-        content=wav_bytes,
-        media_type="audio/wav",
-        headers={
-            "Content-Disposition": "attachment; filename=sfx.wav",
-            "X-Vocarium-Options": json.dumps(vocarium_options),
-        },
-    )
-
-
-@app.get("/api/sfx/health")
-async def sfx_health():
-    """Check MMAudio backend health."""
-    try:
-        status, body = await _sfx_request("GET", "/health")
-        return json.loads(body)
-    except Exception:
-        return {"status": "unreachable", "model_loaded": False}
+    return build_public_health(tts_health, gpu_resources)
 
 
 # ---------------------------------------------------------------------------
@@ -2314,6 +2496,44 @@ class OpenAISpeechRequest(BaseModel):
 
 def _openai_voice_lookup_key(value: str) -> str:
     return re.sub(r"[\s_-]+", " ", (value or "").strip()).casefold()
+
+
+def _voice_alias_key(value: str) -> str:
+    """Vergleichsschluessel fuer Stimmennamen: "Marc-Uwe Kling" == "Marc-Uwe-Kling"."""
+    text = (value or "").strip().casefold()
+    for src, dst in (("ä", "ae"), ("ö", "oe"), ("ü", "ue"), ("ß", "ss")):
+        text = text.replace(src, dst)
+    return re.sub(r"[^a-z0-9]+", "", text)
+
+
+def _legacy_clone_alias(voice_id: str, user_id: int | None) -> str | None:
+    """OmniVoice-Stimme, die einen stillgelegten Qwen-Klon gleichen Namens ersetzt.
+
+    Clients wie Sub-Wave haben die alten 8-stelligen Klon-IDs gespeichert
+    ("83b59aca" = Michael Scott). Die Klone wurden nach OmniVoice migriert und
+    heissen dort wie der alte Anzeigename, nur mit Bindestrichen. Solange Qwen
+    aus ist, wird der alte Datensatz auf diese Stimme umgebogen.
+    """
+    if QWEN_TTS_ENABLED or not voice_id or voice_id == "default":
+        return None
+    _fetched_at, omnivoice = _omnivoice_models_cache
+    if not omnivoice or voice_id in omnivoice:
+        return None
+    db = get_db()
+    if user_id is not None:
+        row = db.execute(
+            "SELECT name, source FROM voices WHERE id=? AND (user_id=? OR user_id IS NULL)",
+            (voice_id, user_id),
+        ).fetchone()
+    else:
+        row = db.execute("SELECT name, source FROM voices WHERE id=?", (voice_id,)).fetchone()
+    if not row or row[1] not in ("clone", "custom", "design"):
+        return None
+    wanted = _voice_alias_key(row[0])
+    for candidate_id, display in omnivoice.items():
+        if wanted and wanted in (_voice_alias_key(candidate_id), _voice_alias_key(display)):
+            return candidate_id
+    return None
 
 
 def _resolve_openai_tts_voice(voice: str, user_id: int | None = None) -> str:
@@ -2338,10 +2558,10 @@ def _resolve_openai_tts_voice(voice: str, user_id: int | None = None) -> str:
 
     for voice_id, name in rows:
         if cleaned == (voice_id or ""):
-            return voice_id
+            return _legacy_clone_alias(voice_id, user_id) or voice_id
     for voice_id, name in rows:
         if lookup_key == _openai_voice_lookup_key(name or ""):
-            return voice_id
+            return _legacy_clone_alias(voice_id, user_id) or voice_id
 
     normalized = re.sub(r"[\s_-]+", " ", cleaned).casefold()
     compact = re.sub(r"[\s_-]+", "", cleaned).casefold()
@@ -2365,16 +2585,30 @@ async def _openai_speech_proxy(
         req.response_format, allowed=TTS_RESPONSE_FORMATS
     )
     requested_voice = (req.voice or "").strip()
-    voice = voice_override or _normalize_openai_tts_voice(req.voice)
-    selected_url, selected_engine = _select_tts_backend(req.model, req.engine)
+    voice = voice_override or requested_voice or "default"
+    await _kikiri_models()
+    await _vibevoice_models()
+    await _omnivoice_models()
+    # Die Engine-Wahl muss die aufgeloeste Stimme sehen, nicht den rohen
+    # Request: sonst landet ein alter Klon-Alias wieder bei der toten Qwen-Engine.
+    selected_url, selected_engine, selected_kikiri_model = await _select_tts_backend(
+        req.model,
+        req.engine,
+        voice_id=voice,
+        response_format=response_format,
+    )
     payload = {
         "input": req.input,
-        "voice": voice,
+        "voice": _engine_voice(selected_engine, voice, selected_kikiri_model),
         "response_format": response_format,
     }
+    if selected_engine == "kikiri":
+        payload["model"] = selected_kikiri_model
     # Map OpenAI model names to internal model_id
     model_map = {"tts-1": "1.7b-base", "tts-1-hd": "1.7b-base"}
-    if req.model in model_map:
+    if selected_engine == "kikiri":
+        pass
+    elif req.model in model_map:
         payload["model_id"] = model_map[req.model]
     elif req.model not in ("qwen3-tts", ""):
         payload["model_id"] = req.model
@@ -2384,8 +2618,8 @@ async def _openai_speech_proxy(
             "POST", "/v1/audio/speech", url=selected_url, json=payload
         )
         if status >= 400:
-            raise HTTPException(status, body.decode(errors="replace"))
-        if voice not in ("default", ""):
+            raise HTTPException(status, _upstream_detail(body))
+        if selected_engine != "kikiri" and voice not in ("default", ""):
             h_lower = {k.lower(): v for k, v in headers.items()}
             actual_voice = h_lower.get("x-voice")
             if actual_voice and actual_voice != voice:
@@ -2396,7 +2630,9 @@ async def _openai_speech_proxy(
         content_type = headers.get("Content-Type", headers.get("content-type", "audio/wav"))
         return {"body": body, "media_type": content_type, "voice": voice}
 
-    result = await _run_tts_job(description, work_maker)
+    result = await _run_tts_job(
+        description, work_maker, tts_url=selected_url, engine=selected_engine
+    )
     headers = {}
     headers["X-TTS-Engine"] = selected_engine
     if result.get("voice") and result["voice"] != requested_voice:
@@ -2413,6 +2649,10 @@ async def openai_tts(req: OpenAISpeechRequest, request: Request):
     Designed voices live behind ``/v1/audio/speech/designed``.
     """
     user = get_current_user(request, allow_anonymous=True)
+    # Warm the engine listings first: _verify_voice_source is sync and reads the
+    # caches, so a cold cache would reject a perfectly valid OmniVoice voice.
+    await _omnivoice_models()
+    await _kikiri_models()
     voice = _resolve_openai_tts_voice(req.voice, user_id=user["id"])
     _verify_voice_source(voice, allowed_sources=("clone",), user_id=user["id"])
     return await _openai_speech_proxy(
@@ -2465,11 +2705,12 @@ async def openai_stt(
         except Exception as e:
             raise HTTPException(500, f"Audio conversion failed: {e}")
 
-    async def work():
-        return await _transcribe_wav_bytes(wav_bytes)
-
-    _, future = await gpu_queue.submit("asr", "OpenAI STT", work)
-    result = await future
+    if not WHISPER_URL:
+        raise HTTPException(503, "Kein STT-Dienst konfiguriert (WHISPER_URL)")
+    try:
+        result = await _transcribe_wav_whisper(wav_bytes)
+    except Exception as exc:
+        raise HTTPException(502, f"Transkription fehlgeschlagen: {exc}")
 
     if response_format == "text":
         return Response(content=result["text"], media_type="text/plain")
@@ -2482,12 +2723,19 @@ async def openai_models():
     """OpenAI-compatible model listing for TTS/STT."""
     models = [
         {"id": "tts-1", "object": "model", "owned_by": "vocarium",
-         "description": "Qwen3-TTS 1.7B (GPU)"},
+         "description": "OmniVoice zero-shot clones (GPU)"},
         {"id": "tts-1-hd", "object": "model", "owned_by": "vocarium",
-         "description": "Qwen3-TTS 1.7B (GPU)"},
+         "description": "OmniVoice zero-shot clones (GPU)"},
         {"id": "whisper-1", "object": "model", "owned_by": "vocarium",
-         "description": "Qwen3-ASR 0.6B"},
+         "description": "faster-whisper large-v3 (GPU)"},
     ]
+    for model_id, meta in sorted((await _kikiri_models()).items()):
+        models.append({
+            "id": model_id,
+            "object": "model",
+            "owned_by": "vocarium",
+            "description": f"Kikiri {meta['name']} (CPU)",
+        })
     return {"object": "list", "data": models}
 
 
@@ -2525,6 +2773,10 @@ async def openai_voices(request: Request, source: str | None = Query(default=Non
         })
     for r in rows:
         if r[0] == "default" and source in (None, "clone"):
+            continue
+        # Designed and custom voices belonged to the retired Qwen engine;
+        # without it they are unplayable and stay hidden like in /api/voices.
+        if r[3] in ("design", "custom") and not QWEN_TTS_ENABLED:
             continue
         voices.append({
             "voice_id": r[0],
@@ -2765,6 +3017,27 @@ def _get_active_llm_provider(user_id: int) -> dict | None:
     }
 
 
+# --- Bereichs-Einstellungen -------------------------------------------------
+
+@app.get("/api/settings/prefs/{namespace}")
+async def read_settings_prefs(namespace: str, request: Request):
+    """Voreinstellungen eines Bereichs lesen."""
+    user = get_current_user(request)
+    if namespace not in user_settings.SETTINGS_NAMESPACES:
+        raise HTTPException(404, f"unknown settings namespace {namespace!r}")
+    return {"namespace": namespace, "prefs": user_settings.read(get_db(), user["id"], namespace)}
+
+
+@app.put("/api/settings/prefs/{namespace}")
+async def write_settings_prefs(namespace: str, body: dict, request: Request):
+    """Voreinstellungen eines Bereichs schreiben (unbekannte Schlüssel fallen raus)."""
+    user = get_current_user(request)
+    if namespace not in user_settings.SETTINGS_NAMESPACES:
+        raise HTTPException(404, f"unknown settings namespace {namespace!r}")
+    prefs = user_settings.write(get_db(), user["id"], namespace, body)
+    return {"namespace": namespace, "prefs": prefs}
+
+
 @app.get("/api/llm/providers")
 async def list_llm_providers(request: Request):
     """List all LLM providers for the authenticated user."""
@@ -2938,6 +3211,44 @@ async def set_active_llm_provider(provider_id: str, request: Request):
     )
     db.commit()
     return {"status": "active", "provider_id": provider_id}
+
+
+@app.get("/api/llm/providers/{provider_id}/models")
+async def list_provider_models(provider_id: str, request: Request) -> dict:
+    """Discover models with stored credentials, scoped to the signed-in user."""
+    user = get_current_user(request)
+    row = get_db().execute(
+        "SELECT base_url, api_key FROM llm_providers WHERE id=? AND user_id=?",
+        (provider_id, user["id"]),
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, "Provider not found")
+    import aiohttp
+    headers = {"Authorization": f"Bearer {row[1]}"} if row[1] else {}
+    try:
+        async with _http_session().get(
+            f"{_normalize_http_base_url(row[0])}/models", headers=headers,
+            timeout=aiohttp.ClientTimeout(total=25), allow_redirects=False,
+        ) as response:
+            if response.status != 200:
+                raise HTTPException(502, "Provider model catalog unavailable. Check the saved URL and credentials.")
+            chunks = []
+            size = 0
+            while chunk := await response.content.read(65536):
+                size += len(chunk)
+                if size > 2_000_000:
+                    raise HTTPException(502, "Provider model catalog is too large")
+                chunks.append(chunk)
+            data = json.loads(b"".join(chunks))
+            models = sorted({str(item["id"]) for item in data.get("data", [])
+                             if isinstance(item, dict) and isinstance(item.get("id"), str) and 0 < len(item["id"]) <= 200})
+            if not models:
+                raise HTTPException(502, "Provider returned no models; the current selection is unchanged.")
+            return {"models": models, "refreshed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    except HTTPException:
+        raise
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError, AttributeError):
+        raise HTTPException(502, "Provider model catalog unavailable; the current selection is unchanged.")
 
 
 @app.post("/api/llm/test")

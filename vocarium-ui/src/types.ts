@@ -16,7 +16,18 @@ export interface Voice {
   instruct?: string;
   created_at: string;
   has_audio: boolean;
+  engine?: string;
+  /**
+   * Kikiri only: `kikiri` for the fine-tunes, `fallback` for the Piper voice
+   * bank that exists purely for the case where OmniVoice cannot run.
+   */
+  group?: string;
+  gender?: string;
+  backend?: string;
+  notes?: string;
 }
+
+export type TtsEngine = 'auto' | 'kikiri' | 'vibevoice' | 'omnivoice' | 'qwen';
 
 export interface Speaker {
   id: string;
@@ -88,6 +99,51 @@ export interface Host {
   role: HostRole;
   created_at: string;
   updated_at: string;
+  tagline?: string;
+  /** Nur bei "aus Preset übernehmen": Wunschstimme war nicht verfügbar. */
+  voice_missing?: boolean;
+  /** Kennt OmniVoice/Kikiri die gesetzte Stimme gerade? Fehlt bei alten Antworten. */
+  voice_available?: boolean;
+}
+
+export interface HostPresetCategory {
+  id: string;
+  label: string;
+  description: string;
+}
+
+export interface HostPreset {
+  id: string;
+  name: string;
+  tagline: string;
+  category: string;
+  role: HostRole;
+  voice: string;
+  gender: 'male' | 'female';
+  personality: string;
+  speaking_style: string;
+  voice_available: boolean;
+  already_added: boolean;
+}
+
+export type SettingsNamespace = 'podcast' | 'lab' | 'general';
+
+export interface PodcastPrefs {
+  format: PodcastFormat;
+  duration: PodcastDuration;
+  audio_format: string;
+  disfluency_level: number;
+  language: string;
+}
+
+export interface LabPrefs {
+  speech_voice: string;
+  speech_format: string;
+  speech_speed: number;
+}
+
+export interface GeneralPrefs {
+  area_default: string;
 }
 
 export type PodcastFormat = 'dialog' | 'monolog' | 'custom';
@@ -102,6 +158,7 @@ export type PodcastStatus =
   | 'error';
 
 export interface ScriptSegment {
+  speaker_id?: string;
   id: string;
   script_id?: string | null;
   speaker: string;
@@ -118,9 +175,9 @@ export interface ScriptSegment {
   /** Mixing offset relative to the previous segment's end (ms).
    *  0 = use the contextual gap; <0 = overlap (interruption); >0 = forced gap. */
   overlap_ms?: number;
-  /** Music or prompted SFX prompt. */
+  /** Music prompt. */
   prompt?: string | null;
-  /** Target duration for music/SFX segments. */
+  /** Target duration for music segments. */
   duration_ms?: number;
   /** Per-segment volume in dB (typically negative for music ducked under speech). */
   volume_db?: number;
@@ -133,6 +190,9 @@ export interface ScriptPayload {
 }
 
 export interface Podcast {
+  script_revision?: string;
+  audio_revision?: string;
+  audio_stale?: boolean;
   id: string;
   topic: string;
   format: PodcastFormat;
@@ -229,4 +289,54 @@ export interface LLMProvider {
   is_active: boolean;
   provider_type: string;
   created_at: string;
+}
+
+export interface AbChapter {
+  index: number;
+  title: string;
+  totalSegments: number;
+  cachedSegments: number;
+  complete: boolean;
+}
+
+export interface AbBook {
+  id: string;
+  title: string;
+  author: string;
+  format: string;
+  voice_id: string | null;
+  total_chapters: number;
+  created_at: string;
+  is_hidden?: boolean;
+  has_cover?: boolean;
+  collectionIds?: string[];
+  progress?: { chapterIndex: number; segmentIndex: number; completed?: boolean; updatedAt?: string } | null;
+}
+
+export interface AbCollection {
+  id: string;
+  name: string;
+  color: string;
+}
+
+export interface AbGeneration {
+  status: 'running' | 'completed' | 'failed' | 'cancelled';
+  voice_id: string;
+  chapter: number | null;
+  done: number;
+  total: number;
+  error: string;
+}
+
+export interface AbBookDetail extends AbBook {
+  chapters: AbChapter[];
+  generation: AbGeneration | null;
+}
+
+export interface AbSegment {
+  index: number;
+  text: string;
+  chapterIndex: number;
+  paragraphBreak: boolean;
+  heading?: boolean;
 }

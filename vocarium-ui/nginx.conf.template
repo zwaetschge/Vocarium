@@ -1,0 +1,57 @@
+resolver 127.0.0.11 valid=10s;
+
+server {
+    listen 3000;
+    root /usr/share/nginx/html;
+    index index.html;
+
+    include /etc/nginx/security-headers.conf;
+
+    # index.html, Service Worker und Manifest dürfen NIE aus dem Browser-Cache
+    # kommen — sonst zeigen Deploys erst nach Tagen Wirkung (heuristisches
+    # Caching ohne Cache-Control-Header). Die gehashten Assets sind unsterblich.
+    location = /index.html {
+        include /etc/nginx/security-headers.conf;
+        add_header Cache-Control "no-cache, must-revalidate" always;
+    }
+
+    location = /sw.js {
+        include /etc/nginx/security-headers.conf;
+        add_header Cache-Control "no-cache, must-revalidate" always;
+    }
+
+    location = /manifest.webmanifest {
+        include /etc/nginx/security-headers.conf;
+        add_header Cache-Control "no-cache, must-revalidate" always;
+    }
+
+    location /assets/ {
+        include /etc/nginx/security-headers.conf;
+        add_header Cache-Control "public, max-age=31536000, immutable" always;
+    }
+
+    location / {
+        include /etc/nginx/security-headers.conf;
+        add_header Cache-Control "no-cache, must-revalidate" always;
+        try_files $uri $uri/ /index.html;
+    }
+
+    location /api/ {
+        set $backend http://vocarium-api:8280;
+        proxy_pass $backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header Remote-User $http_remote_user;
+        proxy_set_header X-Forwarded-User $http_x_forwarded_user;
+        # Beweist dem Gateway, dass Remote-User durch diesen Proxy kam.
+        # envsubst setzt den Wert beim Containerstart ein (Variable in .env).
+        proxy_set_header X-Vocarium-Proxy-Secret "${VOCARIUM_PROXY_SECRET}";
+        proxy_set_header Connection "";
+        proxy_buffering off;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+        client_max_body_size 512m;
+    }
+}

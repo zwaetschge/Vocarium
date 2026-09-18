@@ -1,9 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import {useRouteField} from '../hooks/useRouteField';
+import { isValidElement, useEffect, useMemo, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   getHosts,
-  createHost,
-  deleteHost,
   getPodcasts,
   getPodcast,
   createPodcast,
@@ -13,6 +13,7 @@ import {
   addUrlSource,
   addTextSource,
   deletePodcastSource,
+  reprocessPodcastSource,
   generatePodcastScript,
   updateSegment,
   addSegment,
@@ -22,10 +23,16 @@ import {
   downloadPodcastAudio,
   getVoices,
   getLanguages,
+  getSegmentTags,
+  updatePodcastCast,
 } from '../api';
+import type { SegmentTag } from '../api';
+import Modal from '../components/Dialog';
+import { PlayEdition } from '../components/StudioPlayer';
+import { useDraftField, useHasDrafts, useEditorDraftActions } from '../state/EditorDrafts';
+import { SingleOfflineButton } from '../components/OfflineControls';
 import type {
   Host,
-  HostRole,
   Podcast,
   PodcastFormat,
   PodcastDuration,
@@ -34,22 +41,21 @@ import type {
   PodcastProgressEvent,
   Voice,
 } from '../types';
+import { engineVoices as listEngineVoices } from '../voiceUtils';
 
 export default function PodcastPage() {
+  const retainDraft = useEditorDraftActions();
   const [hosts, setHosts] = useState<Host[]>([]);
   const [podcasts, setPodcasts] = useState<Podcast[]>([]);
   const [voices, setVoices] = useState<Voice[]>([]);
   const [languages, setLanguages] = useState<string[]>([]);
-  const [selectedPodcastId, setSelectedPodcastId] = useState<string | null>(null);
-  const [hostManagerOpen, setHostManagerOpen] = useState(false);
+  const [selectedPodcastId, setSelectedPodcastId] = useRouteField('episode', '');
   const [createPodcastOpen, setCreatePodcastOpen] = useState(false);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
 
-  const customVoices = useMemo(
-    () => voices.filter((v) => v.source === 'custom'),
-    [voices],
-  );
+  // Podcast-Sprecher kommen aus den Klon-/Finetune-Engines (Qwen ist stillgelegt).
+  const engineVoices = useMemo(() => listEngineVoices(voices), [voices]);
   const selectedPodcast = useMemo(
     () => podcasts.find((p) => p.id === selectedPodcastId) || null,
     [podcasts, selectedPodcastId],
@@ -64,7 +70,7 @@ export default function PodcastPage() {
       setVoices(vv);
       if (!selectedPodcastId && pp.length > 0) setSelectedPodcastId(pp[0].id);
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load podcasts');
+      setError(e instanceof Error ? e.message : 'Podcasts konnten nicht geladen werden');
     } finally {
       setLoading(false);
     }
@@ -99,19 +105,27 @@ export default function PodcastPage() {
     }
   };
 
-  const handleCreate = async (payload: Parameters<typeof createPodcast>[0]) => {
+  const handleCreate = async (payload: Parameters<typeof createPodcast>[0] & { source_text?: string }) => {
     try {
-      const pod = await createPodcast(payload);
+      const { source_text, ...settings } = payload;
+      const pod = await createPodcast(settings);
+      let sourceProblem = '';
+      if (source_text?.trim()) {
+        try { await addTextSource(pod.id, source_text.trim(), 'Erste Textquelle'); }
+        catch { retainDraft(`podcast-source:${pod.id}:text`, source_text); sourceProblem = 'Podcast angelegt. Die erste Quelle konnte nicht gespeichert werden; ihr Text bleibt im Quellenformular erhalten.'; }
+      }
       setPodcasts((prev) => [pod, ...prev]);
       setSelectedPodcastId(pod.id);
       setCreatePodcastOpen(false);
+      if (sourceProblem) setError(sourceProblem);
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Create failed');
+      setError(e instanceof Error ? e.message : 'Anlegen fehlgeschlagen');
+      throw e;
     }
   };
 
   const handleDelete = async (id: string) => {
-    if (!confirm('Delete this podcast? This cannot be undone.')) return;
+    if (!confirm('Diesen Podcast löschen? Das lässt sich nicht rückgängig machen.')) return;
     try {
       await deletePodcast(id);
       setPodcasts((prev) => prev.filter((p) => p.id !== id));
@@ -120,7 +134,7 @@ export default function PodcastPage() {
         setSelectedPodcastId(remaining.length > 0 ? remaining[0].id : null);
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Delete failed');
+      setError(e instanceof Error ? e.message : 'Löschen fehlgeschlagen');
     }
   };
 
@@ -144,21 +158,21 @@ export default function PodcastPage() {
         <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
           <h1 style={{ fontSize: '28px', color: 'var(--color-text)' }}>Podcast Studio</h1>
           <p style={{ fontSize: '13px', color: 'var(--color-text-secondary)' }}>
-            Turn sources into scripted, multi-voice podcasts. Uses your saved custom voices.
+            Aus Quellen wird ein Skript, aus dem Skript ein mehrstimmiger Podcast.
           </p>
         </div>
         <div style={{ display: 'flex', gap: '10px' }}>
-          <button
+          <Link
+            to="/podcast/hosts"
             className="btn btn-secondary"
-            onClick={() => setHostManagerOpen(true)}
             style={{ height: '40px' }}
           >
             <svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
               <circle cx="10" cy="6" r="3" />
               <path d="M3 18v-1a5 5 0 015-5h4a5 5 0 015 5v1" />
             </svg>
-            Hosts ({hosts.length})
-          </button>
+            Sprecher ({hosts.length})
+          </Link>
           <motion.button
             whileTap={{ scale: 0.97 }}
             className="btn btn-primary"
@@ -168,13 +182,13 @@ export default function PodcastPage() {
             <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
               <path d="M8 2v12M2 8h12" />
             </svg>
-            New podcast
+            Neuer Podcast
           </motion.button>
         </div>
       </div>
 
       {/* Custom voice gate hint */}
-      {customVoices.length === 0 && (
+      {engineVoices.length === 0 && (
         <div
           className="card-subtle"
           style={{
@@ -190,7 +204,7 @@ export default function PodcastPage() {
             <path d="M8 1.5l7 13H1l7-13zM8 6v4M8 12v.5" />
           </svg>
           <div style={{ fontSize: '13px', color: 'var(--color-text-secondary)' }}>
-            You have no custom voices yet. Podcasts require custom voices — use <em>Custom</em> to create one.
+            Du hast noch keine eigenen Stimmen. Podcasts brauchen geklonte oder feingetunte Stimmen — öffne im Sprachstudio <em>Stimme klonen</em> und kehre anschließend hierher zurück.
           </div>
         </div>
       )}
@@ -240,28 +254,17 @@ export default function PodcastPage() {
             key={selectedPodcast.id}
             podcast={selectedPodcast}
             hosts={hosts}
-            customVoices={customVoices}
+            engineVoices={engineVoices}
             onReload={() => reloadPodcast(selectedPodcast.id)}
             onReloadList={reloadPodcastList}
             onError={setError}
           />
         ) : (
-          <EmptyPane onNew={() => setCreatePodcastOpen(true)} canCreate={customVoices.length >= 1 && hosts.length >= 1} />
+          <EmptyPane onNew={() => setCreatePodcastOpen(true)} canCreate={engineVoices.length >= 1 && hosts.length >= 1} />
         )}
       </div>
 
       <AnimatePresence>
-        {hostManagerOpen && (
-          <HostManagerModal
-            hosts={hosts}
-            customVoices={customVoices}
-            onClose={() => {
-              setHostManagerOpen(false);
-              loadAll();
-            }}
-            onError={setError}
-          />
-        )}
         {createPodcastOpen && (
           <CreatePodcastModal
             hosts={hosts}
@@ -291,16 +294,16 @@ function PodcastList({
   loading: boolean;
 }) {
   return (
-    <div className="card" style={{ padding: '12px', display: 'flex', flexDirection: 'column', gap: '4px', minHeight: '220px' }}>
+    <div className="card podcast-library" style={{ padding: '12px', display: 'flex', flexDirection: 'column', gap: '4px', minHeight: '220px' }}>
       <div style={{ padding: '6px 10px 10px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-        <span className="label-eyebrow" style={{ fontSize: '10px' }}>Library</span>
+        <span className="label-eyebrow" style={{ fontSize: '10px' }}>Bibliothek</span>
         <span style={{ fontSize: '11px', color: 'var(--color-text-dim)', fontFamily: 'var(--font-mono)' }}>{podcasts.length}</span>
       </div>
       {loading ? (
-        <div style={{ padding: '20px 12px', fontSize: '12px', color: 'var(--color-text-dim)' }}>Loading…</div>
+        <div style={{ padding: '20px 12px', fontSize: '12px', color: 'var(--color-text-dim)' }}>Lädt…</div>
       ) : podcasts.length === 0 ? (
         <div style={{ padding: '18px 12px', fontSize: '12.5px', color: 'var(--color-text-dim)', lineHeight: 1.5 }}>
-          No podcasts yet. Create one to start.
+          Noch keine Podcasts. Leg einen an, um loszulegen.
         </div>
       ) : (
         podcasts.map((p) => {
@@ -309,7 +312,6 @@ function PodcastList({
             <motion.div
               key={p.id}
               whileTap={{ scale: 0.99 }}
-              onClick={() => onSelect(p.id)}
               style={{
                 padding: '12px 12px',
                 borderRadius: '10px',
@@ -329,7 +331,7 @@ function PodcastList({
                 if (!active) e.currentTarget.style.background = 'transparent';
               }}
             >
-              <div style={{ minWidth: 0, flex: 1 }}>
+              <button type="button" className="podcast-select" aria-pressed={active} onClick={() => onSelect(p.id)} style={{ minWidth: 0, flex: 1 }}>
                 <div
                   style={{
                     fontSize: '13.5px',
@@ -341,7 +343,7 @@ function PodcastList({
                     whiteSpace: 'nowrap',
                   }}
                 >
-                  {p.topic || 'Untitled podcast'}
+                  {p.topic || 'Ohne Titel'}
                 </div>
                 <div
                   style={{
@@ -354,20 +356,20 @@ function PodcastList({
                     fontFamily: 'var(--font-mono)',
                   }}
                 >
-                  <span>{p.format}</span>
+                  <span>{FORMAT_LABELS[p.format] || p.format}</span>
                   <span style={{ opacity: 0.4 }}>·</span>
-                  <span>{p.duration}</span>
+                  <span>{DURATION_LABELS[p.duration] || p.duration}</span>
                   <span style={{ opacity: 0.4 }}>·</span>
                   <StatusPill status={p.status} />
                 </div>
-              </div>
+              </button>
               <button
                 className="btn-ghost"
                 onClick={(e) => {
                   e.stopPropagation();
                   onDelete(p.id);
                 }}
-                title="Delete"
+                title="Löschen"
                 style={{
                   padding: '3px 5px',
                   borderRadius: '6px',
@@ -391,13 +393,13 @@ function PodcastList({
 
 function StatusPill({ status }: { status: Podcast['status'] }) {
   const styles: Record<Podcast['status'], { label: string; color: string; bg: string }> = {
-    draft: { label: 'draft', color: 'var(--color-text-dim)', bg: 'rgba(255,255,255,0.05)' },
-    generating_script: { label: 'script…', color: 'var(--color-warning)', bg: 'var(--color-warning-dim)' },
-    script_ready: { label: 'script ready', color: 'var(--color-accent-hover)', bg: 'var(--color-accent-dim)' },
-    generating_audio: { label: 'audio…', color: 'var(--color-warning)', bg: 'var(--color-warning-dim)' },
-    ready: { label: 'ready', color: 'var(--color-success)', bg: 'var(--color-success-dim)' },
-    cancelled: { label: 'cancelled', color: 'var(--color-text-dim)', bg: 'rgba(255,255,255,0.05)' },
-    error: { label: 'error', color: 'var(--color-danger)', bg: 'var(--color-danger-dim)' },
+    draft: { label: 'Entwurf', color: 'var(--color-text-dim)', bg: 'rgba(255,255,255,0.05)' },
+    generating_script: { label: 'Skript…', color: 'var(--color-warning)', bg: 'var(--color-warning-dim)' },
+    script_ready: { label: 'Skript fertig', color: 'var(--color-accent-hover)', bg: 'var(--color-accent-dim)' },
+    generating_audio: { label: 'Audio…', color: 'var(--color-warning)', bg: 'var(--color-warning-dim)' },
+    ready: { label: 'Fertig', color: 'var(--color-success)', bg: 'var(--color-success-dim)' },
+    cancelled: { label: 'Abgebrochen', color: 'var(--color-text-dim)', bg: 'rgba(255,255,255,0.05)' },
+    error: { label: 'Fehler', color: 'var(--color-danger)', bg: 'var(--color-danger-dim)' },
   };
   const s = styles[status];
   return (
@@ -452,19 +454,19 @@ function EmptyPane({ onNew, canCreate }: { onNew: () => void; canCreate: boolean
         </svg>
       </div>
       <div style={{ fontSize: '15px', fontWeight: 500, color: 'var(--color-text)', letterSpacing: 0 }}>
-        No podcast selected
+        Kein Podcast ausgewählt
       </div>
       <div style={{ fontSize: '13px', color: 'var(--color-text-dim)', maxWidth: '360px', lineHeight: 1.5 }}>
-        Create a podcast to add sources, generate a script, and render multi-voice audio.
+        Leg einen Podcast an: Quellen hochladen, Skript schreiben lassen, Audio rendern.
       </div>
       {canCreate && (
         <button className="btn btn-primary" style={{ marginTop: '6px' }} onClick={onNew}>
-          Start new podcast
+          Podcast anlegen
         </button>
       )}
       {!canCreate && (
         <div style={{ fontSize: '11.5px', color: 'var(--color-warning)', marginTop: '6px' }}>
-          You need at least one custom voice and one host first.
+          Dafür brauchst du mindestens eine eigene Stimme und einen Sprecher.
         </div>
       )}
     </div>
@@ -473,62 +475,342 @@ function EmptyPane({ onNew, canCreate }: { onNew: () => void; canCreate: boolean
 
 /* ────────────────── Podcast detail (right column) ────────────────── */
 
+
+type DetailTab = 'sources' | 'script' | 'audio' | 'cast';
+
+const FORMAT_LABELS: Record<string, string> = {
+  dialog: 'Dialog',
+  monolog: 'Monolog',
+  custom: 'Frei',
+};
+
+const DURATION_LABELS: Record<string, string> = {
+  short: 'kurz',
+  medium: 'mittel',
+  long: 'lang',
+};
+
+// Die Sprache steht als englischer Name in der DB; die Oberfläche ist deutsch.
+const LANGUAGE_LABELS: Record<string, string> = {
+  German: 'Deutsch',
+  English: 'Englisch',
+  French: 'Französisch',
+  Spanish: 'Spanisch',
+  Italian: 'Italienisch',
+};
+
+/**
+ * Skript- und Audio-Erzeugung leben hier oben statt in den Panels: die Kopfzeile
+ * zeigt den nächsten Schritt als einen Knopf, und der Fortschritt bleibt sichtbar,
+ * egal welcher Reiter gerade offen ist.
+ */
+function usePodcastJobs(
+  podcast: Podcast,
+  onReload: () => void,
+  onReloadList: () => void,
+  onError: (msg: string) => void,
+) {
+  const hasDrafts = useHasDrafts(`podcast:${podcast.id}:`);
+  const [localScriptBusy, setScriptBusy] = useState(false);
+  const [scriptProgress, setScriptProgress] = useState<PodcastProgressEvent | null>(null);
+  const [localAudioBusy, setAudioBusy] = useState(false);
+  const [audioProgress, setAudioProgress] = useState<PodcastProgressEvent | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+
+  const scriptBusy = localScriptBusy || podcast.status === 'generating_script';
+  const audioBusy = localAudioBusy || podcast.status === 'generating_audio';
+  const running = useRef(false);
+  const reloadRef = useRef(onReload);
+  reloadRef.current = onReload;
+  useEffect(() => {
+    if (!scriptBusy && !audioBusy) return;
+    const timer = window.setInterval(() => reloadRef.current(), 3000);
+    return () => window.clearInterval(timer);
+  }, [scriptBusy, audioBusy]);
+
+  const generateScript = async () => {
+    if (hasDrafts) { onError('Bitte Segmententwürfe zuerst speichern oder verwerfen.'); return; }
+    if (scriptBusy || audioBusy || running.current) return;
+    running.current = true;
+    setScriptBusy(true);
+    setScriptProgress(null);
+    const finish = () => {
+      running.current = false;
+      setScriptBusy(false);
+      setScriptProgress(null);
+      onReload();
+      onReloadList();
+    };
+    try {
+      await generatePodcastScript(podcast.id, setScriptProgress, finish, (err) => {
+        onError(err);
+        finish();
+      });
+    } catch (e) {
+      running.current = false;
+      onReload();
+      setScriptBusy(false);
+      setScriptProgress(null);
+      onError(e instanceof Error ? e.message : 'Skript-Erzeugung fehlgeschlagen');
+    }
+  };
+
+  const generateAudio = async (force = false) => {
+    if (hasDrafts) { onError('Bitte Segmententwürfe zuerst speichern oder verwerfen.'); return; }
+    if (scriptBusy || audioBusy || running.current) return;
+    running.current = true;
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setAudioBusy(true);
+    setAudioProgress(null);
+    const finish = () => {
+      running.current = false;
+      setAudioBusy(false);
+      setAudioProgress(null);
+      onReload();
+      onReloadList();
+    };
+    try {
+      await generatePodcastAudio(
+        podcast.id,
+        setAudioProgress,
+        finish,
+        (err) => {
+          if (err !== 'cancelled') onError(err);
+          finish();
+        },
+        force,
+        controller.signal,
+      );
+    } catch (e) {
+      running.current = false;
+      onReload();
+      setAudioBusy(false);
+      setAudioProgress(null);
+      onError(e instanceof Error ? e.message : 'Audio-Erzeugung fehlgeschlagen');
+    } finally {
+      if (abortRef.current === controller) abortRef.current = null;
+    }
+  };
+
+  const cancelAudio = () => {
+    abortRef.current?.abort();
+    setAudioBusy(false);
+    setAudioProgress(null);
+    onReload();
+    onReloadList();
+  };
+
+  const downloadAudio = async () => {
+    try {
+      const blob = await downloadPodcastAudio(podcast.id);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${(podcast.topic || 'podcast').replace(/[^a-z0-9]+/gi, '-').toLowerCase()}.${podcast.audio_format || 'wav'}`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      onError(e instanceof Error ? e.message : 'Download fehlgeschlagen');
+    }
+  };
+
+  return {
+    hasDrafts,
+    scriptBusy,
+    scriptProgress,
+    generateScript,
+    audioBusy,
+    audioProgress,
+    generateAudio,
+    cancelAudio,
+    downloadAudio,
+  };
+}
+
+type PodcastJobs = ReturnType<typeof usePodcastJobs>;
+
 function PodcastDetail({
   podcast,
   hosts,
-  customVoices,
+  engineVoices,
   onReload,
   onReloadList,
   onError,
 }: {
   podcast: Podcast;
   hosts: Host[];
-  customVoices: Voice[];
+  engineVoices: Voice[];
   onReload: () => void;
   onReloadList: () => void;
   onError: (msg: string) => void;
 }) {
+  const segments = podcast.script?.segments || [];
+  const hasAudio = !!podcast.audio_path;
+  const jobs = usePodcastJobs(podcast, onReload, onReloadList, onError);
+  const [sourceCount, setSourceCount] = useState<number | null>(null);
+  // Der Elternteil setzt key={podcast.id}, die Komponente startet also je Podcast
+  // neu — der Startreiter darf deshalb aus dem Initialwert kommen.
+  const [rawTab, setTab] = useRouteField('view',
+    hasAudio ? 'audio' : segments.length > 0 ? 'script' : 'sources',
+  );
+
+  const tab = ['sources','script','audio','cast'].includes(rawTab) ? rawTab : 'sources';
+
+  const tabs: { id: DetailTab; label: string; badge?: string }[] = [
+    { id: 'sources', label: 'Quellen', badge: sourceCount ? String(sourceCount) : undefined },
+    { id: 'script', label: 'Skript', badge: segments.length ? String(segments.length) : undefined },
+    { id: 'audio', label: 'Audio', badge: hasAudio ? '✓' : undefined },
+    { id: 'cast', label: 'Besetzung', badge: podcast.hosts.length ? String(podcast.hosts.length) : undefined },
+  ];
+
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: '18px' }}>
-      <ConfigCard podcast={podcast} />
-      <SourcesCard podcast={podcast} onError={onError} />
-      <ScriptCard
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '14px', minWidth: 0 }}>
+      <DetailHeader
         podcast={podcast}
-        onReload={onReload}
-        onReloadList={onReloadList}
-        onError={onError}
+        jobs={jobs}
+        segmentCount={segments.length}
+        hasAudio={hasAudio}
+        onJump={setTab}
       />
-      <AudioCard
-        podcast={podcast}
-        onReload={onReload}
-        onReloadList={onReloadList}
-        onError={onError}
-      />
-      {/* Hosts preview */}
-      <HostsPreview hosts={podcast.hosts} customVoices={customVoices} allHosts={hosts} />
+
+      {jobs.hasDrafts && <p role="status" className="draft-status">Ungespeicherte Segmententwürfe. Vor einer neuen Produktion speichern oder verwerfen.</p>}
+      <nav className="podcast-tabs" aria-label="Podcastansichten">
+        {tabs.map((t) => (
+          <button
+            key={t.id}
+            aria-current={tab === t.id ? 'page' : undefined}
+            className={`podcast-tab${tab === t.id ? ' podcast-tab-active' : ''}`}
+            onClick={() => setTab(t.id)}
+          >
+            {t.label}
+            {t.badge && <span className="podcast-tab-badge">{t.badge}</span>}
+          </button>
+        ))}
+      </nav>
+
+      {tab === 'sources' && (
+        <SourcesCard podcast={podcast} onError={onError} onCount={setSourceCount} />
+      )}
+      {tab === 'script' && (
+        <ScriptCard podcast={podcast} jobs={jobs} onReload={onReload} onError={onError} />
+      )}
+      {tab === 'audio' && <AudioCard podcast={podcast} jobs={jobs} />}
+      {tab === 'cast' && (
+        <EpisodeCast podcast={podcast} allHosts={hosts} engineVoices={engineVoices} disabled={jobs.audioBusy || jobs.scriptBusy} onReload={onReload} onError={onError} />
+      )}
     </div>
   );
 }
 
-function ConfigCard({ podcast }: { podcast: Podcast }) {
+/** Titel, Status, Kennzahlen und — immer sichtbar — der nächste Schritt. */
+function DetailHeader({
+  podcast,
+  jobs,
+  segmentCount,
+  hasAudio,
+  onJump,
+}: {
+  podcast: Podcast;
+  jobs: PodcastJobs;
+  segmentCount: number;
+  hasAudio: boolean;
+  onJump: (tab: DetailTab) => void;
+}) {
+  const busy = jobs.scriptBusy || jobs.audioBusy;
+  const progress = jobs.scriptBusy ? jobs.scriptProgress : jobs.audioProgress;
+
+  const primary = (() => {
+    if (segmentCount === 0) {
+      return {
+        label: 'Skript erzeugen',
+        run: () => {
+          onJump('script');
+          jobs.generateScript();
+        },
+      };
+    }
+    if (!hasAudio) {
+      return {
+        label: 'Audio rendern',
+        run: () => {
+          onJump('audio');
+          jobs.generateAudio(false);
+        },
+      };
+    }
+    return { label: 'Herunterladen', run: jobs.downloadAudio };
+  })();
+
   return (
-    <div className="card" style={{ padding: '22px 24px' }}>
-      <SectionHeader
-        eyebrow="Overview"
-        title={podcast.topic || 'Untitled'}
-      />
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px', marginTop: '14px' }}>
-        <MetaChip label="Format" value={podcast.format} />
-        <MetaChip label="Duration" value={podcast.duration} />
-        <MetaChip label="Language" value={podcast.language || 'auto'} />
-        <MetaChip label="Disfluency" value={`${podcast.disfluency_level}/3`} />
-        <MetaChip label="Hosts" value={String(podcast.hosts.length)} />
-        {podcast.total_words > 0 && <MetaChip label="Words" value={String(podcast.total_words)} emphasis />}
+    <div className="card podcast-header">
+      <div className="podcast-header-row">
+        <div style={{ minWidth: 0, flex: 1 }}>
+          <h2 className="podcast-header-title">{podcast.topic || 'Ohne Titel'}</h2>
+          <div className="podcast-header-meta">
+            <StatusPill status={podcast.status} />
+            <span>{FORMAT_LABELS[podcast.format] || podcast.format}</span>
+            <span className="podcast-meta-dot">·</span>
+            <span>{DURATION_LABELS[podcast.duration] || podcast.duration}</span>
+            <span className="podcast-meta-dot">·</span>
+            <span>{LANGUAGE_LABELS[podcast.language] || podcast.language || 'auto'}</span>
+            <span className="podcast-meta-dot">·</span>
+            <span>{podcast.hosts.length} Stimmen</span>
+            {segmentCount > 0 && (
+              <>
+                <span className="podcast-meta-dot">·</span>
+                <span>
+                  {segmentCount} Segmente · {podcast.script?.total_words || 0} Wörter
+                </span>
+              </>
+            )}
+            {hasAudio && (
+              <>
+                <span className="podcast-meta-dot">·</span>
+                <span>{formatClock(podcast.audio_duration)}</span>
+              </>
+            )}
+          </div>
+        </div>
+        <div style={{ display: 'flex', gap: '8px', flexShrink: 0 }}>
+          {jobs.audioBusy && (
+            <button className="btn btn-ghost" onClick={jobs.cancelAudio} style={{ height: '38px' }}>
+              Abbrechen
+            </button>
+          )}
+          <motion.button
+            whileTap={{ scale: 0.97 }}
+            className="btn btn-primary"
+            onClick={primary.run}
+            disabled={busy || (jobs.hasDrafts && !hasAudio)}
+            style={{ height: '38px' }}
+          >
+            {busy ? (
+              <>
+                <svg
+                  style={{ width: 13, height: 13, animation: 'spin 0.9s linear infinite' }}
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2.5"
+                >
+                  <circle cx="12" cy="12" r="10" strokeDasharray="60" strokeDashoffset="20" strokeLinecap="round" opacity="0.8" />
+                </svg>
+                {progress ? progress.stage : 'Läuft'}
+              </>
+            ) : (
+              primary.label
+            )}
+          </motion.button>
+        </div>
       </div>
-      {podcast.error_message && (
+
+      <AnimatePresence>{busy && <JobProgress progress={progress} />}</AnimatePresence>
+
+      {podcast.error_message && !busy && (
         <div
           style={{
-            marginTop: '14px',
+            marginTop: '12px',
             padding: '10px 12px',
             borderRadius: '10px',
             background: 'var(--color-danger-dim)',
@@ -544,28 +826,91 @@ function ConfigCard({ podcast }: { podcast: Podcast }) {
   );
 }
 
+/** Der Fortschrittsbalken, den Skript- und Audiolauf sich teilen. */
+function JobProgress({ progress }: { progress: PodcastProgressEvent | null }) {
+  const percent = progress ? progressPercent(progress.progress) : 0;
+  return (
+    <motion.div
+      initial={{ opacity: 0, height: 0 }}
+      animate={{ opacity: 1, height: 'auto' }}
+      exit={{ opacity: 0, height: 0 }}
+      role="status"
+      style={{ marginTop: '14px', overflow: 'hidden' }}
+    >
+      <div
+        style={{
+          padding: '12px 14px',
+          borderRadius: '12px',
+          background: 'var(--color-accent-dim)',
+          border: '1px solid rgba(123,97,255,0.24)',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '10px',
+        }}
+      >
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '12.5px', gap: '10px' }}>
+          <span style={{ color: 'var(--color-text)' }}>{progress?.message || 'Wird vorbereitet…'}</span>
+          <span style={{ color: 'var(--color-accent-hover)', fontFamily: 'var(--font-mono)', fontSize: '11px', flexShrink: 0 }}>
+            {Math.round(percent)}%
+            {progress?.segment_position != null && <> · Seg. {progress.segment_position + 1}</>}
+          </span>
+        </div>
+        <div style={{ height: '3px', borderRadius: '999px', background: 'rgba(255,255,255,0.08)', overflow: 'hidden' }}>
+          <motion.div
+            animate={{ width: `${percent}%` }}
+            transition={{ duration: 0.25, ease: 'easeOut' }}
+            style={{
+              height: '100%',
+              background: 'linear-gradient(90deg, var(--color-accent), var(--color-aurora-2))',
+              boxShadow: '0 0 10px rgba(123,97,255,0.5)',
+            }}
+          />
+        </div>
+      </div>
+    </motion.div>
+  );
+}
+
+function formatClock(seconds: number): string {
+  if (!seconds || seconds < 0) return '0:00';
+  const m = Math.floor(seconds / 60);
+  const s = Math.round(seconds % 60);
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+
+
 /* ────────────────── Sources card ────────────────── */
 
-function SourcesCard({ podcast, onError }: { podcast: Podcast; onError: (msg: string) => void }) {
+function SourcesCard({
+  podcast,
+  onError,
+  onCount,
+}: {
+  podcast: Podcast;
+  onError: (msg: string) => void;
+  onCount?: (n: number) => void;
+}) {
   const [sources, setSources] = useState<PodcastSource[]>([]);
   const [loading, setLoading] = useState(true);
-  const [mode, setMode] = useState<'none' | 'file' | 'url' | 'text'>('none');
   const [url, setUrl] = useState('');
   const [urlTitle, setUrlTitle] = useState('');
-  const [textBody, setTextBody] = useState('');
+  const [textBody, setTextBody] = useDraftField(`podcast-source:${podcast.id}:text`, '');
+  const [mode, setMode] = useState<'none' | 'file' | 'url' | 'text'>(textBody ? 'text' : 'none');
   const [textTitle, setTextTitle] = useState('');
   const [busy, setBusy] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const loadSources = async () => {
-    setLoading(true);
+  const loadSources = async (quiet = false) => {
+    if (!quiet) setLoading(true);
     try {
       const s = await getPodcastSources(podcast.id);
       setSources(s);
+      onCount?.(s.length);
     } catch (e) {
-      onError(e instanceof Error ? e.message : 'Failed to load sources');
+      if (!quiet) onError(e instanceof Error ? e.message : 'Quellen konnten nicht geladen werden');
     } finally {
-      setLoading(false);
+      if (!quiet) setLoading(false);
     }
   };
 
@@ -574,6 +919,16 @@ function SourcesCard({ podcast, onError }: { podcast: Podcast; onError: (msg: st
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [podcast.id]);
 
+  // Verarbeitung laeuft im Hintergrund; ohne Nachfassen bliebe eine Quelle in
+  // der Oberflaeche auf "pending" stehen, bis der Nutzer die Seite neu laedt.
+  const pending = sources.some((s) => s.status === 'pending');
+  useEffect(() => {
+    if (!pending) return;
+    const timer = setInterval(() => loadSources(true), 2500);
+    return () => clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pending, podcast.id]);
+
   const handleFile = async (file: File) => {
     setBusy(true);
     try {
@@ -581,7 +936,7 @@ function SourcesCard({ podcast, onError }: { podcast: Podcast; onError: (msg: st
       await loadSources();
       setMode('none');
     } catch (e) {
-      onError(e instanceof Error ? e.message : 'Upload failed');
+      onError(e instanceof Error ? e.message : 'Upload fehlgeschlagen');
     } finally {
       setBusy(false);
     }
@@ -591,13 +946,15 @@ function SourcesCard({ podcast, onError }: { podcast: Podcast; onError: (msg: st
     if (!url.trim()) return;
     setBusy(true);
     try {
+      const parsed = new URL(url.trim());
+      if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('Bitte eine vollständige HTTP- oder HTTPS-Adresse eingeben.');
       await addUrlSource(podcast.id, url.trim(), urlTitle.trim() || undefined);
       await loadSources();
       setUrl('');
       setUrlTitle('');
       setMode('none');
     } catch (e) {
-      onError(e instanceof Error ? e.message : 'URL source failed');
+      onError(e instanceof Error ? e.message : 'URL-Quelle fehlgeschlagen');
     } finally {
       setBusy(false);
     }
@@ -613,31 +970,44 @@ function SourcesCard({ podcast, onError }: { podcast: Podcast; onError: (msg: st
       setTextTitle('');
       setMode('none');
     } catch (e) {
-      onError(e instanceof Error ? e.message : 'Text source failed');
+      onError(e instanceof Error ? e.message : 'Text-Quelle fehlgeschlagen');
     } finally {
       setBusy(false);
     }
   };
 
+  const handleReprocess = async (sourceId: string) => {
+    try {
+      const updated = await reprocessPodcastSource(podcast.id, sourceId);
+      setSources((prev) => prev.map((s) => (s.id === sourceId ? updated : s)));
+    } catch (e) {
+      onError(e instanceof Error ? e.message : 'Erneute Verarbeitung fehlgeschlagen');
+    }
+  };
+
   const handleDelete = async (sourceId: string) => {
-    if (!confirm('Delete this source?')) return;
+    if (!confirm('Diese Quelle löschen?')) return;
     try {
       await deletePodcastSource(podcast.id, sourceId);
-      setSources((prev) => prev.filter((s) => s.id !== sourceId));
+      setSources((prev) => {
+        const next = prev.filter((s) => s.id !== sourceId);
+        onCount?.(next.length);
+        return next;
+      });
     } catch (e) {
-      onError(e instanceof Error ? e.message : 'Delete failed');
+      onError(e instanceof Error ? e.message : 'Löschen fehlgeschlagen');
     }
   };
 
   return (
     <div className="card" style={{ padding: '22px 24px' }}>
       <SectionHeader
-        eyebrow="Sources"
-        title={`${sources.length} ${sources.length === 1 ? 'source' : 'sources'}`}
+        eyebrow="Quellen"
+        title={`${sources.length} ${sources.length === 1 ? 'Quelle' : 'Quellen'}`}
         trailing={
           <div style={{ display: 'flex', gap: '6px' }}>
             <ModeButton active={mode === 'file'} onClick={() => setMode(mode === 'file' ? 'none' : 'file')}>
-              File
+              Datei
             </ModeButton>
             <ModeButton active={mode === 'url'} onClick={() => setMode(mode === 'url' ? 'none' : 'url')}>
               URL
@@ -678,10 +1048,10 @@ function SourcesCard({ podcast, onError }: { podcast: Podcast; onError: (msg: st
               <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
                 <path d="M8 2v10M4 6l4-4 4 4M2 14h12" />
               </svg>
-              {busy ? 'Uploading…' : 'Choose file (PDF, DOCX, MD, TXT, HTML, EPUB…)'}
+              {busy ? 'Lädt hoch…' : 'Datei wählen (PDF, DOCX, MD, TXT, HTML, EPUB…)'}
             </button>
             <div style={{ fontSize: '11px', color: 'var(--color-text-faint)', marginTop: '6px' }}>
-              Max 50MB · parsed via Docling
+              Max 50 MB · wird per Docling geparst
             </div>
           </motion.div>
         )}
@@ -703,13 +1073,13 @@ function SourcesCard({ podcast, onError }: { podcast: Podcast; onError: (msg: st
             />
             <input
               type="text"
-              placeholder="Title (optional)"
+              placeholder="Titel (optional)"
               value={urlTitle}
               onChange={(e) => setUrlTitle(e.target.value)}
               className="input-field"
             />
             <button className="btn btn-primary" onClick={handleUrl} disabled={!url.trim() || busy}>
-              {busy ? 'Fetching…' : 'Add URL'}
+              {busy ? 'Lädt…' : 'URL hinzufügen'}
             </button>
           </motion.div>
         )}
@@ -724,13 +1094,13 @@ function SourcesCard({ podcast, onError }: { podcast: Podcast; onError: (msg: st
           >
             <input
               type="text"
-              placeholder="Title (optional)"
+              placeholder="Titel (optional)"
               value={textTitle}
               onChange={(e) => setTextTitle(e.target.value)}
               className="input-field"
             />
             <textarea
-              placeholder="Paste raw text content (10–100,000 characters)…"
+              placeholder="Text einfügen (10–100.000 Zeichen)…"
               value={textBody}
               onChange={(e) => setTextBody(e.target.value)}
               className="input-field"
@@ -738,10 +1108,10 @@ function SourcesCard({ podcast, onError }: { podcast: Podcast; onError: (msg: st
             />
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
               <span style={{ fontSize: '11px', color: 'var(--color-text-dim)', fontFamily: 'var(--font-mono)' }}>
-                {textBody.length.toLocaleString()} chars
+                {textBody.length.toLocaleString()} Zeichen
               </span>
               <button className="btn btn-primary" onClick={handleText} disabled={!textBody.trim() || busy}>
-                {busy ? 'Adding…' : 'Add text'}
+                {busy ? 'Fügt hinzu…' : 'Text hinzufügen'}
               </button>
             </div>
           </motion.div>
@@ -750,10 +1120,10 @@ function SourcesCard({ podcast, onError }: { podcast: Podcast; onError: (msg: st
 
       <div style={{ marginTop: sources.length > 0 || mode !== 'none' ? '14px' : '10px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
         {loading ? (
-          <div style={{ fontSize: '12px', color: 'var(--color-text-dim)', padding: '8px 0' }}>Loading…</div>
+          <div style={{ fontSize: '12px', color: 'var(--color-text-dim)', padding: '8px 0' }}>Lädt…</div>
         ) : sources.length === 0 ? (
           <div style={{ fontSize: '12.5px', color: 'var(--color-text-dim)', padding: '8px 0' }}>
-            Add at least one source to generate a script.
+            Mindestens eine Quelle hinzufügen, damit ein Skript entstehen kann.
           </div>
         ) : (
           sources.map((s) => (
@@ -780,7 +1150,7 @@ function SourcesCard({ podcast, onError }: { podcast: Podcast; onError: (msg: st
                     whiteSpace: 'nowrap',
                   }}
                 >
-                  {s.title || s.url || '(untitled)'}
+                  {s.title || s.url || '(ohne Titel)'}
                 </div>
                 <div
                   style={{
@@ -794,22 +1164,47 @@ function SourcesCard({ podcast, onError }: { podcast: Podcast; onError: (msg: st
                 >
                   <span>{s.type}</span>
                   <span style={{ opacity: 0.4 }}>·</span>
-                  <span style={{ color: statusColor(s.status) }}>{s.status}</span>
+                  <span style={{ color: statusColor(s.status) }}>{statusLabel(s.status)}</span>
                   {s.chunk_count > 0 && (
                     <>
                       <span style={{ opacity: 0.4 }}>·</span>
-                      <span>{s.chunk_count} chunks</span>
+                      <span>{s.chunk_count} Abschnitte</span>
                     </>
                   )}
                 </div>
+                {/* Der Fehler entsteht erst in der Hintergrundverarbeitung —
+                    ohne ihn hier steht nur "fehlgeschlagen" ohne Grund. */}
+                {s.status === 'failed' && s.error_message && (
+                  <div
+                    style={{
+                      fontSize: '11px',
+                      color: 'var(--color-danger)',
+                      marginTop: '4px',
+                      lineHeight: 1.45,
+                      wordBreak: 'break-word',
+                    }}
+                  >
+                    {s.error_message}
+                  </div>
+                )}
               </div>
+              {s.status === 'failed' && (
+                <button
+                  className="btn-ghost"
+                  onClick={() => handleReprocess(s.id)}
+                  style={{ padding: '4px 8px', fontSize: '11.5px', color: 'var(--color-text-dim)' }}
+                  title="Quelle erneut verarbeiten"
+                >
+                  Erneut
+                </button>
+              )}
               <button
                 className="btn-ghost"
                 onClick={() => handleDelete(s.id)}
                 style={{ padding: '4px 6px', color: 'var(--color-text-faint)' }}
                 onMouseEnter={(e) => (e.currentTarget.style.color = 'var(--color-danger)')}
                 onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--color-text-faint)')}
-                title="Delete"
+                title="Löschen"
               >
                 <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
                   <path d="M3 4h10M6 4V2h4v2M5 4l1 10h4l1-10" />
@@ -868,6 +1263,12 @@ function SourceIcon({ type }: { type: PodcastSource['type'] }) {
   );
 }
 
+function statusLabel(status: string) {
+  if (status === 'processed') return 'verarbeitet';
+  if (status === 'failed') return 'fehlgeschlagen';
+  return 'wird verarbeitet…';
+}
+
 function statusColor(status: string) {
   if (status === 'processed') return 'var(--color-success)';
   if (status === 'failed') return 'var(--color-danger)';
@@ -876,142 +1277,125 @@ function statusColor(status: string) {
 
 /* ────────────────── Script card ────────────────── */
 
+
 function ScriptCard({
   podcast,
+  jobs,
   onReload,
-  onReloadList,
   onError,
 }: {
   podcast: Podcast;
+  jobs: PodcastJobs;
   onReload: () => void;
-  onReloadList: () => void;
   onError: (msg: string) => void;
 }) {
-  const [generating, setGenerating] = useState(false);
-  const [progress, setProgress] = useState<PodcastProgressEvent | null>(null);
-  const segments = podcast.script?.segments || [];
+  const scriptSegments = podcast.script?.segments;
+  const segments = useMemo(() => scriptSegments || [], [scriptSegments]);
+  const [query, setQuery] = useState('');
+  const [speakerFilter, setSpeakerFilter] = useState<string>('');
+  const [expandedId, setExpandedId] = useState<string | null>(null);
 
-  const handleGenerate = async () => {
-    setGenerating(true);
-    setProgress(null);
-    try {
-      await generatePodcastScript(
-        podcast.id,
-        (p) => setProgress(p),
-        () => {
-          setGenerating(false);
-          setProgress(null);
-          onReload();
-          onReloadList();
-        },
-        (err) => {
-          setGenerating(false);
-          setProgress(null);
-          onError(err);
-          onReload();
-          onReloadList();
-        },
-      );
-    } catch (e) {
-      setGenerating(false);
-      setProgress(null);
-      onError(e instanceof Error ? e.message : 'Script generation failed');
-    }
-  };
+  const speakers = useMemo(() => {
+    const seen = new Set<string>();
+    for (const s of segments) if (s.speaker) seen.add(s.speaker);
+    return Array.from(seen).sort();
+  }, [segments]);
+
+  const visible = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return segments.filter((s) => {
+      if (speakerFilter && s.speaker !== speakerFilter) return false;
+      if (!q) return true;
+      return (s.text || '').toLowerCase().includes(q) || (s.prompt || '').toLowerCase().includes(q);
+    });
+  }, [segments, query, speakerFilter]);
+
+  if (segments.length === 0) {
+    return (
+      <div className="card" style={{ padding: '44px 28px', textAlign: 'center' }}>
+        <div style={{ fontSize: '15px', fontWeight: 500, color: 'var(--color-text)' }}>Noch kein Skript</div>
+        <div style={{ fontSize: '13px', color: 'var(--color-text-dim)', marginTop: '8px', lineHeight: 1.55 }}>
+          Lade zuerst Quellen hoch, dann schreibt das Sprachmodell daraus einen mehrstimmigen Dialog.
+        </div>
+        <button
+          className="btn btn-primary"
+          onClick={jobs.generateScript}
+          disabled={jobs.scriptBusy || jobs.audioBusy || jobs.hasDrafts}
+          style={{ marginTop: '18px' }}
+        >
+          Skript erzeugen
+        </button>
+      </div>
+    );
+  }
 
   return (
-    <div className="card" style={{ padding: '22px 24px' }}>
-      <SectionHeader
-        eyebrow="Script"
-        title={segments.length > 0 ? `${segments.length} segments · ${podcast.script?.total_words || 0} words` : 'No script yet'}
-        trailing={
-          <button
-            className="btn btn-primary"
-            onClick={handleGenerate}
-            disabled={generating}
-            style={{ height: '36px' }}
-          >
-            {generating ? (
-              <>
-                <svg style={{ width: 13, height: 13, animation: 'spin 0.9s linear infinite' }} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                  <circle cx="12" cy="12" r="10" strokeDasharray="60" strokeDashoffset="20" strokeLinecap="round" opacity="0.8" />
-                </svg>
-                {progress ? progress.stage : 'Generating'}
-              </>
-            ) : segments.length > 0 ? (
-              <>Regenerate</>
-            ) : (
-              <>
-                <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round">
-                  <path d="M2 8l5 5 7-10" />
-                </svg>
-                Generate script
-              </>
-            )}
-          </button>
-        }
-      />
-
-      <AnimatePresence>
-        {generating && progress && (
-          <motion.div
-            initial={{ opacity: 0, height: 0 }}
-            animate={{ opacity: 1, height: 'auto' }}
-            exit={{ opacity: 0, height: 0 }}
-            style={{ marginTop: '14px', overflow: 'hidden' }}
-          >
-            <div
-              style={{
-                padding: '12px 14px',
-                borderRadius: '12px',
-                background: 'var(--color-accent-dim)',
-                border: '1px solid rgba(123,97,255,0.24)',
-                display: 'flex',
-                flexDirection: 'column',
-                gap: '10px',
-              }}
-            >
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '12.5px' }}>
-                <span style={{ color: 'var(--color-text)' }}>{progress.message}</span>
-                <span style={{ color: 'var(--color-accent-hover)', fontFamily: 'var(--font-mono)', fontSize: '11px' }}>
-                  {Math.round(progressPercent(progress.progress))}%
-                </span>
-              </div>
-              <div style={{ height: '3px', borderRadius: '999px', background: 'rgba(255,255,255,0.08)', overflow: 'hidden' }}>
-                <motion.div
-                  animate={{ width: `${progressPercent(progress.progress)}%` }}
-                  transition={{ duration: 0.25, ease: 'easeOut' }}
-                  style={{
-                    height: '100%',
-                    background: 'linear-gradient(90deg, var(--color-accent), var(--color-aurora-2))',
-                    boxShadow: '0 0 10px rgba(123,97,255,0.5)',
-                  }}
-                />
-              </div>
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      {segments.length > 0 && (
-        <div style={{ marginTop: '16px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
-          {segments.map((seg) => (
-            <SegmentRow
-              key={seg.id}
-              podcastId={podcast.id}
-              segment={seg}
-              onReload={onReload}
-              onError={onError}
-            />
+    <div className="card" style={{ padding: '18px 20px' }}>
+      <div className="podcast-script-toolbar">
+        <input
+          type="text"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          aria-label="Skriptsuche"
+          placeholder="Im Skript suchen…"
+          className="input-field podcast-script-toolbar-search"
+        />
+        <select
+          aria-label="Sprecherfilter"
+          value={speakerFilter}
+          onChange={(e) => setSpeakerFilter(e.target.value)}
+          className="input-field"
+          style={{ ...selectStyle, width: 'auto' }}
+        >
+          <option value="">Alle Sprecher</option>
+          {speakers.map((s) => (
+            <option key={s} value={s}>
+              {s}
+            </option>
           ))}
+        </select>
+        <span className="podcast-script-count">
+          {visible.length}/{segments.length}
+        </span>
+        <button
+          className="btn btn-ghost"
+          onClick={jobs.generateScript}
+          disabled={jobs.scriptBusy || jobs.audioBusy || jobs.hasDrafts}
+          style={{ height: '32px', fontSize: '12px', flexShrink: 0 }}
+          title="Skript komplett neu schreiben lassen"
+        >
+          Neu erzeugen
+        </button>
+      </div>
+
+      <div style={{ marginTop: '14px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+        {visible.map((seg) => (
+          <SegmentRow
+            key={seg.id}
+            podcastId={podcast.id}
+            hosts={podcast.hosts}
+            disabled={jobs.audioBusy || jobs.scriptBusy}
+            segment={seg}
+            editing={expandedId === seg.id}
+            onEdit={(on) => setExpandedId(on ? seg.id : null)}
+            onReload={onReload}
+            onError={onError}
+          />
+        ))}
+        {visible.length === 0 && (
+          <div style={{ padding: '24px 6px', fontSize: '12.5px', color: 'var(--color-text-dim)', textAlign: 'center' }}>
+            Kein Segment passt zum Filter.
+          </div>
+        )}
+        {!query && !speakerFilter && (
           <AddTrackBar
             podcastId={podcast.id}
             position={segments.length}
             onReload={onReload}
             onError={onError}
           />
-        </div>
-      )}
+        )}
+      </div>
     </div>
   );
 }
@@ -1027,14 +1411,14 @@ function AddTrackBar({
   onReload: () => void;
   onError: (msg: string) => void;
 }) {
-  const [pickerOpen, setPickerOpen] = useState<'music' | 'sfx' | null>(null);
+  const [pickerOpen, setPickerOpen] = useState<'music' | null>(null);
   const [prompt, setPrompt] = useState('');
   const [duration, setDuration] = useState('30');
   const [busy, setBusy] = useState(false);
 
   const handleAdd = async () => {
     if (!pickerOpen || !prompt.trim()) return;
-    const durSec = parseFloat(duration) || (pickerOpen === 'music' ? 30 : 4);
+    const durSec = parseFloat(duration) || 30;
     setBusy(true);
     try {
       await addSegment(podcastId, {
@@ -1049,7 +1433,7 @@ function AddTrackBar({
       setDuration('30');
       onReload();
     } catch (e) {
-      onError(e instanceof Error ? e.message : 'Add failed');
+      onError(e instanceof Error ? e.message : 'Hinzufügen fehlgeschlagen');
     } finally {
       setBusy(false);
     }
@@ -1069,19 +1453,19 @@ function AddTrackBar({
         }}
       >
         <div style={{ fontSize: '11px', color: 'var(--color-text-faint)', textTransform: 'uppercase', letterSpacing: 0 }}>
-          {pickerOpen === 'music' ? 'Background music' : 'Sound effect'}
+          Hintergrundmusik
         </div>
         <textarea
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
           placeholder={pickerOpen === 'music'
-            ? 'e.g. ambient lo-fi piano, soft pad, contemplative'
-            : 'e.g. rain on window, thunder distant'}
+            ? 'z. B. ambient lo-fi piano, soft pad, contemplative'
+            : 'z. B. rain on window, thunder distant'}
           className="input-field"
           style={{ minHeight: '60px', padding: '10px 12px', fontSize: '13px', lineHeight: 1.55 }}
         />
         <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-          <label style={{ fontSize: '12px', color: 'var(--color-text-faint)' }}>Duration (s):</label>
+          <label style={{ fontSize: '12px', color: 'var(--color-text-faint)' }}>Dauer (s):</label>
           <input
             type="number"
             value={duration}
@@ -1093,14 +1477,14 @@ function AddTrackBar({
           />
           <div style={{ flex: 1 }} />
           <button className="btn btn-primary" onClick={handleAdd} disabled={busy || !prompt.trim()} style={{ padding: '6px 12px', fontSize: '12px', height: '32px' }}>
-            Add
+            Einfügen
           </button>
           <button
             className="btn-ghost"
             onClick={() => { setPickerOpen(null); setPrompt(''); }}
             style={{ padding: '6px 12px', fontSize: '12px' }}
           >
-            Cancel
+            Abbrechen
           </button>
         </div>
       </div>
@@ -1113,36 +1497,24 @@ function AddTrackBar({
         className="btn-ghost"
         onClick={() => setPickerOpen('music')}
         style={{ padding: '6px 14px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
-        title="Add a music track that plays under the dialogue"
+        title="Musikbett, das unter dem Dialog läuft"
       >
         <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
           <path d="M9 3v8.5" />
           <circle cx="7" cy="11.5" r="2" />
           <path d="M9 3l5 1v3l-5-1" />
         </svg>
-        Add music
-      </button>
-      <button
-        className="btn-ghost"
-        onClick={() => setPickerOpen('sfx')}
-        style={{ padding: '6px 14px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
-        title="Add a sound effect that overlays the dialogue"
-      >
-        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-          <path d="M2 6v4M5 4v8M8 5v6M11 3v10M14 6v4" />
-        </svg>
-        Add SFX
+        Musik
       </button>
     </div>
   );
 }
 
 const TYPE_STYLES: Record<string, { color: string; bg: string; border: string; label: string }> = {
-  speech:   { color: 'var(--color-text-faint)',  bg: 'rgba(255,255,255,0.04)',     border: 'rgba(255,255,255,0.06)',  label: 'speech' },
-  reaction: { color: 'var(--color-text-faint)',  bg: 'rgba(255,255,255,0.04)',     border: 'rgba(255,255,255,0.06)',  label: 'reaction' },
-  pause:    { color: 'var(--color-text-faint)',  bg: 'rgba(255,255,255,0.04)',     border: 'rgba(255,255,255,0.06)',  label: 'pause' },
-  music:    { color: '#a888ff',                  bg: 'rgba(123,97,255,0.10)',      border: 'rgba(123,97,255,0.30)',  label: 'music' },
-  sfx:      { color: '#ffb15a',                  bg: 'rgba(255,148,68,0.10)',      border: 'rgba(255,148,68,0.30)',  label: 'sfx' },
+  speech:   { color: 'var(--color-text-faint)',  bg: 'rgba(255,255,255,0.04)',     border: 'rgba(255,255,255,0.06)',  label: 'Sprache' },
+  reaction: { color: 'var(--color-text-faint)',  bg: 'rgba(255,255,255,0.04)',     border: 'rgba(255,255,255,0.06)',  label: 'Reaktion' },
+  pause:    { color: 'var(--color-text-faint)',  bg: 'rgba(255,255,255,0.04)',     border: 'rgba(255,255,255,0.06)',  label: 'Pause' },
+  music:    { color: '#a888ff',                  bg: 'rgba(123,97,255,0.10)',      border: 'rgba(123,97,255,0.30)',  label: 'Musik' },
 };
 
 function progressPercent(value: number): number {
@@ -1150,43 +1522,115 @@ function progressPercent(value: number): number {
   return Math.max(0, Math.min(100, normalized));
 }
 
+
+/** OmniVoice rendert diese Klammern als echten Laut, statt sie vorzulesen. */
+const TAG_PATTERN = /\[([A-Za-z][A-Za-z-]{1,23})\]/g;
+
+let tagCatalogPromise: Promise<SegmentTag[]> | null = null;
+
+function useSegmentTags(): SegmentTag[] {
+  const [tags, setTags] = useState<SegmentTag[]>([]);
+  useEffect(() => {
+    if (!tagCatalogPromise) tagCatalogPromise = getSegmentTags().catch(() => []);
+    let alive = true;
+    tagCatalogPromise.then((t) => alive && setTags(t));
+    return () => {
+      alive = false;
+    };
+  }, []);
+  return tags;
+}
+
+/** Text mit hervorgehobenen Tags — der Rest bleibt normaler Fließtext. */
+function renderTaggedText(text: string, known: Set<string>): React.ReactNode[] {
+  const out: React.ReactNode[] = [];
+  let last = 0;
+  let m: RegExpExecArray | null;
+  TAG_PATTERN.lastIndex = 0;
+  while ((m = TAG_PATTERN.exec(text)) !== null) {
+    if (!known.has(m[1])) continue;
+    if (m.index > last) out.push(text.slice(last, m.index));
+    out.push(
+      <span key={`${m.index}-${m[1]}`} className="podcast-tag-chip" title={m[1]}>
+        {m[1]}
+      </span>,
+    );
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) out.push(text.slice(last));
+  return out.length > 0 ? out : [text];
+}
+
 function SegmentRow({
   podcastId,
   segment,
+  hosts,
+  disabled,
+  editing,
+  onEdit,
   onReload,
   onError,
 }: {
   podcastId: string;
   segment: ScriptSegment;
+  hosts: Host[];
+  disabled: boolean;
+  editing: boolean;
+  onEdit: (on: boolean) => void;
   onReload: () => void;
   onError: (msg: string) => void;
 }) {
-  const [editing, setEditing] = useState(false);
-  const [text, setText] = useState(segment.text);
-  const [speaker, setSpeaker] = useState(segment.speaker);
-  const [prompt, setPrompt] = useState(segment.prompt || '');
-  const [duration, setDuration] = useState(
-    segment.duration_ms ? String(segment.duration_ms / 1000) : '',
-  );
-  const [overlap, setOverlap] = useState(
-    segment.overlap_ms ? String(segment.overlap_ms) : '',
-  );
-  const [volume, setVolume] = useState(
-    typeof segment.volume_db === 'number' && segment.volume_db !== 0
-      ? String(segment.volume_db)
-      : '',
-  );
+  const savedSpeaker = segment.speaker_id || hosts.find(h=>h.name === segment.speaker)?.id || '';
+  const draftKey = `podcast:${podcastId}:${segment.id}`;
+  const [text, setText, clearText] = useDraftField(`${draftKey}:text`, segment.text);
+  const [speaker, setSpeaker, clearSpeaker] = useDraftField(`${draftKey}:speaker`, savedSpeaker);
+  const [prompt, setPrompt, clearPrompt] = useDraftField(`${draftKey}:prompt`, segment.prompt || '');
+  const [duration, setDuration, clearDuration] = useDraftField(`${draftKey}:duration`, segment.duration_ms ? String(segment.duration_ms / 1000) : '');
+  const [overlap, setOverlap, clearOverlap] = useDraftField(`${draftKey}:overlap`, segment.overlap_ms ? String(segment.overlap_ms) : '');
+  const [volume, setVolume, clearVolume] = useDraftField(`${draftKey}:volume`, segment.volume_db ? String(segment.volume_db) : '');
+  const dirty = text !== segment.text || speaker !== savedSpeaker || prompt !== (segment.prompt || '') ||
+    duration !== (segment.duration_ms ? String(segment.duration_ms / 1000) : '') ||
+    overlap !== (segment.overlap_ms ? String(segment.overlap_ms) : '') || volume !== (segment.volume_db ? String(segment.volume_db) : '');
+  const clearDraft = () => { clearText(); clearSpeaker(); clearPrompt(); clearDuration(); clearOverlap(); clearVolume(); };
   const [busy, setBusy] = useState(false);
+  const textRef = useRef<HTMLTextAreaElement>(null);
 
-  const isMedia = segment.type === 'music' || segment.type === 'sfx';
+  const isMedia = segment.type === 'music';
   const styleSet = TYPE_STYLES[segment.type] || TYPE_STYLES.speech;
+  const tags = useSegmentTags();
+  const knownTags = useMemo(() => new Set(tags.map((t) => t.id)), [tags]);
+
+  const reset = clearDraft;
+
+  // Tag an der Cursorposition einsetzen, nicht stumpf hinten anhängen — die
+  // Wirkung hängt daran, wo im Satz der Laut fällt.
+  const insertTag = (tag: string) => {
+    const el = textRef.current;
+    const token = `[${tag}]`;
+    if (!el) {
+      setText((t) => (t ? `${t} ${token}` : token));
+      return;
+    }
+    const start = el.selectionStart ?? text.length;
+    const end = el.selectionEnd ?? start;
+    const before = text.slice(0, start);
+    const after = text.slice(end);
+    const spaced = `${before}${before && !/\s$/.test(before) ? ' ' : ''}${token}${after && !/^\s/.test(after) ? ' ' : ''}${after}`;
+    setText(spaced);
+    requestAnimationFrame(() => {
+      const pos = before.length + (before && !/\s$/.test(before) ? 1 : 0) + token.length;
+      el.focus();
+      el.setSelectionRange(pos, pos);
+    });
+  };
 
   const handleSave = async () => {
+    if (disabled || busy) return;
     setBusy(true);
     try {
       const payload: Parameters<typeof updateSegment>[2] = {
         text: text.trim(),
-        speaker: speaker.trim(),
+        ...(!isMedia ? { speaker_id:speaker, speaker:hosts.find(h=>h.id === speaker)?.name || segment.speaker } : {}),
       };
       if (isMedia) {
         payload.prompt = prompt.trim() || null;
@@ -1195,23 +1639,25 @@ function SegmentRow({
       }
       payload.overlap_ms = overlap ? parseInt(overlap, 10) || 0 : 0;
       await updateSegment(podcastId, segment.id, payload);
-      setEditing(false);
+      clearDraft();
+      onEdit(false);
       onReload();
     } catch (e) {
-      onError(e instanceof Error ? e.message : 'Save failed');
+      onError(e instanceof Error ? e.message : 'Speichern fehlgeschlagen');
     } finally {
       setBusy(false);
     }
   };
 
   const handleDelete = async () => {
-    if (!confirm('Delete this segment?')) return;
+    if (!confirm('Dieses Segment löschen?')) return;
     setBusy(true);
     try {
       await deleteSegment(podcastId, segment.id);
+      clearDraft();
       onReload();
     } catch (e) {
-      onError(e instanceof Error ? e.message : 'Delete failed');
+      onError(e instanceof Error ? e.message : 'Löschen fehlgeschlagen');
     } finally {
       setBusy(false);
     }
@@ -1219,54 +1665,32 @@ function SegmentRow({
 
   return (
     <div
+      className={`podcast-segment${editing ? ' podcast-segment-editing' : ''}`}
       style={{
-        padding: '14px 16px',
-        borderRadius: '12px',
-        background: isMedia ? styleSet.bg : 'rgba(255,255,255,0.02)',
-        border: `1px solid ${isMedia ? styleSet.border : 'rgba(255,255,255,0.06)'}`,
-        display: 'flex',
-        gap: '14px',
-        alignItems: 'flex-start',
+        background: isMedia ? styleSet.bg : undefined,
+        borderColor: isMedia ? styleSet.border : undefined,
       }}
     >
-      <div style={{ minWidth: '48px', flexShrink: 0 }}>
-        <div
-          style={{
-            fontFamily: 'var(--font-mono)',
-            fontSize: '10px',
-            color: 'var(--color-text-faint)',
-            letterSpacing: 0,
-            textTransform: 'uppercase',
-          }}
-        >
-          #{segment.position + 1}
-        </div>
-      </div>
-      <div style={{ flex: 1, minWidth: 0 }}>
+      <div className="podcast-segment-gutter">#{segment.position + 1}{dirty && <span className="draft-indicator" title="Ungespeicherter Entwurf">●</span>}</div>
+
+      <div className="podcast-segment-body">
+        {dirty && <div role="status" className="draft-status">Ungespeicherter Entwurf · zum Fortsetzen bearbeiten</div>}
         {editing ? (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
             {!isMedia && (
-              <input
-                type="text"
-                value={speaker}
-                onChange={(e) => setSpeaker(e.target.value)}
-                className="input-field"
-                style={{ padding: '8px 12px', fontSize: '12.5px' }}
-              />
+              <label>Sprecher dieser Episode<select aria-label="Sprecher" className="input-field" value={speaker} onChange={e=>setSpeaker(e.target.value)}><option value="">Sprecher zuordnen</option>{hosts.map(h=><option key={h.id} value={h.id}>{h.name}</option>)}</select></label>
             )}
             {isMedia ? (
               <>
                 <textarea
                   value={prompt}
                   onChange={(e) => setPrompt(e.target.value)}
-                  placeholder={segment.type === 'music'
-                    ? 'Music prompt (e.g. ambient lo-fi piano, contemplative)'
-                    : 'SFX prompt (e.g. distant thunder, rain on glass)'}
+                  placeholder="Musik-Prompt (z. B. ambient lo-fi piano, contemplative)"
                   className="input-field"
                   style={{ minHeight: '60px', padding: '10px 12px', fontSize: '13px', lineHeight: 1.55 }}
                 />
                 <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
-                  <label style={{ fontSize: '11px', color: 'var(--color-text-faint)' }}>Dur (s):</label>
+                  <label style={{ fontSize: '11px', color: 'var(--color-text-faint)' }}>Dauer (s):</label>
                   <input
                     type="number"
                     value={duration}
@@ -1276,7 +1700,7 @@ function SegmentRow({
                     className="input-field"
                     style={{ padding: '4px 8px', width: '70px', fontSize: '12px' }}
                   />
-                  <label style={{ fontSize: '11px', color: 'var(--color-text-faint)' }}>Vol (dB):</label>
+                  <label style={{ fontSize: '11px', color: 'var(--color-text-faint)' }}>Lautst. (dB):</label>
                   <input
                     type="number"
                     value={volume}
@@ -1287,7 +1711,7 @@ function SegmentRow({
                     className="input-field"
                     style={{ padding: '4px 8px', width: '70px', fontSize: '12px' }}
                   />
-                  <label style={{ fontSize: '11px', color: 'var(--color-text-faint)' }}>Offset (ms):</label>
+                  <label style={{ fontSize: '11px', color: 'var(--color-text-faint)' }}>Versatz (ms):</label>
                   <input
                     type="number"
                     value={overlap}
@@ -1301,13 +1725,33 @@ function SegmentRow({
             ) : (
               <>
                 <textarea
+                  aria-label="Gesprochener Text"
+                  ref={textRef}
                   value={text}
                   onChange={(e) => setText(e.target.value)}
                   className="input-field"
-                  style={{ minHeight: '80px', padding: '10px 12px', fontSize: '13px', lineHeight: 1.55 }}
+                  style={{ minHeight: '84px', padding: '10px 12px', fontSize: '13px', lineHeight: 1.55 }}
                 />
+                {tags.length > 0 && (
+                  <div className="podcast-tag-palette">
+                    <span className="podcast-tag-palette-label">Laute</span>
+                    {tags.map((t) => (
+                      <button
+                        key={t.id}
+                        type="button"
+                        className="podcast-tag-button"
+                        title={`${t.label} — ${t.hint}`}
+                        onClick={() => insertTag(t.id)}
+                      >
+                        {t.label}
+                      </button>
+                    ))}
+                  </div>
+                )}
                 <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                  <label style={{ fontSize: '11px', color: 'var(--color-text-faint)' }}>Offset (ms, &lt;0 to interrupt):</label>
+                  <label style={{ fontSize: '11px', color: 'var(--color-text-faint)' }}>
+                    Versatz (ms, &lt;0 = ins Wort fallen):
+                  </label>
                   <input
                     type="number"
                     value={overlap}
@@ -1320,39 +1764,26 @@ function SegmentRow({
               </>
             )}
             <div style={{ display: 'flex', gap: '6px' }}>
-              <button className="btn btn-primary" onClick={handleSave} disabled={busy} style={{ padding: '6px 12px', fontSize: '12px', height: '32px' }}>
-                Save
+              <button className="btn btn-primary" onClick={handleSave} disabled={busy || disabled} style={{ padding: '6px 12px', fontSize: '12px', height: '32px' }}>
+                Speichern
               </button>
               <button
                 className="btn-ghost"
                 onClick={() => {
-                  setEditing(false);
-                  setText(segment.text);
-                  setSpeaker(segment.speaker);
-                  setPrompt(segment.prompt || '');
-                  setDuration(segment.duration_ms ? String(segment.duration_ms / 1000) : '');
-                  setOverlap(segment.overlap_ms ? String(segment.overlap_ms) : '');
-                  setVolume(typeof segment.volume_db === 'number' && segment.volume_db !== 0 ? String(segment.volume_db) : '');
+                  onEdit(false);
+                  reset();
                 }}
                 style={{ padding: '6px 12px', fontSize: '12px' }}
               >
-                Cancel
+                Abbrechen
               </button>
             </div>
           </div>
         ) : (
           <>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '6px', flexWrap: 'wrap' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '5px', flexWrap: 'wrap' }}>
               {!isMedia && (
-                <span
-                  style={{
-                    fontSize: '11px',
-                    fontWeight: 600,
-                    color: 'var(--color-accent-hover)',
-                    textTransform: 'uppercase',
-                    letterSpacing: 0,
-                  }}
-                >
+                <span style={{ fontSize: '11px', fontWeight: 600, color: 'var(--color-accent-hover)', textTransform: 'uppercase' }}>
                   {segment.speaker}
                 </span>
               )}
@@ -1367,7 +1798,6 @@ function SegmentRow({
                     background: styleSet.bg,
                     border: `1px solid ${styleSet.border}`,
                     textTransform: 'uppercase',
-                    letterSpacing: 0,
                   }}
                 >
                   {styleSet.label}
@@ -1384,7 +1814,7 @@ function SegmentRow({
                     background: segment.overlap_ms < 0 ? 'rgba(255,90,101,0.10)' : 'rgba(122,223,255,0.10)',
                     border: `1px solid ${segment.overlap_ms < 0 ? 'rgba(255,90,101,0.25)' : 'rgba(122,223,255,0.25)'}`,
                   }}
-                  title={segment.overlap_ms < 0 ? 'Starts before previous segment ends' : 'Forced gap before this segment'}
+                  title={segment.overlap_ms < 0 ? 'Beginnt, bevor das vorige Segment endet' : 'Erzwungene Pause davor'}
                 >
                   {segment.overlap_ms > 0 ? `+${segment.overlap_ms}ms` : `${segment.overlap_ms}ms`}
                 </span>
@@ -1392,7 +1822,7 @@ function SegmentRow({
               <span style={{ fontSize: '10px', color: 'var(--color-text-faint)', fontFamily: 'var(--font-mono)', marginLeft: 'auto' }}>
                 {isMedia
                   ? `~${(segment.duration_ms ? segment.duration_ms / 1000 : segment.estimated_duration).toFixed(1)}s${typeof segment.volume_db === 'number' && segment.volume_db !== 0 ? ` · ${segment.volume_db}dB` : ''}`
-                  : `~${segment.estimated_duration.toFixed(1)}s · ${segment.word_count}w`}
+                  : `~${segment.estimated_duration.toFixed(1)}s · ${segment.word_count}W`}
               </span>
             </div>
             <p
@@ -1404,18 +1834,27 @@ function SegmentRow({
                 margin: 0,
               }}
             >
-              {isMedia ? (segment.prompt || segment.text || '(no prompt)') : segment.text}
+              {isMedia
+                ? segment.prompt || segment.text || '(kein Prompt)'
+                : renderTaggedText(segment.text, knownTags)}
             </p>
+            {segment.notes && (
+              <div className="podcast-segment-note" title="Regie-Notiz — steuert die Stimme nicht">
+                {segment.notes}
+              </div>
+            )}
           </>
         )}
       </div>
+
       {!editing && (
         <div style={{ display: 'flex', gap: '4px', flexShrink: 0 }}>
           <button
             className="btn-ghost"
-            onClick={() => setEditing(true)}
+            disabled={disabled}
+            onClick={() => onEdit(true)}
             style={{ padding: '4px 6px', color: 'var(--color-text-faint)' }}
-            title="Edit"
+            title="Bearbeiten"
           >
             <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
               <path d="M2 14l3-1L14 4.5a1.5 1.5 0 00-2-2L3 12l-1 2z" />
@@ -1424,11 +1863,11 @@ function SegmentRow({
           <button
             className="btn-ghost"
             onClick={handleDelete}
-            disabled={busy}
+            disabled={busy || disabled}
             style={{ padding: '4px 6px', color: 'var(--color-text-faint)' }}
             onMouseEnter={(e) => (e.currentTarget.style.color = 'var(--color-danger)')}
             onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--color-text-faint)')}
-            title="Delete"
+            title="Löschen"
           >
             <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
               <path d="M3 4h10M6 4V2h4v2M5 4l1 10h4l1-10" />
@@ -1442,214 +1881,99 @@ function SegmentRow({
 
 /* ────────────────── Audio card ────────────────── */
 
-function AudioCard({
-  podcast,
-  onReload,
-  onReloadList,
-  onError,
-}: {
-  podcast: Podcast;
-  onReload: () => void;
-  onReloadList: () => void;
-  onError: (msg: string) => void;
-}) {
-  const [generating, setGenerating] = useState(false);
-  const [progress, setProgress] = useState<PodcastProgressEvent | null>(null);
-  const hasAudio = podcast.status === 'ready' && !!podcast.audio_path;
-  const canGenerate = podcast.status === 'script_ready' || podcast.status === 'ready' || podcast.status === 'error' || podcast.status === 'cancelled';
-  const audioRef = useRef<HTMLAudioElement>(null);
-  const abortRef = useRef<AbortController | null>(null);
 
-  const handleGenerate = async (force = false) => {
-    const controller = new AbortController();
-    abortRef.current = controller;
-    setGenerating(true);
-    setProgress(null);
-    try {
-      await generatePodcastAudio(
-        podcast.id,
-        (p) => setProgress(p),
-        () => {
-          setGenerating(false);
-          setProgress(null);
-          onReload();
-          onReloadList();
-        },
-        (err) => {
-          setGenerating(false);
-          setProgress(null);
-          if (err !== 'cancelled') onError(err);
-          onReload();
-          onReloadList();
-        },
-        force,
-        controller.signal,
-      );
-    } catch (e) {
-      setGenerating(false);
-      setProgress(null);
-      onError(e instanceof Error ? e.message : 'Audio generation failed');
-    } finally {
-      if (abortRef.current === controller) abortRef.current = null;
-    }
-  };
+function AudioCard({ podcast, jobs }: { podcast: Podcast; jobs: PodcastJobs }) {
+  const hasAudio = !!podcast.audio_path;
+  const hasScript = (podcast.script?.segments?.length ?? 0) > 0;
 
-  const handleCancel = () => {
-    abortRef.current?.abort();
-    setGenerating(false);
-    setProgress(null);
-    onReload();
-    onReloadList();
-  };
-
-  const handleDownload = async () => {
-    try {
-      const blob = await downloadPodcastAudio(podcast.id);
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `${(podcast.topic || 'podcast').replace(/[^a-z0-9]+/gi, '-').toLowerCase()}.${podcast.audio_format || 'wav'}`;
-      a.click();
-      URL.revokeObjectURL(url);
-    } catch (e) {
-      onError(e instanceof Error ? e.message : 'Download failed');
-    }
-  };
+  if (!hasScript && !hasAudio) {
+    return (
+      <div className="card" style={{ padding: '44px 28px', textAlign: 'center' }}>
+        <div style={{ fontSize: '15px', fontWeight: 500, color: 'var(--color-text)' }}>Noch kein Audio</div>
+        <div style={{ fontSize: '13px', color: 'var(--color-text-dim)', marginTop: '8px' }}>
+          Erst das Skript, dann der Ton.
+        </div>
+      </div>
+    );
+  }
 
   return (
-    <div className="card" style={{ padding: '22px 24px' }}>
-      <SectionHeader
-        eyebrow="Audio"
-        title={
-          hasAudio
-            ? `${podcast.audio_duration.toFixed(1)}s · ${podcast.audio_format.toUpperCase()}`
-            : 'Not rendered yet'
-        }
-        trailing={
-          <div style={{ display: 'flex', gap: '6px' }}>
-            {hasAudio && !generating && (
-              <button className="btn btn-ghost" onClick={handleDownload} style={{ height: '36px', fontSize: '12.5px' }}>
-                <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
-                  <path d="M8 2v9M4 8l4 4 4-4M2 14h12" />
-                </svg>
-                Download
-              </button>
-            )}
-            {generating && (
-              <button className="btn btn-ghost" onClick={handleCancel} style={{ height: '36px', fontSize: '12.5px' }}>
-                Cancel
-              </button>
-            )}
-            <button
-              className="btn btn-primary"
-              onClick={() => handleGenerate(hasAudio)}
-              disabled={generating || !canGenerate}
-              style={{ height: '36px' }}
-            >
-              {generating ? (
-                <>
-                  <svg style={{ width: 13, height: 13, animation: 'spin 0.9s linear infinite' }} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                    <circle cx="12" cy="12" r="10" strokeDasharray="60" strokeDashoffset="20" strokeLinecap="round" opacity="0.8" />
-                  </svg>
-                  {progress ? progress.stage : 'Rendering'}
-                </>
-              ) : hasAudio ? (
-                <>Re-render</>
-              ) : (
-                <>
-                  <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor">
-                    <path d="M3 2v12l10-6z" />
-                  </svg>
-                  Render audio
-                </>
-              )}
-            </button>
+    <div className="card" style={{ padding: '20px 22px' }}>
+      <p className="hs-item-note">Geschätzte Sprechdauer: {formatClock(podcast.script?.estimated_duration || (podcast.script?.total_words || 0) / 150 * 60)} · tatsächliche Dauer hängt von Stimme, Pausen und Musik ab.</p>
+      {hasAudio && <p role="status" className={podcast.audio_stale ? 'draft-status':'hs-item-note'}>{podcast.audio_stale ? 'Audio ist veraltet: Text oder Besetzung wurden geändert.' : podcast.audio_revision ? 'Audio entspricht dem gespeicherten Skript und der Besetzung.' : 'Vorhandenes Audio: Der zugehörige Skriptstand ist noch nicht belegt.'}</p>}
+      {podcast.script_revision && <details><summary>Fassungsnachweis</summary><p className="hs-meta">Skript {podcast.script_revision.slice(0,12)} · Audio aus {podcast.audio_revision?.slice(0,12) || 'unbekanntem Stand'}</p></details>}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', flexWrap: 'wrap' }}>
+        <div>
+          <div className="label-eyebrow" style={{ fontSize: '10px' }}>Mischung</div>
+          <div style={{ fontSize: '14px', color: 'var(--color-text)', marginTop: '4px' }}>
+            {hasAudio
+              ? `${formatClock(podcast.audio_duration)} · ${podcast.audio_format.toUpperCase()} · ${(podcast.audio_size / 1048576).toFixed(1)} MB`
+              : 'Noch nicht gerendert'}
           </div>
-        }
-      />
-
-      <AnimatePresence>
-        {generating && progress && (
-          <motion.div
-            initial={{ opacity: 0, height: 0 }}
-            animate={{ opacity: 1, height: 'auto' }}
-            exit={{ opacity: 0, height: 0 }}
-            style={{ marginTop: '14px', overflow: 'hidden' }}
+        </div>
+        <div style={{ display: 'flex', gap: '6px' }}>
+          {hasAudio && !jobs.audioBusy && (
+            <button className="btn btn-ghost" onClick={jobs.downloadAudio} style={{ height: '34px', fontSize: '12.5px' }}>
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                <path d="M8 2v9M4 8l4 4 4-4M2 14h12" />
+              </svg>
+              Herunterladen
+            </button>
+          )}
+          {hasAudio && !jobs.audioBusy && (
+            <SingleOfflineButton kind="podcast" id={podcast.id} title={podcast.topic} url={getPodcastAudioStreamUrl(podcast.id, podcast.audio_sha256)}
+              extraJson={[`/api/podcasts/${podcast.id}`]} className="btn btn-ghost" />
+          )}
+          <button
+            className="btn btn-secondary"
+            onClick={() => jobs.generateAudio(hasAudio)}
+            disabled={jobs.audioBusy || jobs.scriptBusy || jobs.hasDrafts}
+            style={{ height: '34px', fontSize: '12.5px' }}
           >
-            <div
-              style={{
-                padding: '12px 14px',
-                borderRadius: '12px',
-                background: 'var(--color-accent-dim)',
-                border: '1px solid rgba(123,97,255,0.24)',
-                display: 'flex',
-                flexDirection: 'column',
-                gap: '10px',
-              }}
-            >
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '12.5px' }}>
-                <span style={{ color: 'var(--color-text)' }}>{progress.message}</span>
-                <span style={{ color: 'var(--color-accent-hover)', fontFamily: 'var(--font-mono)', fontSize: '11px' }}>
-                  {Math.round(progressPercent(progress.progress))}%
-                  {progress.segment_position != null && <> · seg {progress.segment_position + 1}</>}
-                </span>
-              </div>
-              <div style={{ height: '3px', borderRadius: '999px', background: 'rgba(255,255,255,0.08)', overflow: 'hidden' }}>
-                <motion.div
-                  animate={{ width: `${progressPercent(progress.progress)}%` }}
-                  transition={{ duration: 0.25, ease: 'easeOut' }}
-                  style={{
-                    height: '100%',
-                    background: 'linear-gradient(90deg, var(--color-accent), var(--color-aurora-2))',
-                    boxShadow: '0 0 10px rgba(123,97,255,0.5)',
-                  }}
-                />
-              </div>
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      {hasAudio && !generating && (
-        <div style={{ marginTop: '14px' }}>
-          <audio
-            ref={audioRef}
-            src={getPodcastAudioStreamUrl(podcast.id)}
-            controls
-            preload="metadata"
-            style={{ width: '100%', height: '40px' }}
-          />
+            {hasAudio ? 'Neu rendern' : 'Audio rendern'}
+          </button>
         </div>
-      )}
+      </div>
 
-      {!hasAudio && !generating && podcast.status !== 'script_ready' && podcast.status !== 'ready' && (
-        <div style={{ marginTop: '12px', fontSize: '12.5px', color: 'var(--color-text-dim)' }}>
-          Generate a script first, then render audio here.
-        </div>
-      )}
+      {hasAudio && <PlayEdition track={{ key:`podcast:${podcast.id}:${podcast.audio_sha256 || podcast.audio_path}`, title:podcast.topic, subtitle:'Podcast', url:getPodcastAudioStreamUrl(podcast.id, podcast.audio_sha256), href:'/podcast' }} />}
     </div>
   );
 }
 
 /* ────────────────── Hosts preview ────────────────── */
 
-function HostsPreview({ hosts, customVoices, allHosts }: { hosts: Host[]; customVoices: Voice[]; allHosts: Host[] }) {
+function EpisodeCast({podcast,allHosts,engineVoices,disabled,onReload,onError}:{podcast:Podcast;allHosts:Host[];engineVoices:Voice[];disabled:boolean;onReload:()=>void;onError:(message:string)=>void}) {
+  const [ids,setIds] = useState(podcast.hosts.map(h=>h.id));
+  const [busy,setBusy] = useState(false);
+  const available=[...allHosts,...podcast.hosts.filter(h=>!allHosts.some(a=>a.id===h.id))];
+  async function save() {
+    if (busy || disabled) return; setBusy(true);
+    try { await updatePodcastCast(podcast.id,ids); onReload(); } catch(e){onError((e as Error).message);} finally{setBusy(false);}
+  }
+  return <section className="card studio-section"><h2>Besetzung dieser Episode</h2><p>Hier speicherst du eine eigene Momentaufnahme der ausgewählten Sprecher. Änderungen an der globalen Vorlage werden erst mit erneutem Speichern übernommen.</p>
+    <fieldset className="studio-field"><legend>Sprecher auswählen</legend>{available.map(h=><label key={h.id} className="cast-choice"><input type="checkbox" checked={ids.includes(h.id)} disabled={disabled || busy || !h.voice_id} onChange={e=>setIds(prev=>e.target.checked?[...prev,h.id]:prev.filter(id=>id!==h.id))} />{h.name} · {engineVoices.find(v=>v.id === h.voice_id)?.name || 'Stimme nicht verfügbar'}</label>)}</fieldset>
+    <button className="btn btn-primary" disabled={disabled || busy || !ids.length} onClick={()=>void save()}>{busy?'Wird gespeichert…':'Episodenbesetzung speichern'}</button>
+    <p className="hs-item-note">Vor dem Entfernen eines Sprechers dessen Skriptsegmente neu zuordnen.</p><HostsPreview hosts={podcast.hosts} engineVoices={engineVoices} allHosts={allHosts} />
+  </section>;
+}
+
+function HostsPreview({ hosts, engineVoices, allHosts }: { hosts: Host[]; engineVoices: Voice[]; allHosts: Host[] }) {
   if (hosts.length === 0) {
     return (
       <div className="card-subtle" style={{ padding: '14px 18px', fontSize: '12.5px', color: 'var(--color-text-dim)' }}>
-        No hosts assigned. Manage hosts to add cast.
+        Diesem Podcast ist niemand zugewiesen — oben über „Sprecher“ die Besetzung verwalten.
       </div>
     );
   }
   const voiceName = (id: string | null) => {
-    if (!id) return 'no voice';
-    const v = customVoices.find((x) => x.id === id);
-    return v ? v.name : 'unknown';
+    if (!id) return 'keine Stimme';
+    const v = engineVoices.find((x) => x.id === id);
+    return v ? v.name : 'unbekannt';
   };
   void allHosts;
   return (
     <div className="card" style={{ padding: '18px 22px' }}>
-      <SectionHeader eyebrow="Cast" title={`${hosts.length} ${hosts.length === 1 ? 'host' : 'hosts'}`} />
+      <SectionHeader eyebrow="Besetzung" title={`${hosts.length} Sprecher`} />
       <div style={{ marginTop: '12px', display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: '10px' }}>
         {hosts.map((h) => (
           <div
@@ -1682,42 +2006,50 @@ function CreatePodcastModal({
 }: {
   hosts: Host[];
   languages: string[];
-  onCreate: (data: Parameters<typeof createPodcast>[0]) => void;
+  onCreate: (data: Parameters<typeof createPodcast>[0] & { source_text?: string }) => Promise<void>;
   onClose: () => void;
 }) {
   const [topic, setTopic] = useState('');
+  const [sourceText, setSourceText] = useState('');
   const [format, setFormat] = useState<PodcastFormat>('dialog');
   const [duration, setDuration] = useState<PodcastDuration>('medium');
   const [language, setLanguage] = useState('German');
   const [disfluency, setDisfluency] = useState(1);
   const [hostIds, setHostIds] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
+  const [submitError,setSubmitError] = useState('');
+  const castValid = format === 'dialog' ? hostIds.length >= 2 : format === 'monolog' ? hostIds.length === 1 : hostIds.length > 0;
 
-  const canSubmit = topic.trim().length > 0 && hostIds.length > 0 && !busy;
+  const canSubmit = topic.trim().length > 0 && castValid && !busy;
 
   const handleSubmit = async () => {
     if (!canSubmit) return;
     setBusy(true);
-    await onCreate({
+    setSubmitError('');
+    try { await onCreate({
       topic: topic.trim(),
+      source_text:sourceText,
       format,
       duration,
       language,
       disfluency_level: disfluency,
       host_ids: hostIds,
-    });
-    setBusy(false);
+    }); } catch(e) { setSubmitError((e as Error).message); } finally { setBusy(false); }
   };
 
   return (
-    <Modal title="New podcast" onClose={onClose}>
+    <Modal title="Neuer Podcast" onClose={onClose}>
+      {submitError && <p role="alert" className="hs-error">{submitError}</p>}
+      {!castValid && <p className="hs-item-note">{format === 'dialog' ? 'Für einen Dialog mindestens zwei Sprecher auswählen.' : 'Für einen Monolog genau einen Sprecher auswählen.'}</p>}
       <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
-        <LabeledField label="Topic">
+        <LabeledField label="Erste Textquelle (optional)"><textarea className="input-field" rows={4} value={sourceText} onChange={e=>setSourceText(e.target.value)} placeholder="Quelltext hier einfügen" /></LabeledField>
+        <p className="hs-item-note">Dateien und Webadressen kannst du anschließend im Reiter Quellen hinzufügen. Die Erstellung startet noch keine Produktion.</p>
+        <LabeledField label="Thema">
           <input
             type="text"
             value={topic}
             onChange={(e) => setTopic(e.target.value)}
-            placeholder="e.g. The future of synthetic voices"
+            placeholder="z. B. Die Zukunft synthetischer Stimmen"
             className="input-field"
             autoFocus
           />
@@ -1726,23 +2058,23 @@ function CreatePodcastModal({
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
           <LabeledField label="Format">
             <select value={format} onChange={(e) => setFormat(e.target.value as PodcastFormat)} className="input-field" style={selectStyle}>
-              <option value="dialog">Dialog (2+ hosts)</option>
-              <option value="monolog">Monolog (single)</option>
-              <option value="custom">Custom</option>
+              <option value="dialog">Dialog (2+ Sprecher)</option>
+              <option value="monolog">Monolog (einer)</option>
+              <option value="custom">Frei</option>
             </select>
           </LabeledField>
 
-          <LabeledField label="Duration">
+          <LabeledField label="Länge">
             <select value={duration} onChange={(e) => setDuration(e.target.value as PodcastDuration)} className="input-field" style={selectStyle}>
-              <option value="short">Short (~3 min)</option>
-              <option value="medium">Medium (~7 min)</option>
-              <option value="long">Long (~15 min)</option>
+              <option value="short">Kurz (~3 Min)</option>
+              <option value="medium">Mittel (~7 Min)</option>
+              <option value="long">Lang (~15 Min)</option>
             </select>
           </LabeledField>
         </div>
 
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
-          <LabeledField label="Language">
+          <LabeledField label="Sprache">
             <select value={language} onChange={(e) => setLanguage(e.target.value)} className="input-field" style={selectStyle}>
               {languages.map((l) => (
                 <option key={l} value={l}>{l}</option>
@@ -1750,7 +2082,7 @@ function CreatePodcastModal({
             </select>
           </LabeledField>
 
-          <LabeledField label={`Disfluency ${disfluency}/3`}>
+          <LabeledField label={`Sprechfluss-Störer ${disfluency}/3`}>
             <input
               type="range"
               min={0}
@@ -1763,7 +2095,7 @@ function CreatePodcastModal({
           </LabeledField>
         </div>
 
-        <LabeledField label={`Hosts (${hostIds.length} selected)`}>
+        <LabeledField label={`Besetzung (${hostIds.length} ausgewählt)`}>
           {hosts.length === 0 ? (
             <div
               style={{
@@ -1775,15 +2107,22 @@ function CreatePodcastModal({
                 color: 'var(--color-text-secondary)',
               }}
             >
-              No hosts yet. Use <strong style={{ color: 'var(--color-text)' }}>Manage hosts</strong> first.
+              Noch keine Sprecher. Im{' '}
+              <Link to="/podcast/hosts" style={{ color: 'var(--color-accent)' }}>Host-Hub</Link>{' '}
+              eine der 40 Persönlichkeiten übernehmen.
             </div>
           ) : (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', maxHeight: '220px', overflowY: 'auto' }}>
               {hosts.map((h) => {
                 const selected = hostIds.includes(h.id);
+                // Eine gesetzte voice_id heißt nicht, dass die Engine sie noch
+                // kennt. Solche Sprecher lassen `POST /podcasts` mit 400
+                // scheitern — also hier gar nicht erst auswählbar.
+                const unusable = !h.voice_id || h.voice_available === false;
                 return (
                   <label
                     key={h.id}
+                    title={unusable ? 'Diesem Sprecher fehlt eine gültige Stimme — im Host-Hub zuweisen.' : undefined}
                     style={{
                       display: 'flex',
                       alignItems: 'center',
@@ -1792,13 +2131,15 @@ function CreatePodcastModal({
                       borderRadius: '10px',
                       border: `1px solid ${selected ? 'rgba(123,97,255,0.32)' : 'rgba(255,255,255,0.08)'}`,
                       background: selected ? 'var(--color-accent-dim)' : 'rgba(255,255,255,0.02)',
-                      cursor: 'pointer',
+                      cursor: unusable ? 'not-allowed' : 'pointer',
+                      opacity: unusable ? 0.55 : 1,
                       transition: 'all 0.15s ease',
                     }}
                   >
                     <input
                       type="checkbox"
                       checked={selected}
+                      disabled={unusable}
                       onChange={() => {
                         setHostIds((prev) => (selected ? prev.filter((id) => id !== h.id) : [...prev, h.id]));
                       }}
@@ -1806,8 +2147,19 @@ function CreatePodcastModal({
                     />
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ fontSize: '13px', color: 'var(--color-text)' }}>{h.name}</div>
-                      <div style={{ fontSize: '11px', color: 'var(--color-text-dim)', fontFamily: 'var(--font-mono)' }}>
-                        {h.role} {h.voice_id ? '· voice set' : '· no voice'}
+                      <div
+                        style={{
+                          fontSize: '11px',
+                          color: unusable ? 'var(--color-warning)' : 'var(--color-text-dim)',
+                          fontFamily: 'var(--font-mono)',
+                        }}
+                      >
+                        {h.role}{' '}
+                        {!h.voice_id
+                          ? '· keine Stimme'
+                          : h.voice_available === false
+                            ? '· Stimme fehlt'
+                            : `· ${h.voice_id}`}
                       </div>
                     </div>
                   </label>
@@ -1818,9 +2170,9 @@ function CreatePodcastModal({
         </LabeledField>
 
         <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end', marginTop: '4px' }}>
-          <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+          <button className="btn btn-ghost" onClick={onClose}>Abbrechen</button>
           <button className="btn btn-primary" onClick={handleSubmit} disabled={!canSubmit}>
-            {busy ? 'Creating…' : 'Create'}
+            {busy ? 'Legt an…' : 'Anlegen'}
           </button>
         </div>
       </div>
@@ -1830,307 +2182,11 @@ function CreatePodcastModal({
 
 /* ────────────────── Host manager modal ────────────────── */
 
-function HostManagerModal({
-  hosts,
-  customVoices,
-  onClose,
-  onError,
-}: {
-  hosts: Host[];
-  customVoices: Voice[];
-  onClose: () => void;
-  onError: (msg: string) => void;
-}) {
-  const [localHosts, setLocalHosts] = useState<Host[]>(hosts);
-  const [creating, setCreating] = useState(false);
-  const [name, setName] = useState('');
-  const [personality, setPersonality] = useState('');
-  const [speakingStyle, setSpeakingStyle] = useState('');
-  const [voiceId, setVoiceId] = useState('');
-  const [role, setRole] = useState<HostRole>('host');
-  const [busy, setBusy] = useState(false);
-
-  const reset = () => {
-    setName('');
-    setPersonality('');
-    setSpeakingStyle('');
-    setVoiceId('');
-    setRole('host');
-    setCreating(false);
-  };
-
-  const handleCreate = async () => {
-    if (!name.trim() || !voiceId) return;
-    setBusy(true);
-    try {
-      const h = await createHost({
-        name: name.trim(),
-        personality: personality.trim() || undefined,
-        speaking_style: speakingStyle.trim() || undefined,
-        voice_id: voiceId,
-        role,
-      });
-      setLocalHosts((prev) => [...prev, h]);
-      reset();
-    } catch (e) {
-      onError(e instanceof Error ? e.message : 'Create host failed');
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const handleDelete = async (id: string) => {
-    if (!confirm('Delete this host?')) return;
-    try {
-      await deleteHost(id);
-      setLocalHosts((prev) => prev.filter((h) => h.id !== id));
-    } catch (e) {
-      onError(e instanceof Error ? e.message : 'Delete failed');
-    }
-  };
-
-  return (
-    <Modal title="Manage hosts" onClose={onClose} wide>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-        <div style={{ fontSize: '12.5px', color: 'var(--color-text-dim)', lineHeight: 1.5 }}>
-          Hosts are podcast personas. Each host must use one of your custom voices.
-        </div>
-
-        {/* Host list */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxHeight: '280px', overflowY: 'auto' }}>
-          {localHosts.length === 0 ? (
-            <div style={{ padding: '16px', fontSize: '12.5px', color: 'var(--color-text-dim)', textAlign: 'center' }}>
-              No hosts yet.
-            </div>
-          ) : (
-            localHosts.map((h) => {
-              const v = customVoices.find((x) => x.id === h.voice_id);
-              return (
-                <div
-                  key={h.id}
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: '12px',
-                    padding: '12px 14px',
-                    borderRadius: '10px',
-                    background: 'rgba(255,255,255,0.02)',
-                    border: '1px solid rgba(255,255,255,0.06)',
-                  }}
-                >
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontSize: '13.5px', color: 'var(--color-text)', display: 'flex', alignItems: 'center', gap: '8px' }}>
-                      {h.name}
-                      <span
-                        style={{
-                          fontSize: '9.5px',
-                          textTransform: 'uppercase',
-                          letterSpacing: 0,
-                          color: 'var(--color-accent-hover)',
-                          background: 'var(--color-accent-dim)',
-                          padding: '1px 6px',
-                          borderRadius: '4px',
-                        }}
-                      >
-                        {h.role}
-                      </span>
-                    </div>
-                    <div style={{ fontSize: '11px', color: 'var(--color-text-dim)', fontFamily: 'var(--font-mono)', marginTop: '3px' }}>
-                      Voice: {v ? v.name : '—'}
-                    </div>
-                    {h.personality && (
-                      <div style={{ fontSize: '12px', color: 'var(--color-text-secondary)', marginTop: '6px', lineHeight: 1.45 }}>
-                        {h.personality}
-                      </div>
-                    )}
-                  </div>
-                  <button
-                    className="btn-ghost"
-                    onClick={() => handleDelete(h.id)}
-                    style={{ padding: '4px 6px', color: 'var(--color-text-faint)' }}
-                    onMouseEnter={(e) => (e.currentTarget.style.color = 'var(--color-danger)')}
-                    onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--color-text-faint)')}
-                  >
-                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
-                      <path d="M3 4h10M6 4V2h4v2M5 4l1 10h4l1-10" />
-                    </svg>
-                  </button>
-                </div>
-              );
-            })
-          )}
-        </div>
-
-        {/* Create form */}
-        {creating ? (
-          <div
-            style={{
-              padding: '16px',
-              borderRadius: '12px',
-              background: 'rgba(255,255,255,0.02)',
-              border: '1px solid rgba(255,255,255,0.06)',
-              display: 'flex',
-              flexDirection: 'column',
-              gap: '10px',
-            }}
-          >
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
-              <LabeledField label="Name">
-                <input type="text" value={name} onChange={(e) => setName(e.target.value)} className="input-field" placeholder="e.g. Alex" />
-              </LabeledField>
-              <LabeledField label="Role">
-                <select value={role} onChange={(e) => setRole(e.target.value as HostRole)} className="input-field" style={selectStyle}>
-                  <option value="host">Host</option>
-                  <option value="expert">Expert</option>
-                </select>
-              </LabeledField>
-            </div>
-            <LabeledField label="Custom voice (required)">
-              {customVoices.length === 0 ? (
-                <div
-                  style={{
-                    padding: '12px',
-                    fontSize: '12.5px',
-                    borderRadius: '10px',
-                    background: 'var(--color-danger-dim)',
-                    border: '1px solid rgba(255,90,101,0.28)',
-                    color: 'var(--color-danger)',
-                  }}
-                >
-                  No custom voices available. Create one via <strong>Custom</strong> first.
-                </div>
-              ) : (
-                <select value={voiceId} onChange={(e) => setVoiceId(e.target.value)} className="input-field" style={selectStyle}>
-                  <option value="">Select a custom voice…</option>
-                  {customVoices.map((v) => (
-                    <option key={v.id} value={v.id}>{v.name}</option>
-                  ))}
-                </select>
-              )}
-            </LabeledField>
-            <LabeledField label="Personality (optional)">
-              <textarea
-                value={personality}
-                onChange={(e) => setPersonality(e.target.value)}
-                className="input-field"
-                placeholder="e.g. Curious, skeptical, asks probing questions"
-                style={{ minHeight: '64px', resize: 'vertical' }}
-              />
-            </LabeledField>
-            <LabeledField label="Speaking style (optional)">
-              <input
-                type="text"
-                value={speakingStyle}
-                onChange={(e) => setSpeakingStyle(e.target.value)}
-                className="input-field"
-                placeholder="e.g. Warm, conversational, occasional humor"
-              />
-            </LabeledField>
-            <div style={{ display: 'flex', gap: '6px', justifyContent: 'flex-end' }}>
-              <button className="btn btn-ghost" onClick={reset}>Cancel</button>
-              <button className="btn btn-primary" onClick={handleCreate} disabled={!name.trim() || !voiceId || busy}>
-                {busy ? 'Adding…' : 'Add host'}
-              </button>
-            </div>
-          </div>
-        ) : (
-          <button className="btn btn-secondary" onClick={() => setCreating(true)} style={{ alignSelf: 'flex-start' }}>
-            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round">
-              <path d="M8 3v10M3 8h10" />
-            </svg>
-            New host
-          </button>
-        )}
-
-        <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '4px' }}>
-          <button className="btn btn-primary" onClick={onClose}>Done</button>
-        </div>
-      </div>
-    </Modal>
-  );
-}
-
 /* ────────────────── Shared primitives ────────────────── */
 
-function Modal({
-  title,
-  children,
-  onClose,
-  wide,
-}: {
-  title: string;
-  children: React.ReactNode;
-  onClose: () => void;
-  wide?: boolean;
-}) {
-  useEffect(() => {
-    const h = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', h);
-    return () => window.removeEventListener('keydown', h);
-  }, [onClose]);
-
-  return (
-    <motion.div
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-      exit={{ opacity: 0 }}
-      style={{
-        position: 'fixed',
-        inset: 0,
-        background: 'rgba(10, 10, 15, 0.72)',
-        backdropFilter: 'blur(8px)',
-        WebkitBackdropFilter: 'blur(8px)',
-        zIndex: 100,
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        padding: '32px',
-      }}
-      onClick={onClose}
-    >
-      <motion.div
-        initial={{ opacity: 0, scale: 0.96, y: 12 }}
-        animate={{ opacity: 1, scale: 1, y: 0 }}
-        exit={{ opacity: 0, scale: 0.98 }}
-        transition={{ duration: 0.2, ease: [0.25, 0.46, 0.45, 0.94] }}
-        onClick={(e) => e.stopPropagation()}
-        className="glass-strong"
-        style={{
-          width: '100%',
-          maxWidth: wide ? '640px' : '480px',
-          maxHeight: '88vh',
-          overflowY: 'auto',
-          borderRadius: 'var(--radius-panel)',
-          padding: '22px 24px',
-        }}
-      >
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '18px' }}>
-          <h2 style={{ fontSize: '18px', color: 'var(--color-text)' }}>{title}</h2>
-          <button
-            className="btn-ghost"
-            onClick={onClose}
-            style={{ padding: '4px 8px', color: 'var(--color-text-dim)' }}
-          >
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round">
-              <path d="M3 3l10 10M13 3L3 13" />
-            </svg>
-          </button>
-        </div>
-        {children}
-      </motion.div>
-    </motion.div>
-  );
-}
-
 function LabeledField({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-      <span className="label-eyebrow" style={{ fontSize: '10px' }}>{label}</span>
-      {children}
-    </div>
-  );
+  if (isValidElement(children) && typeof children.type === 'string' && ['input','textarea','select'].includes(children.type)) return <label className="studio-field"><span>{label}</span>{children}</label>;
+  return <fieldset className="studio-field"><legend>{label}</legend>{children}</fieldset>;
 }
 
 function SectionHeader({
@@ -2161,43 +2217,6 @@ function SectionHeader({
         </div>
       </div>
       {trailing}
-    </div>
-  );
-}
-
-function MetaChip({ label, value, emphasis }: { label: string; value: string; emphasis?: boolean }) {
-  return (
-    <div
-      style={{
-        display: 'inline-flex',
-        alignItems: 'center',
-        gap: '8px',
-        padding: '5px 11px',
-        borderRadius: '999px',
-        background: emphasis ? 'var(--color-accent-dim)' : 'rgba(255,255,255,0.04)',
-        border: `1px solid ${emphasis ? 'rgba(123,97,255,0.28)' : 'rgba(255,255,255,0.06)'}`,
-        fontSize: '11px',
-      }}
-    >
-      <span
-        style={{
-          color: emphasis ? 'var(--color-accent-hover)' : 'var(--color-text-dim)',
-          textTransform: 'uppercase',
-          letterSpacing: 0,
-          fontWeight: 500,
-        }}
-      >
-        {label}
-      </span>
-      <span
-        style={{
-          fontFamily: 'var(--font-mono)',
-          color: emphasis ? 'var(--color-text)' : 'var(--color-text-secondary)',
-          fontVariantNumeric: 'tabular-nums',
-        }}
-      >
-        {value}
-      </span>
     </div>
   );
 }

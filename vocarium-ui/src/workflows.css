@@ -1,0 +1,92 @@
+/* Stable global modes, separate local workflows; reuse the installed fonts. */
+:root { --workspace-selected: #243f90; }
+.workspace-brand {display:flex;gap:12px;align-items:center;padding:26px 20px 22px;color:var(--color-text);text-decoration:none;font-size:20px;font-weight:650;}
+.workspace-brand small,.workspace-account small {display:block;font-size:12px;font-weight:400;color:var(--color-text-secondary);margin-top:3px;}
+.workspace-brand-mark {display:grid;place-items:center;background:#1856ff;border-radius:12px;width:40px;height:40px;color:white;font-size:23px;}
+.workflow-sidebar {background:rgba(17,20,31,.96);}
+.mode-list {display:grid;gap:6px;padding:0 12px;}
+.mode-link {display:flex;align-items:center;gap:12px;min-height:58px;padding:12px;color:#c8cedb;border:1px solid transparent;border-radius:12px;text-decoration:none;}
+.mode-link>svg {flex-shrink:0;}
+.mode-link strong {font-size:14px;font-weight:650;display:block;}
+.mode-link small {font-size:11px;line-height:1.4;display:block;margin-top:3px;color:#b8c2d9;}
+.mode-link.is-active {color:#fff;background:var(--workspace-selected);border-color:#6687e9;}
+.mode-link:hover {background:#263047;color:#fff;}
+.mode-link.is-active:hover {background:#294ba7;}
+.mode-link:focus-visible,.workflow-tabs a:focus-visible,.workspace-sidebar-tools a:focus-visible {outline:3px solid #99b9ff;outline-offset:2px;}
+.workspace-tools-label {padding:26px 24px 10px;font-size:12px;font-weight:650;color:#b7c5e3;}
+.workspace-sidebar-tools {display:grid;gap:4px;padding:0 12px;overflow-y:auto;}
+.workspace-sidebar-tools a {display:flex;gap:12px;align-items:center;min-height:44px;padding:8px 12px;text-decoration:none;color:#c8cedb;border-radius:8px;font-size:13px;}
+.workspace-sidebar-tools a[aria-current],.workspace-sidebar-tools a:hover {background:#252d40;color:white;}
+.workspace-account {display:flex;gap:10px;align-items:center;margin-top:auto;padding:20px 16px;font-size:13px;border-top:1px solid #30384a;}
+.workspace-account>a {margin-left:auto;text-decoration:none;color:#ced6e8;min-height:44px;min-width:32px;display:grid;place-items:center;font-size:22px;}
+.workspace-avatar {display:grid;place-items:center;background:#333d55;border-radius:50%;width:32px;height:32px;flex-shrink:0;}
+.workflow-bar {flex-shrink:0;background:rgba(17,20,31,.93);border-bottom:1px solid #30384a;z-index:35;padding:16px 28px 0;backdrop-filter:blur(12px);}
+.workflow-identity {display:flex;align-items:center;gap:10px;min-width:0;padding-bottom:14px;}
+.workflow-identity>a {color:#f1f5ff;text-decoration:none;font-size:16px;font-weight:650;}
+.workflow-identity>span {font-size:12px;color:#bbc5d9;margin-left:8px;}
+.workflow-identity>.workflow-home {margin-left:auto;font-size:12px;font-weight:500;min-height:36px;display:flex;align-items:center;}
+.workflow-tabs {display:flex;gap:6px;overflow-x:auto;scrollbar-width:thin;}
+.workflow-tabs a {flex-shrink:0;min-height:44px;display:flex;align-items:center;padding:8px 12px;color:#c8cedb;text-decoration:none;font-size:13px;border-bottom:3px solid transparent;}
+.workflow-tabs a[aria-current] {color:white;border-color:#7da3ff;background:#202c48;}
+.workflow-guide {border:1px solid #364058;border-radius:10px;margin-bottom:24px;background:rgba(27,32,46,.86);}
+.workflow-guide summary {padding:14px 16px;cursor:pointer;color:#dce5f8;font-size:13px;}
+.workflow-guide summary>span {float:right;color:#b7c5e3;font-size:12px;}
+.workflow-guide ol {display:grid;grid-template-columns:repeat(4,minmax(0,1fr));list-style:none;padding:0 16px 16px;margin:0;gap:16px;}
+.workflow-guide li {font-size:13px;line-height:1.5;color:#dce5f8;}
+.workflow-guide li>span {display:block;color:#a4bdff;font-size:12px;font-weight:650;margin-bottom:5px;}
+/* Nested pages previously inherited the sidebar offset a second time. */
+.app-main-inner .app-content {margin-left:0;overflow:visible;}
+.app-main-inner {padding-top:24px;}
+@media (min-width:1025px) {.workflow-tabs {display:none;} .workflow-bar {padding-bottom:0;} }
+@media (max-width:1024px) {
+ .workflow-sidebar {display:none;}
+ .mode-bottom {grid-template-columns:repeat(4,minmax(0,1fr));background:rgba(17,20,31,.97);}
+ .mode-bottom .mode-link {flex-direction:column;gap:5px;justify-content:center;min-width:0;min-height:60px;padding:8px 2px;border-radius:9px;}
+ .mode-bottom .mode-link strong {font-size:11px;line-height:1.25;text-align:center;overflow-wrap:anywhere;}
+ .mode-bottom .mode-link.is-active {border-color:transparent;background:#243f90;}
+ .workflow-bar {padding:14px 20px 0;}
+ .workflow-identity>span {display:none;}
+}
+@media (min-width:720px) and (max-width:1024px) {
+ .mode-bottom {gap:14px;padding:24px 6px;}
+ .mode-bottom .mode-link {min-height:74px;}
+}
+@media (max-width:719px) {
+ .workflow-bar {padding:10px 14px 0;}
+ .workflow-identity {padding-bottom:4px;}
+ .workflow-tabs a {padding:8px 10px;font-size:12px;}
+ .app-main-inner {padding:20px 16px 104px;}
+ .mode-bottom {padding:6px 8px calc(6px + env(safe-area-inset-bottom));gap:4px;}
+ .workflow-guide ol {grid-template-columns:1fr 1fr;}
+ .reader-heading {flex-wrap:wrap;}
+ .reader-heading .reader-tools {width:100%;justify-content:space-between;gap:2px;}
+ .reader-heading .reader-tools .btn {font-size:12px;}
+}
+@supports not (backdrop-filter:blur(1px)) {.workflow-bar,.workflow-sidebar,.mode-bottom {background:#11141f;}}
+@media (prefers-reduced-motion:reduce) {.mode-link {transition:none;}}
+.workflow-tools-button {display:none;}
+@media (max-width:1024px) {.workflow-tools-button {display:inline-flex;} .workflow-identity>.workflow-home {display:none;} .workflow-tools-button {margin-left:auto;min-height:44px;} }
+@media (max-height:500px) and (max-width:719px) {.workflow-identity {display:none;} .workflow-guide {margin-bottom:12px;} .mode-bottom .mode-link {min-height:48px;padding:4px 2px;} }
+.speech-workspace[hidden] {display:none;}
+@media (max-width:719px) {
+ .studio-player {bottom:calc(var(--mode-nav-height,72px) + 8px);}
+ .app-main-inner {padding-bottom:calc(var(--mode-nav-height,72px) + 32px);}
+ body:has(.studio-player) .app-main {padding-bottom:calc(var(--mode-nav-height,72px) + 190px);}
+}
+@media (min-width:720px) and (max-width:1024px) {
+ .mode-bottom {width:96px;padding-left:4px;padding-right:4px;}
+ .app-content {margin-left:96px;}
+ .studio-player {left:112px;}
+}
+
+/* Settings remain one tap away in every mode, including short windows. */
+.workflow-identity>.workflow-settings {display:inline-flex;align-items:center;gap:6px;min-width:44px;min-height:44px;font-size:13px;justify-content:center;padding:0 8px;border:1px solid #596278;border-radius:8px;flex-shrink:0;}
+.workflow-settings>span:first-child {font-size:20px;}
+.settings-ai {display:flex;flex-direction:column;gap:20px;padding:0!important;}
+.cli-maintenance-list {display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,260px),1fr));gap:12px;list-style:none;padding:0;}
+.cli-maintenance-list>li {padding:16px;border:1px solid var(--color-border);border-radius:8px;display:flex;flex-direction:column;gap:10px;min-width:0;}
+.cli-maintenance-list p {font-size:13px;color:var(--color-text-secondary);overflow-wrap:anywhere;}
+.cli-maintenance-list .btn {align-self:flex-start;min-height:44px;}
+.maintenance-status {padding:12px;border-radius:8px;background:var(--color-surface);overflow-wrap:anywhere;}
+@media(max-width:1024px) {.workflow-identity>.workflow-settings {margin-left:auto;} .workflow-tools-button {margin-left:0;} .workflow-settings>span:last-child {display:none;} }
+@media(max-height:500px) and (max-width:719px) {.workflow-identity {display:flex;} .workflow-identity>svg,.workflow-identity>span {display:none;} }

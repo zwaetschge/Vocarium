@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark Vocarium TTS/music/SFX generation without surprise downloads."""
+"""Benchmark Vocarium TTS/music generation without surprise downloads."""
 
 from __future__ import annotations
 
@@ -31,13 +31,6 @@ MODEL_WEIGHT_HINTS = {
             "approx_size": "up to 3.71 GB",
             "purpose": "ACE-Step lyrics/prompt language model",
         },
-    ],
-    "sfx": [
-        {
-            "name": "mmaudio_large_44k_v2.pth",
-            "approx_size": "4.12 GB",
-            "purpose": "MMAudio large 44 kHz SFX generation model",
-        }
     ],
     "tts": [
         {
@@ -127,26 +120,6 @@ def _generate_music(api_url: str, duration: int, user: str) -> tuple[int, bytes]
     return status, body
 
 
-def _generate_sfx(api_url: str, duration: int, user: str) -> tuple[int, bytes]:
-    payload = {
-        "engine": "mmaudio",
-        "prompt": "Kurzer deutscher Benchmark: sanftes Glockenspiel in einem kleinen Raum.",
-        "duration": min(max(1, duration), 30),
-        "negative_prompt": "distortion, clipping",
-        "no_speech": True,
-        "no_music": False,
-        "seed": 1234,
-    }
-    status, body, _ = _request(
-        "POST",
-        f"{api_url}/api/sfx/generate",
-        payload=payload,
-        user=user,
-        timeout=900,
-    )
-    return status, body
-
-
 def _generate_tts(api_url: str, engine: str, user: str) -> tuple[int, bytes]:
     payload = {
         "model": "tts-1",
@@ -202,8 +175,7 @@ def probe_kind(args: argparse.Namespace, kind: str) -> ProbeResult:
             output_path=output_path,
         )
 
-    health_path = "/api/music/health" if kind == "music" else "/api/sfx/health"
-    health = _json_request(args.api_url, health_path, user=args.user)
+    health = _json_request(args.api_url, "/api/music/health", user=args.user)
     if args.preload and not _is_loaded(kind, health) and not args.force_generate:
         return ProbeResult(
             kind=kind,
@@ -218,11 +190,7 @@ def probe_kind(args: argparse.Namespace, kind: str) -> ProbeResult:
         return ProbeResult(kind=kind, health=health, generated=False)
 
     start = time.perf_counter()
-    status, body = (
-        _generate_music(args.api_url, args.duration, args.user)
-        if kind == "music"
-        else _generate_sfx(args.api_url, args.duration, args.user)
-    )
+    status, body = _generate_music(args.api_url, args.duration, args.user)
     elapsed = time.perf_counter() - start
     if status >= 400:
         return ProbeResult(
@@ -277,7 +245,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--api-url", default="http://localhost:8280")
     parser.add_argument("--user", default="api")
-    parser.add_argument("--kind", choices=("music", "sfx", "tts", "both"), default="both")
+    parser.add_argument("--kind", choices=("music", "tts", "both"), default="both")
     parser.add_argument("--tts-engine", choices=("qwen",), default="qwen")
     parser.add_argument("--duration", type=int, default=10)
     parser.add_argument("--preload", action="store_true")
@@ -288,8 +256,7 @@ def main() -> int:
     args.api_url = args.api_url.rstrip("/")
 
     if args.kind == "both":
-        kinds = ["music", "sfx"]
-        kinds.append(f"tts:{args.tts_engine}")
+        kinds = ["music", f"tts:{args.tts_engine}"]
     elif args.kind == "tts":
         kinds = [f"tts:{args.tts_engine}"]
     else:

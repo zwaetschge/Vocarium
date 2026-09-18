@@ -49,6 +49,9 @@ voices/
 # --- HuggingFace / model caches ---
 models/
 qwen3-tts/models/
+kikiri-tts/models/
+kikiri-trainer/base/
+kikiri-trainer/library/
 **/.cache/
 **/huggingface/
 
@@ -81,3 +84,28 @@ notes.local.md
 
 # --- Unrelated nested project (separate git repo, own stack) ---
 vibevoice-api/
+
+# --- Embedding weights (fetched by scripts/download-embedding-model.sh) ---
+llama-embeddings/models/*.gguf
+
+# --- Internal working notes, audits, device screenshots, project dumps ---
+# Contain LAN addresses, personal library screenshots and full project JSON
+# (novel excerpts). Not part of the public repository.
+docs/audits/
+docs/design/
+docs/implementation/
+docs/operations/
+docs/verification/
+docs/plans/
+docs/superpowers/audits/
+Canto rebuild-spec/
+
+# --- Scratch / session artefacts ---
+.work/
+.piper-tmp/
+.ui-shots/
+*.bak-*
+
+# --- Voice weights (fetched or trained locally) ---
+kikiri-tts/models-archive/
+kikiri-tts/piper-models/

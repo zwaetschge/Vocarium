@@ -106,9 +106,59 @@ def _extension(filename: str) -> str:
     return filename[idx:].lower() if idx >= 0 else ""
 
 
-def _read_text_fallback(path: Path) -> str | None:
-    if _extension(path.name) not in {".txt", ".md", ".html", ".htm", ".xml", ".rtf"}:
+_PLAIN_TEXT_EXTENSIONS = {".txt", ".md", ".html", ".htm", ".xml", ".rtf"}
+
+# Ohne laufenden Docling-Dienst muss ein Upload trotzdem funktionieren. Der
+# Hoerbuch-Bereich parst PDF/EPUB/DOCX bereits lokal (pypdf + zipfile), also
+# wird derselbe Parser hier wiederverwendet, statt einen Dienst zu verlangen,
+# den dieser Stack gar nicht mitbringt.
+_LOCAL_FORMATS = {".pdf": "pdf", ".epub": "epub", ".docx": "docx"}
+
+
+def _parse_locally(path: Path) -> str | None:
+    """Text aus einem Binaerdokument ohne Docling. None, wenn nicht moeglich."""
+    fmt = _LOCAL_FORMATS.get(_extension(path.name))
+    if not fmt:
         return None
+    try:
+        from audiobooks.text_pipeline import parse_document
+
+        document = parse_document(path.read_bytes(), fmt)
+    except Exception as exc:
+        logger.warning("Local parse of %s failed: %s", path.name, exc)
+        return None
+    parts: list[str] = []
+    for chapter in document.chapters:
+        body = (chapter.content or "").strip()
+        if not body:
+            continue
+        title = (chapter.title or "").strip()
+        parts.append(f"{title}\n\n{body}" if title else body)
+    text = "\n\n".join(parts).strip()
+    return text or None
+
+
+async def _fetch_url_text(url: str) -> str:
+    """Sichtbaren Text einer URL holen. Wirft, wenn nichts Brauchbares kommt."""
+    from audiobooks.text_pipeline import _strip_html
+
+    resp = await _client().get(
+        url, timeout=httpx.Timeout(60.0), follow_redirects=True
+    )
+    resp.raise_for_status()
+    body = resp.text
+    content_type = resp.headers.get("content-type", "")
+    text = _strip_html(body) if "html" in content_type or "<" in body[:512] else body
+    text = text.strip()
+    if not text:
+        raise RuntimeError(f"Keine lesbaren Inhalte unter {url}")
+    return text
+
+
+def _read_text_fallback(path: Path) -> str | None:
+    """Text ohne Docling: erst als Klartext lesen, sonst lokal parsen."""
+    if _extension(path.name) not in _PLAIN_TEXT_EXTENSIONS:
+        return _parse_locally(path)
     for encoding in ("utf-8", "utf-8-sig", "latin-1"):
         try:
             content = path.read_text(encoding=encoding)
@@ -161,7 +211,9 @@ class DoclingClient:
                     status = "success"
                     return {"status": "success", "text": content}
                 raise RuntimeError(
-                    "DOCLING_API_URL is not configured; binary document parsing is unavailable"
+                    f"Kein Text aus {path.name} lesbar ({ext or 'ohne Endung'}); "
+                    "DOCLING_API_URL ist nicht gesetzt, lokal werden nur "
+                    "PDF, EPUB, DOCX und Textdateien unterstuetzt"
                 )
 
             data: dict[str, str] = {"to_formats": "md"}
@@ -229,7 +281,12 @@ class DoclingClient:
         status = "error"
         try:
             if not self.config.base_url:
-                raise RuntimeError("DOCLING_API_URL is not configured")
+                # Ohne Docling die Seite selbst holen und das Markup strippen —
+                # eine URL-Quelle soll nicht daran scheitern, dass ein
+                # optionaler Dienst fehlt.
+                text = await _fetch_url_text(url)
+                status = "success"
+                return {"status": "success", "text": text}
             resp = await _client().post(
                 f"{self.config.base_url}/v1/convert/source",
                 json={"url": url, "format": format_},

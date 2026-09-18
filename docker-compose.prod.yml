@@ -9,15 +9,13 @@
 # ---------------------------------------------------------------------------
 
 services:
-  qwen3-asr:
+  omnivoice-tts:
     ports: !reset []
-  qwen3-tts:
+  whisper-stt:
     ports: !reset []
-  qwen3-tts-2:
+  kikiri-tts:
     ports: !reset []
-  acestep:
-    ports: !reset []
-  mmaudio:
+  embeddings:
     ports: !reset []
   # By default, only the UI is published. If you front Vocarium with an
   # external reverse proxy (Authelia / Traefik / nginx), put that proxy on
@@ -26,9 +24,5 @@ services:
     ports: !reset []
     environment:
       ALLOW_ANONYMOUS: ${ALLOW_ANONYMOUS:-false}
-      CORS_ORIGINS: ${CORS_ORIGINS:?Set CORS_ORIGINS to your production origin, e.g. https://vocarium.example.com}
-  vocarium-api-2:
-    ports: !reset []
-    environment:
-      ALLOW_ANONYMOUS: ${ALLOW_ANONYMOUS:-false}
+      VOCARIUM_ADMIN_USERS: ${VOCARIUM_ADMIN_USERS:-}
       CORS_ORIGINS: ${CORS_ORIGINS:?Set CORS_ORIGINS to your production origin, e.g. https://vocarium.example.com}

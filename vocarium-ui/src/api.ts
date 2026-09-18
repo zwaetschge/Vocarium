@@ -1,12 +1,12 @@
 import type {
   Voice,
-  Speaker,
   Model,
   HealthStatus,
-  BenchmarkResult,
-  BenchmarkConfig,
   User,
   Host,
+  HostPreset,
+  HostPresetCategory,
+  SettingsNamespace,
   HostRole,
   Podcast,
   PodcastFormat,
@@ -16,7 +16,10 @@ import type {
   PodcastProgressEvent,
   PodcastAudioResult,
   LLMProvider,
-  QueueJob,
+  AbBook,
+  AbBookDetail,
+  AbCollection,
+  AbSegment,
 } from './types';
 
 const BASE = '/api';
@@ -105,10 +108,6 @@ export async function getVoices(): Promise<Voice[]> {
   return data.voices;
 }
 
-export async function getVoice(id: string): Promise<Voice> {
-  return request(`/voices/${id}`);
-}
-
 export async function deleteVoice(id: string): Promise<void> {
   await request(`/voices/${id}`, { method: 'DELETE' });
 }
@@ -125,56 +124,6 @@ export async function cloneVoice(formData: FormData): Promise<{ voice_id: string
     throw new Error(body || `Clone failed: ${res.status}`);
   }
   return res.json();
-}
-
-export async function designPreview(data: { text: string; description: string; language: string }): Promise<Blob> {
-  const { blob } = await requestBlob('/voices/design/preview', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(data),
-  });
-  return blob;
-}
-
-export async function designSave(data: { name: string; description: string; text: string; language: string }): Promise<{ voice_id: string; name: string }> {
-  return request('/voices/design/save', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(data),
-  });
-}
-
-// Custom Voices (prebuilt speakers + optional steering)
-export async function getSpeakers(): Promise<Speaker[]> {
-  const data = await request<{ speakers: Speaker[] }>('/speakers');
-  return data.speakers;
-}
-
-export async function previewCustomVoice(data: {
-  text: string;
-  speaker: string;
-  language?: string;
-  instruct?: string | null;
-}): Promise<Blob> {
-  const { blob } = await requestBlob('/voices/custom/preview', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(data),
-  });
-  return blob;
-}
-
-export async function saveCustomVoice(data: {
-  name: string;
-  speaker: string;
-  instruct?: string | null;
-  language?: string;
-}): Promise<{ voice_id: string; name: string; speaker: string; instruct: string; language: string }> {
-  return request('/voices/custom/save', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(data),
-  });
 }
 
 // Generate
@@ -271,42 +220,48 @@ export async function getModels(): Promise<Model[]> {
   return data.models;
 }
 
-export async function getCurrentModel(): Promise<Model & { loaded: boolean }> {
-  return request('/models/current');
-}
-
-export async function switchModel(modelId: string): Promise<{ status: string; model_id: string; load_time_s: number; voices_loaded: number }> {
-  return request('/models/switch', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model_id: modelId }),
-  });
-}
-
-// Benchmark
-export async function runBenchmark(config: BenchmarkConfig): Promise<{ results: BenchmarkResult[] }> {
-  return request('/benchmark/run', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(config),
-  });
-}
-
-export async function getBenchmarkResults(): Promise<{ results: BenchmarkResult[] }> {
-  return request('/benchmark/results');
-}
-
 // Transcription (STT)
-export async function transcribe(data: { file?: File; url?: string }): Promise<{ text: string }> {
+export interface TranscriptionWord {
+  text: string;
+  start: number;
+  end: number;
+}
+
+export interface TranscriptionResult {
+  text: string;
+  language: string;
+  /** Whisper-Profil, das gelaufen ist: `german` oder `swiss`. */
+  model: string;
+  words: TranscriptionWord[];
+  segments: TranscriptionWord[];
+}
+
+export async function transcribe(data: {
+  file?: File;
+  url?: string;
+  /** `german` (large-v3) oder `swiss` (Flix-Finetune). Leer = Servervorgabe. */
+  model?: string;
+  /** ISO-Code oder `auto`. Leer = Servervorgabe (Deutsch). */
+  language?: string;
+}): Promise<TranscriptionResult> {
   const formData = new FormData();
   if (data.file) formData.append('file', data.file);
   if (data.url) formData.append('url', data.url);
+  if (data.model) formData.append('model', data.model);
+  if (data.language) formData.append('language', data.language);
   const res = await fetch(`${BASE}/transcribe`, { method: 'POST', body: formData });
   if (!res.ok) {
     const body = await res.text();
     throw new Error(body || `Transcription failed: ${res.status}`);
   }
-  return res.json();
+  const result = await res.json() as Partial<TranscriptionResult>;
+  return {
+    text: result.text ?? '',
+    language: result.language ?? 'Unknown',
+    model: result.model ?? 'german',
+    words: result.words ?? [],
+    segments: result.segments ?? [],
+  };
 }
 
 // Languages
@@ -335,88 +290,6 @@ export interface MusicGenerateResponse {
   code?: number;
 }
 
-export async function generateMusic(data: {
-  prompt: string;
-  lyrics?: string;
-  audio_duration?: number;
-  bpm?: number;
-  key_scale?: string;
-  time_signature?: string;
-  thinking?: boolean;
-  audio_format?: string;
-  seed?: number;
-}): Promise<MusicGenerateResponse> {
-  return request('/music/generate', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(data),
-  });
-}
-
-export async function getMusicStatus(taskIds: string[]): Promise<{ data: MusicResult[]; code: number }> {
-  return request('/music/status', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ task_ids: taskIds }),
-  });
-}
-
-export async function getMusicAudio(path: string): Promise<Blob> {
-  const { blob } = await requestBlob(`/music/audio?path=${encodeURIComponent(path)}`);
-  return blob;
-}
-
-export async function enhanceMusic(data: { prompt?: string; lyrics?: string }): Promise<unknown> {
-  return request('/music/enhance', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(data),
-  });
-}
-
-export async function getMusicHealth(): Promise<{ status: string; backend_running: boolean }> {
-  return request('/music/health');
-}
-
-// GPU Queue
-export async function getQueueStatus(): Promise<{
-  current: QueueJob | null;
-  queue: QueueJob[];
-  queue_length: number;
-}> {
-  return request('/queue/status');
-}
-
-export async function getQueueJobs(limit = 50): Promise<QueueJob[]> {
-  const data = await request<{ jobs: QueueJob[] }>(`/queue/jobs?limit=${encodeURIComponent(String(limit))}`);
-  return data.jobs;
-}
-
-export async function cancelQueueJob(jobId: string): Promise<QueueJob> {
-  return request(`/queue/jobs/${jobId}/cancel`, { method: 'POST' });
-}
-
-// Sound Effects (MMAudio)
-export async function generateSfx(data: {
-  prompt: string;
-  negative_prompt?: string;
-  duration?: number;
-  cfg_strength?: number;
-  num_steps?: number;
-  seed?: number;
-}): Promise<Blob> {
-  const { blob } = await requestBlob('/sfx/generate', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(data),
-  });
-  return blob;
-}
-
-export async function getSfxHealth(): Promise<{ status: string; model_loaded: boolean }> {
-  return request('/sfx/health');
-}
-
 // --- Podcast: Hosts ---
 export async function getHosts(): Promise<Host[]> {
   const data = await request<{ hosts: Host[] }>('/hosts');
@@ -425,6 +298,7 @@ export async function getHosts(): Promise<Host[]> {
 
 export async function createHost(data: {
   name: string;
+  tagline?: string;
   personality?: string;
   speaking_style?: string;
   voice_id?: string | null;
@@ -447,6 +321,43 @@ export async function updateHost(hostId: string, data: Partial<Omit<Host, 'id' |
 
 export async function deleteHost(hostId: string): Promise<void> {
   await request(`/hosts/${hostId}`, { method: 'DELETE' });
+}
+
+// --- Podcast: Host-Hub ---
+export async function getHostPresets(): Promise<{
+  categories: HostPresetCategory[];
+  presets: HostPreset[];
+}> {
+  return request('/hosts/presets');
+}
+
+export async function createHostFromPreset(
+  presetId: string,
+  overrides: { name?: string; voice_id?: string } = {},
+): Promise<Host & { voice_missing?: boolean }> {
+  return request(`/hosts/presets/${presetId}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(overrides),
+  });
+}
+
+// --- Bereichs-Voreinstellungen ---
+export async function getSettingsPrefs<T>(namespace: SettingsNamespace): Promise<T> {
+  const data = await request<{ prefs: T }>(`/settings/prefs/${namespace}`);
+  return data.prefs;
+}
+
+export async function saveSettingsPrefs<T>(
+  namespace: SettingsNamespace,
+  prefs: Partial<T>,
+): Promise<T> {
+  const data = await request<{ prefs: T }>(`/settings/prefs/${namespace}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(prefs),
+  });
+  return data.prefs;
 }
 
 // --- Podcast: Podcasts ---
@@ -475,27 +386,20 @@ export async function createPodcast(data: {
   });
 }
 
-export async function updatePodcast(
-  podcastId: string,
-  data: {
-    topic?: string;
-    format?: PodcastFormat;
-    disfluency_level?: number;
-    duration?: PodcastDuration;
-    language?: string;
-    audio_format?: string;
-    host_ids?: string[];
-  },
-): Promise<Podcast> {
-  return request(`/podcasts/${podcastId}`, {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(data),
-  });
-}
-
 export async function deletePodcast(podcastId: string): Promise<void> {
   await request(`/podcasts/${podcastId}`, { method: 'DELETE' });
+}
+
+// --- Podcast: Nonverbale Tags ---
+export interface SegmentTag {
+  id: string;
+  label: string;
+  hint: string;
+}
+
+export async function getSegmentTags(): Promise<SegmentTag[]> {
+  const data = await request<{ tags: SegmentTag[] }>('/podcasts/tags');
+  return data.tags;
 }
 
 // --- Podcast: Sources ---
@@ -536,6 +440,13 @@ export async function addTextSource(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ content, title }),
   });
+}
+
+export async function reprocessPodcastSource(
+  podcastId: string,
+  sourceId: string,
+): Promise<PodcastSource> {
+  return request(`/podcasts/${podcastId}/sources/${sourceId}/reprocess`, { method: 'POST' });
 }
 
 export async function deletePodcastSource(podcastId: string, sourceId: string): Promise<void> {
@@ -613,6 +524,7 @@ export async function updateSegment(
   podcastId: string,
   segmentId: string,
   data: {
+    speaker_id?: string;
     speaker?: string;
     text?: string;
     type?: string;
@@ -635,6 +547,7 @@ export async function addSegment(
   podcastId: string,
   data: {
     type: 'speech' | 'reaction' | 'pause' | 'sfx' | 'music';
+    speaker_id?: string;
     speaker?: string;
     text?: string;
     prompt?: string;
@@ -677,8 +590,8 @@ export async function generatePodcastAudio(
   );
 }
 
-export function getPodcastAudioStreamUrl(podcastId: string): string {
-  return `${BASE}/podcasts/${podcastId}/audio/stream`;
+export function getPodcastAudioStreamUrl(podcastId: string, revision?: string): string {
+  return `${BASE}/podcasts/${podcastId}/audio/stream${revision ? `?revision=${encodeURIComponent(revision)}` : ''}`;
 }
 
 export async function downloadPodcastAudio(podcastId: string): Promise<Blob> {
@@ -690,10 +603,6 @@ export async function downloadPodcastAudio(podcastId: string): Promise<Blob> {
 export async function getLLMProviders(): Promise<LLMProvider[]> {
   const data = await request<{ providers: LLMProvider[] }>('/llm/providers');
   return data.providers;
-}
-
-export async function getActiveLLMProvider(): Promise<LLMProvider> {
-  return request('/llm/providers/active');
 }
 
 export async function createLLMProvider(data: {
@@ -750,4 +659,351 @@ export async function testLLMProvider(data: {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data),
   });
+}
+
+// Audiobooks
+export async function listAudiobooks(): Promise<{ books: AbBook[] }> {
+  return request('/audiobooks');
+}
+
+export async function uploadAudiobook(data: {
+  file: File; title?: string; voice_id?: string;
+}): Promise<AbBook & { segments: number }> {
+  const form = new FormData();
+  form.append('file', data.file);
+  if (data.title) form.append('title', data.title);
+  if (data.voice_id) form.append('voice_id', data.voice_id);
+  return request('/audiobooks', { method: 'POST', body: form });
+}
+
+export async function getAudiobook(id: string, voice?: string): Promise<AbBookDetail> {
+  const q = voice ? `?voice=${encodeURIComponent(voice)}` : '';
+  return request(`/audiobooks/${id}${q}`);
+}
+
+export async function deleteAudiobook(id: string): Promise<{ ok: boolean }> {
+  return request(`/audiobooks/${id}`, { method: 'DELETE' });
+}
+
+export async function patchAudiobook(id: string, body: { title?: string; voice_id?: string | null; is_hidden?: boolean; author?: string }): Promise<AbBook> {
+  return request(`/audiobooks/${id}`, {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+}
+
+export async function getAudiobookContent(id: string, chapter: number): Promise<{
+  chapter: { index: number; title: string }; segments: AbSegment[]; totalChapters: number;
+}> {
+  return request(`/audiobooks/${id}/content?chapter=${chapter}`);
+}
+
+export async function generateAudiobook(id: string, body: { voice_id?: string; chapter?: number }): Promise<unknown> {
+  return request(`/audiobooks/${id}/generate`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+}
+
+export async function saveAudiobookProgress(id: string, chapterIndex: number, segmentIndex: number, completed = false): Promise<void> {
+  await request(`/audiobooks/${id}/progress`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chapterIndex, segmentIndex, completed }),
+  });
+}
+
+/** Live-Variante: fehlende Segmente werden serverseitig on-demand generiert
+ *  und landen dabei im regulären Cache. */
+export function audiobookSegmentLiveUrl(id: string, voice: string, chapter: number, segment: number): string {
+  return `${BASE}/audiobooks/${id}/audio-live/${encodeURIComponent(voice)}/${chapter}/${segment}`;
+}
+
+export interface AbBookmark {
+  id: string;
+  chapterIndex: number;
+  segmentIndex: number;
+  note: string;
+  created_at: string;
+}
+
+export async function listAudiobookBookmarks(id: string): Promise<{ bookmarks: AbBookmark[] }> {
+  return request(`/audiobooks/${id}/bookmarks`);
+}
+
+export async function addAudiobookBookmark(id: string, chapterIndex: number, segmentIndex: number, note = ''): Promise<{ id: string }> {
+  return request(`/audiobooks/${id}/bookmarks`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chapterIndex, segmentIndex, note }),
+  });
+}
+
+export async function deleteAudiobookBookmark(id: string, bmId: string): Promise<void> {
+  await request(`/audiobooks/${id}/bookmarks/${bmId}`, { method: 'DELETE' });
+}
+
+export function audiobookCoverUrl(id: string): string {
+  return `${BASE}/audiobooks/${id}/cover`;
+}
+
+export async function uploadAudiobookCover(id: string, file: File): Promise<void> {
+  const form = new FormData();
+  form.append('cover', file);
+  await request(`/audiobooks/${id}/cover`, { method: 'POST', body: form });
+}
+
+export async function listAbCollections(): Promise<{ collections: AbCollection[] }> {
+  return request('/audiobooks/collections');
+}
+
+export async function createAbCollection(name: string, color: string): Promise<AbCollection> {
+  return request('/audiobooks/collections', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, color }),
+  });
+}
+
+export async function deleteAbCollection(cid: string): Promise<void> {
+  await request(`/audiobooks/collections/${cid}`, { method: 'DELETE' });
+}
+
+export async function addBookToCollection(cid: string, bookId: string): Promise<void> {
+  await request(`/audiobooks/collections/${cid}/books`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ bookId }),
+  });
+}
+
+export async function removeBookFromCollection(cid: string, bookId: string): Promise<void> {
+  await request(`/audiobooks/collections/${cid}/books/${bookId}`, { method: 'DELETE' });
+}
+
+export interface AbExportStatus {
+  job: { status: string; done: number; total: number; error: string } | null;
+  ready: boolean;
+  size: number;
+}
+
+export async function startAudiobookExport(id: string, voiceId: string, format: 'm4b' | 'mp3'): Promise<void> {
+  await request(`/audiobooks/${id}/export`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ voice_id: voiceId, format }),
+  });
+}
+
+export async function audiobookExportStatus(id: string, voiceId: string, format: 'm4b' | 'mp3'): Promise<AbExportStatus> {
+  return request(`/audiobooks/${id}/export/status?voice=${encodeURIComponent(voiceId)}&format=${format}`);
+}
+
+export function audiobookExportDownloadUrl(id: string, voiceId: string, format: 'm4b' | 'mp3'): string {
+  return `${BASE}/audiobooks/${id}/export/download?voice=${encodeURIComponent(voiceId)}&format=${format}`;
+}
+
+export interface AbQueueJob {
+  id: string;
+  book_id: string;
+  voice_id: string;
+  chapter: number | null;
+  priority: number;
+  status: 'pending' | 'processing' | 'complete' | 'error' | 'cancelled';
+  done: number;
+  total: number;
+  error: string;
+  title: string;
+  created_at: string;
+}
+
+export async function enqueueAbGeneration(bookId: string, voiceId: string, opts: { chapter?: number; priority?: number } = {}): Promise<{ id: string }> {
+  return request('/audiobooks/queue', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ book_id: bookId, voice_id: voiceId, ...opts }),
+  });
+}
+
+export async function cancelAbQueueJob(qid: string): Promise<void> {
+  await request(`/audiobooks/queue/${qid}`, { method: 'DELETE' });
+}
+
+export function abQueueEventsUrl(): string {
+  return `${BASE}/audiobooks/queue/events`;
+}
+
+export interface AbPronunciationRule {
+  id: string;
+  original: string;
+  replacement: string;
+  language: string;
+  created_at: string;
+}
+
+export async function listPronunciationRules(): Promise<{ rules: AbPronunciationRule[] }> {
+  return request('/audiobooks/pronunciation');
+}
+
+export async function addPronunciationRule(original: string, replacement: string, language = 'German'): Promise<{ id: string }> {
+  return request('/audiobooks/pronunciation', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ original, replacement, language }),
+  });
+}
+
+export async function deletePronunciationRule(rid: string): Promise<void> {
+  await request(`/audiobooks/pronunciation/${rid}`, { method: 'DELETE' });
+}
+
+export interface AbStoreBook {
+  id: string;
+  title: string;
+  author: string;
+  genre: string;
+  format: string;
+  total_chapters: number;
+  created_at: string;
+  mine: boolean;
+  added_by: string;
+  inLibrary: boolean;
+  has_cover: boolean;
+  avgRating: number;
+  ratingCount: number;
+  userRating: number | null;
+}
+
+export async function rateStoreBook(sid: string, rating: number): Promise<{ avgRating: number; ratingCount: number; userRating: number }> {
+  return request(`/audiobooks/store/${sid}/rating`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ rating }),
+  });
+}
+
+export async function patchStoreBook(sid: string, body: { title?: string; author?: string; genre?: string }): Promise<void> {
+  await request(`/audiobooks/store/${sid}`, {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+export async function getReaderPrefs(): Promise<Record<string, unknown>> {
+  return request('/audiobooks/prefs');
+}
+
+export async function putReaderPrefs(prefs: Record<string, unknown>): Promise<void> {
+  await request('/audiobooks/prefs', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(prefs),
+  });
+}
+
+export interface AbSearchHit {
+  chapterIndex: number;
+  index: number;
+  text: string;
+  score: number;
+}
+
+export async function searchAudiobook(id: string, q: string): Promise<{ results: AbSearchHit[]; ready: boolean }> {
+  return request(`/audiobooks/${id}/search?q=${encodeURIComponent(q)}`);
+}
+
+export interface AbOfflineVoice {
+  voice_id: string;
+  cachedSegments: number;
+  totalSegments: number;
+  complete: boolean;
+}
+
+export async function getOfflineVoices(bookId: string): Promise<{ voices: AbOfflineVoice[]; totalSegments: number }> {
+  return request(`/audiobooks/${bookId}/offline-voices`);
+}
+
+export async function patchPronunciationRule(rid: string, body: { original?: string; replacement?: string; language?: string }): Promise<void> {
+  await request(`/audiobooks/pronunciation/${rid}`, {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+export async function listAudiobookStore(): Promise<{ books: AbStoreBook[] }> {
+  return request('/audiobooks/store');
+}
+
+export async function publishBookToStore(bookId: string, genre: string): Promise<{ id: string }> {
+  return request('/audiobooks/store/publish', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ book_id: bookId, genre }),
+  });
+}
+
+export async function addStoreBookToLibrary(sid: string): Promise<{ id: string }> {
+  return request(`/audiobooks/store/${sid}/add`, { method: 'POST' });
+}
+
+export async function deleteStoreBook(sid: string): Promise<void> {
+  await request(`/audiobooks/store/${sid}`, { method: 'DELETE' });
+}
+
+export function audiobookStoreCoverUrl(sid: string): string {
+  return `${BASE}/audiobooks/store/${sid}/cover`;
+}
+
+export interface AbAmbience {
+  id: string;
+  name: string;
+  filename: string;
+  created_at: string;
+}
+
+export async function listAmbience(): Promise<{ sounds: AbAmbience[] }> {
+  return request('/audiobooks/ambience');
+}
+
+export async function uploadAmbience(file: File, name = ''): Promise<{ id: string }> {
+  const form = new FormData();
+  form.append('file', file);
+  if (name) form.append('name', name);
+  return request('/audiobooks/ambience', { method: 'POST', body: form });
+}
+
+export async function deleteAmbience(aid: string): Promise<void> {
+  await request(`/audiobooks/ambience/${aid}`, { method: 'DELETE' });
+}
+
+export function ambienceAudioUrl(aid: string): string {
+  return `${BASE}/audiobooks/ambience/${aid}/audio`;
+}
+
+export async function startListeningSession(bookId: string): Promise<{ id: string }> {
+  return request('/audiobooks/listening-sessions', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ bookId }),
+  });
+}
+
+export async function updateListeningSession(sessionId: string, durationMs: number, segmentsPlayed: number): Promise<void> {
+  await request('/audiobooks/listening-sessions', {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sessionId, durationMs, segmentsPlayed }),
+  });
+}
+
+export interface AbStats {
+  stats: {
+    totalBooks: number; booksStarted: number; booksCompleted: number;
+    totalAudioSegments: number; totalListeningMs: number; totalBookmarks: number;
+    sessions: number; segmentsPlayed: number; streak: number;
+    formats: { format: string; count: number }[];
+    dailyBreakdown: { date: string; ms: number }[];
+  };
+  achievements: { id: string; title: string; description: string; icon: string; unlocked: boolean }[];
+}
+
+export async function getAudiobookStats(): Promise<AbStats> {
+  return request('/audiobooks/stats');
+}
+
+export async function previewPronunciation(text: string): Promise<{ result: string }> {
+  return request('/audiobooks/pronunciation/preview', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text }),
+  });
+}
+
+export async function updatePodcastCast(id: string, host_ids: string[]): Promise<Podcast> {
+  return request(`/podcasts/${id}`, { method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({host_ids}) });
 }

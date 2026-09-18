@@ -40,13 +40,13 @@ Returns the authenticated user.
 
 ## GPU Queue System
 
-**Alle GPU-Operationen laufen durch eine FIFO-Queue.** Im Single-GPU-Default teilt sich GPU 0 (RTX 3060, 12GB) TTS, ASR, Music und SFX. Nur eine Operation gleichzeitig — alle anderen warten.
+**Alle GPU-Operationen laufen durch eine FIFO-Queue.** Im Single-GPU-Default teilt sich GPU 0 (RTX 3060, 12GB) OmniVoice (resident) und Whisper (lazy). Nur eine Operation gleichzeitig — alle anderen warten.
 
-**Dual-GPU ist opt-in:** Eine zweite TTS-Instanz auf GPU 1 wird nur genutzt, wenn der Stack mit `COMPOSE_PROFILES=dual-gpu` und `TTS_URL_2=http://qwen3-tts-2:8880` gestartet wurde. Ohne diese Konfiguration laufen TTS-Requests ausschliesslich ueber `TTS_URL`.
+**Kikiri (CPU-Stimmen) umgeht die Queue:** Anfragen mit `engine="kikiri"` oder an eine Kikiri-Stimme laufen sofort auf der CPU, auch waehrend die GPU transkribiert.
 
 Das bedeutet:
 - TTS-Requests koennen nur dann parallel auf GPU 1 laufen, wenn Dual-GPU explizit aktiviert ist
-- ASR/Music/SFX-Requests koennen lange dauern, wenn die Queue voll ist oder der GPU-Guard nicht genug freien VRAM sieht
+- ASR/Music-Requests koennen lange dauern, wenn die Queue voll ist oder der GPU-Guard nicht genug freien VRAM sieht
 - Timeouts grosszuegig setzen (mindestens 600s)
 - Queue-Status abfragen um dem User Feedback zu geben
 
@@ -66,8 +66,8 @@ Aktueller Queue-Zustand.
     {
       "job_id": "f6e5d4c3b2a1",
       "position": 1,
-      "service_type": "sfx",
-      "description": "SFX Generate",
+      "service_type": "music",
+      "description": "Music Generate",
       "created_at": 1774962005.0
     }
   ],
@@ -109,7 +109,7 @@ Generiert Sprache aus Text. **Haupt-Endpoint fuer Client-Integrationen.**
 {
   "text": "Dies ist ein Testtext.",
   "voice_id": "a1b2c3d4",
-  "model_id": "1.7b-base",
+  "engine": "omnivoice",
   "language": "German",
   "response_format": "wav"
 }
@@ -119,7 +119,7 @@ Generiert Sprache aus Text. **Haupt-Endpoint fuer Client-Integrationen.**
 |------|---------|---------|-------------|
 | `text` | ja | — | Zu sprechender Text |
 | `voice_id` | nein | `"default"` | Voice-ID (muss dem User gehoeren) |
-| `model_id` | nein | aktuelles Modell | `"1.7b-base"` fuer Clone/Base-TTS |
+| `engine` | nein | stimmabhaengig | `"omnivoice"` (GPU, Klone) oder `"kikiri"` (CPU-Bank) erzwingen |
 | `language` | nein | Voice-Sprache | Sprache der Ausgabe |
 | `response_format` | nein | `"wav"` | Audio-Format |
 
@@ -160,7 +160,7 @@ event: chunk
 data: {"index": 1, "total": 3, "audio": "<base64-wav>", "duration": 1.8, "text": "Zweiter Satz."}
 
 event: done
-data: {"total_duration": 5.4, "generation_time": 8.2, "rtf": 1.52, "model": "1.7b-base", "voice": "a1b2c3d4", "chunks": 3}
+data: {"total_duration": 5.4, "generation_time": 8.2, "rtf": 1.52, "model": "omnivoice", "voice": "a1b2c3d4", "chunks": 3}
 ```
 
 **Hinweis:** Der Endpoint streamt Queue-/Progress- und Chunk-Events live per SSE. Lange TTS-Inferenz bleibt GPU-gebunden; setze trotzdem grosszuegige Timeouts.
@@ -203,17 +203,15 @@ curl -X POST http://vocarium-api:8280/v1/audio/speech/designed \
   --output designed.wav
 ```
 
-### Saved Custom Speaker Presets: `POST /v1/audio/speech/custom`
+### Custom Speaker Presets: `POST /v1/audio/speech/custom`
 
-```bash
-curl -X POST http://vocarium-api:8280/v1/audio/speech/custom \
-  -H "Remote-User: alice" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"qwen3-tts-custom","input":"Hallo Welt","voice":"CUSTOM_VOICE_ID","response_format":"wav"}' \
-  --output custom.wav
-```
+Historischer Qwen-Endpunkt. Die Qwen-Engine ist stillgelegt (`QWEN_TTS_ENABLED=false`); der Endpunkt bleibt fuer Kompatibilitaet bestehen und antwortet ohne Engine mit 503.
 
-Custom Voices duerfen nicht an `/v1/audio/speech` gesendet werden; dieser Endpoint akzeptiert nur `default` und Clone-Voices.
+`/v1/audio/speech` akzeptiert `default` und Klon-Stimmen (OmniVoice) sowie die Kikiri-Stimmen.
+
+### Identitaet hinter dem Proxy
+
+Ist `VOCARIUM_PROXY_SECRET` gesetzt, zaehlt `Remote-User` nur zusammen mit dem Header `X-Vocarium-Proxy-Secret`. Der Nginx von `vocarium-ui` haengt ihn automatisch an; Direktzugriffe auf `vocarium-api:8280` ohne Secret laufen als anonymer `api`-Benutzer (bei `ALLOW_ANONYMOUS=true`) oder erhalten 401.
 
 ---
 
@@ -294,123 +292,10 @@ Max. 30 Minuten Audio.
 
 ---
 
-## Musikgenerierung (ACE-Step)
-
-### `POST /api/music/generate` *(GPU: music)*
-Musik generieren. **Synchron — blockiert bis Generierung fertig** (kann 1-3 Min dauern).
-
-**Request:**
-```json
-{
-  "prompt": "upbeat indie pop, acoustic guitar, warm female vocals",
-  "lyrics": "[Verse]\nWalking through the light...\n[Chorus]\nWe are free...",
-  "audio_duration": 60,
-  "bpm": 120,
-  "key_scale": "C Major",
-  "time_signature": "4/4",
-  "thinking": true,
-  "audio_format": "wav",
-  "seed": null
-}
-```
-
-| Feld | Default | Beschreibung |
-|------|---------|-------------|
-| `prompt` | pflicht | Musikbeschreibung |
-| `lyrics` | `""` | Liedtext (optional) |
-| `audio_duration` | `60` | Dauer in Sekunden |
-| `bpm` | null | Beats per minute |
-| `key_scale` | null | z.B. `"C Major"`, `"A Minor"` |
-| `time_signature` | null | z.B. `"4/4"`, `"3/4"` |
-| `thinking` | true | AI-Enhancement der Lyrics |
-| `audio_format` | `"wav"` | Ausgabeformat |
-| `seed` | null | Fuer Reproduzierbarkeit |
-
-**Response:**
-```json
-{
-  "submit": {
-    "data": {
-      "task_id": "uuid-string",
-      "status": "queued",
-      "queue_position": 1
-    }
-  },
-  "result": {
-    "data": [
-      {
-        "task_id": "uuid-string",
-        "status": 1,
-        "result": "[{\"file\":\"/v1/audio?path=...\"}]"
-      }
-    ]
-  }
-}
-```
-
-Audio-Datei dann via `/api/music/audio` abrufen:
-
-### `GET /api/music/audio?path=<path>`
-Generierte Musikdatei herunterladen. `path` kommt aus dem `result`-Feld der Generierung.
-
-### `GET /api/music/health`
-```json
-{"status": "ok", "backend_running": true}
-```
-
----
-
-## Soundeffekte (MMAudio)
-
-### `POST /api/sfx/generate` *(GPU: sfx)*
-Soundeffekt aus Textbeschreibung generieren.
-
-**Request:**
-```json
-{
-  "prompt": "thunder with heavy rain",
-  "negative_prompt": "music, speech",
-  "duration": 8.0,
-  "cfg_strength": 4.5,
-  "num_steps": 25,
-  "seed": null
-}
-```
-
-| Feld | Default | Beschreibung |
-|------|---------|-------------|
-| `prompt` | pflicht | Beschreibung des Soundeffekts |
-| `negative_prompt` | `""` | Was vermieden werden soll |
-| `duration` | `8.0` | Dauer in Sekunden (1-30) |
-| `cfg_strength` | `4.5` | Classifier-free guidance (1-10) |
-| `num_steps` | `25` | Inference-Schritte (10-50, mehr=besser aber langsamer) |
-| `seed` | null | Fuer Reproduzierbarkeit |
-
-**Response:** Binary WAV Audio
-- Content-Type: `audio/wav`
-- Content-Disposition: `attachment; filename=sfx.wav`
-
-### `GET /api/sfx/health`
-```json
-{"status": "ok", "model_loaded": false, "variant": "large_44k_v2"}
-```
-
----
-
 ## Modelle & Sprecher
 
 ### `GET /api/models`
-Verfuegbare TTS-Modelle.
-
-```json
-{
-  "models": [
-    {"id": "1.7b-base", "path": "...", "type": "base", "params": "1.7B", "loaded": true},
-    {"id": "1.7b-design", "path": "...", "type": "design", "params": "1.7B", "loaded": false},
-    {"id": "1.7b-custom", "path": "...", "type": "custom", "params": "1.7B", "loaded": false}
-  ]
-}
-```
+Historischer Qwen-Endpunkt; liefert seit der Stilllegung eine leere Modellliste. Die tatsaechlichen Engines stehen in `GET /api/voices` (`source`: `omnivoice` | `kikiri`) und `GET /api/health` (`tts.voices_loaded`).
 
 ### `GET /api/languages`
 Unterstuetzte Sprachen.

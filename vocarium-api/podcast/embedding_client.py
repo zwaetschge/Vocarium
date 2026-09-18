@@ -17,13 +17,26 @@ logger = logging.getLogger(__name__)
 _http_client: httpx.AsyncClient | None = None
 
 
+_http_client_loop: "asyncio.AbstractEventLoop | None" = None
+
+
 def _client() -> httpx.AsyncClient:
-    global _http_client
-    if _http_client is None or _http_client.is_closed:
+    """Ein AsyncClient pro Event-Loop.
+
+    Der Client haelt anyio-Primitive, die an die Loop gebunden sind, in der er
+    erzeugt wurde. Wird er z. B. von einem Startup-Check in einer Nebenloop
+    angelegt und spaeter aus der Uvicorn-Loop benutzt, haengt der Aufruf
+    still und ohne Timeout -- genau das Bild einer Skriptgenerierung, die
+    ewig bei "preparing" steht.
+    """
+    global _http_client, _http_client_loop
+    loop = asyncio.get_running_loop()
+    if _http_client is None or _http_client.is_closed or _http_client_loop is not loop:
         _http_client = httpx.AsyncClient(
             limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
             timeout=None,
         )
+        _http_client_loop = loop
     return _http_client
 
 
@@ -42,11 +55,26 @@ class EmbeddingConfig:
     dimensions: int
 
 
+def _embeddings_endpoint(url: str) -> str:
+    """Accept either the full endpoint or an OpenAI-style base URL.
+
+    ``EMBEDDING_API_URL`` is shared with ``audiobooks.semantics``, which treats
+    it as a base URL and appends the path. Posting a bare base URL here would
+    404, so normalise both spellings to the same endpoint.
+    """
+    url = url.strip().rstrip("/")
+    if not url or url.endswith("/embeddings"):
+        return url
+    return f"{url}/embeddings"
+
+
 def _default_config() -> EmbeddingConfig:
     return EmbeddingConfig(
-        base_url=os.environ.get("EMBEDDING_API_URL", ""),
+        base_url=_embeddings_endpoint(
+            os.environ.get("EMBEDDING_API_URL", "") or "http://embeddings:8080/v1"
+        ),
         api_key=os.environ.get("EMBEDDING_API_KEY", ""),
-        model=os.environ.get("EMBEDDING_MODEL", ""),
+        model=os.environ.get("EMBEDDING_MODEL", "") or "bge-m3",
         dimensions=int(os.environ.get("EMBEDDING_DIMENSIONS", "1024")),
     )
 

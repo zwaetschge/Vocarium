@@ -1,12 +1,12 @@
 """Audio assembler — combines TTS segments into a single podcast audio file.
 
 The TTS producer is injected via ``TTSGenerator`` so this module stays
-decoupled from the Vocarium voice resolver / qwen3-tts client wiring in
+decoupled from the Vocarium voice resolver / speech engine wiring in
 ``main.py``.
 
 The pipeline:
   1. synthesize each speech/reaction segment to an individual MP3
-  2. generate optional music / prompted SFX assets
+  2. generate optional music assets
   3. trim leading silence from each segment
   4. mix every asset on a timeline with ffmpeg filter_complex/amix
   5. apply EBU R128 loudness normalisation (I=-16, TP=-1.5, LRA=11)
@@ -117,22 +117,6 @@ class MusicGenerator(Protocol):
         ...
 
 
-class SFXGenerator(Protocol):
-    """Sound-effect dependency. Same shape as MusicGenerator but typically
-    backed by MMAudio."""
-
-    async def generate_to_file(
-        self,
-        prompt: str,
-        duration_s: float,
-        output_path: Path,
-        output_format: AudioFormat,
-        *,
-        user_id: int | None = None,
-    ) -> float:
-        ...
-
-
 # --- Text cleaning ------------------------------------------------------------
 
 
@@ -185,18 +169,6 @@ def clean_text_for_tts(text: str) -> str:
     for pattern, replacement in _CLEAN_STEPS:
         out = pattern.sub(replacement, out)
     return out.strip()
-
-
-# --- SFX map -----------------------------------------------------------------
-
-_SFX_MAP: dict[str, str] = {
-    "[lacht]": "laugh.mp3",
-    "[laughs]": "laugh.mp3",
-    "[schmunzelt]": "chuckle.mp3",
-    "[chuckles]": "chuckle.mp3",
-    "[kichert]": "giggle.mp3",
-    "[giggles]": "giggle.mp3",
-}
 
 
 # --- Helpers -----------------------------------------------------------------
@@ -258,7 +230,6 @@ def _calculate_contextual_pause(
     if _ENTHUSIASTIC_START.match(curr.text):
         return _rand_between(80, 180)
 
-    prev_notes = (prev.notes or "").lower()
     curr_notes = (curr.notes or "").lower()
     if any(k in curr_notes for k in ("übergang", "transition", "neues thema")):
         return _rand_between(500, 800)
@@ -274,21 +245,15 @@ class AudioAssembler:
         self,
         tts: TTSGenerator,
         output_dir: str | os.PathLike[str] | None = None,
-        sfx_dir: str | os.PathLike[str] | None = None,
         ffmpeg_path: str = "ffmpeg",
         ffprobe_path: str = "ffprobe",
         user_id: int | None = None,
         music: MusicGenerator | None = None,
-        sfx: SFXGenerator | None = None,
     ):
         self.tts = tts
         self.music = music
-        self.sfx = sfx
         self.output_dir = Path(
             output_dir or os.environ.get("PODCAST_AUDIO_PATH", "/app/data/podcast_audio")
-        )
-        self.sfx_dir = Path(sfx_dir) if sfx_dir else Path(
-            os.environ.get("PODCAST_SFX_PATH", "/app/data/podcast_sfx")
         )
         self.ffmpeg = ffmpeg_path
         self.ffprobe = ffprobe_path
@@ -318,7 +283,7 @@ class AudioAssembler:
             )
 
     async def aclose(self) -> None:
-        for dependency in (self.tts, self.music, self.sfx):
+        for dependency in (self.tts, self.music):
             close = getattr(dependency, "aclose", None)
             if close is not None:
                 await close()
@@ -495,59 +460,12 @@ class AudioAssembler:
                 completed += 1
                 return
 
-            # SFX — prompted goes via MMAudio, otherwise fall back to bundled clips.
+            # SFX-Segmente sind Altlast: die Soundgenerierung wurde entfernt.
+            # Alte Skripte laden weiter, liefern hier aber kein Audio mehr.
             if segment.type == "sfx":
-                if segment.prompt and self.sfx is not None:
-                    fingerprint = self._segment_fingerprint(
-                        segment=segment,
-                        options=options,
-                        user_id=resolved_user_id,
-                        kind="sfx",
-                        text=segment.prompt,
-                        voice=None,
-                    )
-                    if self._segment_output_is_current(output_path, fingerprint):
-                        results[idx] = SynthesisResult(
-                            segment=segment,
-                            file_path=output_path,
-                            duration=await self.get_audio_duration(output_path),
-                        )
-                        completed += 1
-                        return
-                    if output_path.exists():
-                        try:
-                            output_path.unlink()
-                        except OSError:
-                            pass
-                    try:
-                        duration = await self.sfx.generate_to_file(
-                            prompt=segment.prompt,
-                            duration_s=max(1.0, (segment.duration_ms or 4000) / 1000.0),
-                            output_path=output_path,
-                            output_format=options.output_format,
-                            user_id=resolved_user_id,
-                        )
-                        results[idx] = SynthesisResult(
-                            segment=segment, file_path=output_path, duration=duration
-                        )
-                        await self._write_segment_manifest(output_path, fingerprint)
-                    except Exception as exc:
-                        logger.error("SFX segment %s failed: %s", segment.id, exc)
-                        results[idx] = SynthesisResult(segment=segment, file_path=None, duration=0.0)
-                    completed += 1
-                    return
-
-                # Legacy bracketed-tag SFX (e.g. [lacht] → laugh.mp3)
-                sfx_file = self._resolve_sfx(segment.text)
-                if sfx_file and sfx_file.exists():
-                    results[idx] = SynthesisResult(
-                        segment=segment,
-                        file_path=sfx_file,
-                        duration=await self.get_audio_duration(sfx_file),
-                    )
-                    completed += 1
-                    return
-                # fall through → treat as speech
+                results[idx] = SynthesisResult(segment=segment, file_path=None, duration=0.0)
+                completed += 1
+                return
 
             voice = (
                 segment.voice
@@ -662,7 +580,7 @@ class AudioAssembler:
         # avoids unloading a model while direct podcast TTS requests are active.
         generated_overlay_indices = [
             i for i, seg in enumerate(segments)
-            if seg.type == "music" or (seg.type == "sfx" and seg.prompt and self.sfx is not None)
+            if seg.type == "music"
         ]
         generated_overlay_set = set(generated_overlay_indices)
         foreground_indices = [
@@ -820,14 +738,6 @@ class AudioAssembler:
         assert last_err is not None
         raise last_err
 
-    def _resolve_sfx(self, text: str) -> Path | None:
-        for tag, filename in _SFX_MAP.items():
-            if tag in text:
-                return self.sfx_dir / filename
-        return None
-
-    # --- Combination ---------------------------------------------------------
-
     async def _combine_segments(
         self,
         synthesized: list[SynthesisResult],
@@ -837,8 +747,8 @@ class AudioAssembler:
     ) -> Path:
         """Mix all segments onto a single timeline.
 
-        Foreground (speech/reaction/pause/sfx-fallback) advance the cursor;
-        overlays (music, prompted sfx) sit on top without consuming time.
+        Foreground (speech/reaction/pause) advance the cursor;
+        overlays (music) sit on top without consuming time.
         Per-segment ``overlap_ms`` lets a foreground segment start before the
         previous one ends (interruption) or force a fixed gap.
         """
@@ -882,7 +792,7 @@ class AudioAssembler:
 
             for item in synthesized:
                 seg = item.segment
-                is_overlay = seg.type == "music" or (seg.type == "sfx" and seg.prompt)
+                is_overlay = seg.type == "music"
 
                 if seg.type == "pause":
                     pause_s = _extract_pause_duration(seg)
@@ -1059,9 +969,13 @@ class AudioAssembler:
         except Exception as exc:
             logger.warning("ffprobe error for %s: %s", path, exc)
 
-        # Fallback: rough MP3 estimate at 192 kbps
+        # Fallback: rough MP3 estimate at 192 kbps. Files under 1 KB are
+        # header-only (the engine produced no audio for e.g. "Hmm") and count
+        # as silent rather than as a bogus fraction of a second.
         try:
             size = path.stat().st_size
+            if size < 1024:
+                return 0.0
             return (size / 192000) * 8
         except OSError:
             return 0.0

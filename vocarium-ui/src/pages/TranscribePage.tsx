@@ -1,11 +1,60 @@
-import { useState, useRef, useCallback } from 'react';
+import { useMemo, useRef, useState, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { transcribe } from '../api';
+import type { TranscriptionResult } from '../api';
 import AudioPlayer from '../components/AudioPlayer';
 import { useAudio } from '../hooks/useAudio';
 import WaveformBars from '../components/WaveformBars';
 
 type InputMode = 'file' | 'url' | 'mic';
+
+/**
+ * Die beiden Whisper-Profile, die der Worker tatsächlich kennt.
+ *
+ * `swiss` ist bewusst nicht die Vorgabe: das Flix-Finetune übersetzt sauberes
+ * Hochdeutsch gelegentlich nach Englisch, obwohl `language=de` und
+ * `task=transcribe` gesetzt sind. Für Mundart ist es trotzdem klar besser.
+ */
+const PROFILES = [
+  { id: 'german', label: 'Standard', hint: 'large-v3' },
+  { id: 'swiss', label: 'Mundart', hint: 'Flix-Finetune' },
+] as const;
+
+const LANGUAGES = [
+  { id: '', label: 'Deutsch', hint: 'fest' },
+  { id: 'auto', label: 'Automatisch', hint: 'erkennen' },
+] as const;
+
+function formatTimestamp(seconds: number): string {
+  const total = Math.max(0, Math.floor(seconds));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  return h > 0
+    ? `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`
+    : `${m}:${s.toString().padStart(2, '0')}`;
+}
+
+/** SRT-Zeitcode: `00:01:02,500` — Komma statt Punkt, das ist im Format so. */
+function srtTime(seconds: number): string {
+  const ms = Math.max(0, Math.round(seconds * 1000));
+  const h = Math.floor(ms / 3_600_000);
+  const m = Math.floor((ms % 3_600_000) / 60_000);
+  const s = Math.floor((ms % 60_000) / 1000);
+  const rest = ms % 1000;
+  return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s
+    .toString()
+    .padStart(2, '0')},${rest.toString().padStart(3, '0')}`;
+}
+
+function download(name: string, content: string) {
+  const url = URL.createObjectURL(new Blob([content], { type: 'text/plain;charset=utf-8' }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(url);
+}
 
 export default function TranscribePage() {
   const audio = useAudio();
@@ -14,11 +63,14 @@ export default function TranscribePage() {
   const [mode, setMode] = useState<InputMode>('file');
   const [file, setFile] = useState<File | null>(null);
   const [url, setUrl] = useState('');
+  const [profile, setProfile] = useState<string>('german');
+  const [language, setLanguage] = useState<string>('');
   const [dragging, setDragging] = useState(false);
   const [transcribing, setTranscribing] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [result, setResult] = useState<string | null>(null);
+  const [result, setResult] = useState<TranscriptionResult | null>(null);
   const [copied, setCopied] = useState(false);
+  const [withTimes, setWithTimes] = useState(true);
 
   const [recording, setRecording] = useState(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -31,13 +83,6 @@ export default function TranscribePage() {
     audio.play(f, 'preview');
   }, [audio]);
 
-  const handleDrop = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    setDragging(false);
-    const f = e.dataTransfer.files[0];
-    if (f) handleFile(f);
-  }, [handleFile]);
-
   const handleRecord = async () => {
     if (recording) {
       mediaRecorderRef.current?.stop();
@@ -49,619 +94,392 @@ export default function TranscribePage() {
       const recorder = new MediaRecorder(stream);
       mediaRecorderRef.current = recorder;
       chunksRef.current = [];
-
-      recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) chunksRef.current.push(e.data);
-      };
+      recorder.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data); };
       recorder.onstop = () => {
         const blob = new Blob(chunksRef.current, { type: 'audio/webm' });
-        const f = new File([blob], 'recording.webm', { type: 'audio/webm' });
-        setMode('file');
-        handleFile(f);
+        handleFile(new File([blob], 'aufnahme.webm', { type: 'audio/webm' }));
         stream.getTracks().forEach((t) => t.stop());
       };
       recorder.start();
       setRecording(true);
     } catch {
-      setError('Microphone access denied');
+      setError('Kein Zugriff auf das Mikrofon.');
     }
   };
 
-  const handleTranscribe = async () => {
+  const canRun = mode === 'url' ? url.trim().length > 0 : !!file;
+
+  const run = async () => {
     setTranscribing(true);
     setError(null);
     setResult(null);
-
     try {
-      let res: { text: string };
-      if (mode === 'url' && url.trim()) {
-        res = await transcribe({ url: url.trim() });
-      } else if (file) {
-        res = await transcribe({ file });
-      } else {
-        setError('No input provided');
-        setTranscribing(false);
-        return;
-      }
-      setResult(res.text);
+      const opts = { model: profile, language };
+      if (mode === 'url' && url.trim()) setResult(await transcribe({ url: url.trim(), ...opts }));
+      else if (file) setResult(await transcribe({ file, ...opts }));
+      else setError('Es fehlt eine Datei oder ein Link.');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Transcription failed');
+      setError(err instanceof Error ? err.message : 'Transkription fehlgeschlagen');
     }
     setTranscribing(false);
   };
 
-  const handleCopy = () => {
-    if (!result) return;
-    navigator.clipboard.writeText(result);
+  const plain = useMemo(() => (result?.segments.length ? result.segments.map((s) => s.text.trim()).join(' ') : result?.text ?? ''), [result]);
+
+  const timed = useMemo(() => {
+    if (!result?.segments.length) return plain;
+    return result.segments
+      .map((s) => `[${formatTimestamp(s.start)} – ${formatTimestamp(s.end)}] ${s.text.trim()}`)
+      .join('\n');
+  }, [result, plain]);
+
+  const copy = () => {
+    navigator.clipboard.writeText(withTimes ? timed : plain);
     setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    setTimeout(() => setCopied(false), 1800);
   };
 
-  const canTranscribe = mode === 'url' ? url.trim().length > 0 : !!file;
+  const saveSrt = () => {
+    if (!result?.segments.length) return;
+    const srt = result.segments
+      .map((s, i) => `${i + 1}\n${srtTime(s.start)} --> ${srtTime(s.end)}\n${s.text.trim()}\n`)
+      .join('\n');
+    download('transkript.srt', srt);
+  };
 
-  const modeButtons: { key: InputMode; label: string; icon: JSX.Element }[] = [
-    {
-      key: 'file',
-      label: 'File Upload',
-      icon: (
-        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-          <path d="M8 2v8M4 6l4-4 4 4" />
-          <path d="M2 11v2a1 1 0 001 1h10a1 1 0 001-1v-2" />
-        </svg>
-      ),
-    },
-    {
-      key: 'url',
-      label: 'Media URL',
-      icon: (
-        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-          <path d="M6.5 5l3 3-3 3" />
-          <rect x="1" y="2" width="14" height="12" rx="2" />
-        </svg>
-      ),
-    },
-    {
-      key: 'mic',
-      label: 'Microphone',
-      icon: (
-        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-          <rect x="5" y="1" width="6" height="9" rx="3" />
-          <path d="M2 7a6 6 0 0012 0M8 13v2" />
-        </svg>
-      ),
-    },
+  const baseName = file ? file.name.replace(/\.[^.]+$/, '') : 'transkript';
+
+  /* Ein Klick auf ein Segment springt in der Vorschau an diese Stelle — nur
+     sinnvoll, solange die Quelle noch geladen ist und ihre Länge kennt. */
+  const jumpTo = (seconds: number) => {
+    if (!audio.duration) return;
+    audio.seek(Math.min(0.999, seconds / audio.duration));
+  };
+
+  const modes: { key: InputMode; label: string; icon: JSX.Element }[] = [
+    { key: 'file', label: 'Datei', icon: (
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M8 2v8M4 6l4-4 4 4" /><path d="M2 11v2a1 1 0 001 1h10a1 1 0 001-1v-2" />
+      </svg>) },
+    { key: 'url', label: 'Link', icon: (
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M6.5 5l3 3-3 3" /><rect x="1" y="2" width="14" height="12" rx="2" />
+      </svg>) },
+    { key: 'mic', label: 'Mikrofon', icon: (
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+        <rect x="5" y="1" width="6" height="9" rx="3" /><path d="M2 7a6 6 0 0012 0M8 13v2" />
+      </svg>) },
   ];
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: '22px', maxWidth: '820px' }}>
-      {/* Intro strip */}
-      <div
-        className="card-subtle"
-        style={{
-          padding: '14px 18px',
-          display: 'flex',
-          alignItems: 'center',
-          gap: '12px',
-          flexWrap: 'wrap',
-        }}
-      >
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: '8px',
-            padding: '5px 10px',
-            borderRadius: '999px',
-            background: 'rgba(123,97,255,0.08)',
-            border: '1px solid rgba(123,97,255,0.22)',
-            fontSize: '10.5px',
-            fontFamily: 'var(--font-mono)',
-            color: 'var(--color-accent)',
-            textTransform: 'uppercase',
-            letterSpacing: 0,
-          }}
-        >
-          <span
-            style={{
-              width: '6px',
-              height: '6px',
-              borderRadius: '50%',
-              background: 'var(--color-accent)',
-              boxShadow: '0 0 8px rgba(123,97,255,0.7)',
-            }}
-          />
-          Qwen3-ASR · lazy-load
+    <div className="tx-page">
+      <header className="speech-header">
+        <div>
+          <h1 style={{ fontSize: '26px', marginBottom: '4px' }}>Transkription</h1>
+          <p style={{ fontSize: '13.5px', color: 'var(--color-text-secondary)', lineHeight: 1.5 }}>
+            Audio, Video oder ein YouTube-Link werden zu Text mit Zeitmarken.
+          </p>
         </div>
-        <p style={{ fontSize: '12.5px', color: 'var(--color-text-secondary)', margin: 0 }}>
-          Transcribe audio, video, or web media. Auto-unloads after idle to free the TTS GPU.
-        </p>
-      </div>
+        <div className="speech-route-pill" title="Whisper lädt beim ersten Auftrag und gibt die GPU nach fünf Minuten Leerlauf wieder frei">
+          <span className="status-dot status-dot-online" />
+          <span>Whisper large-v3</span>
+        </div>
+      </header>
 
-      {/* Mode selector */}
-      <div style={{ display: 'flex', gap: '8px' }}>
-        {modeButtons.map((m) => {
-          const active = mode === m.key;
-          return (
-            <motion.button
-              key={m.key}
-              whileTap={{ scale: 0.97 }}
-              onClick={() => { setMode(m.key); setError(null); }}
-              style={{
-                flex: 1,
-                padding: '11px 12px',
-                fontSize: '13px',
-                fontWeight: 500,
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                gap: '8px',
-                borderRadius: '12px',
-                cursor: 'pointer',
-                transition: 'background 0.2s, border-color 0.2s, color 0.2s',
-                background: active ? 'rgba(123,97,255,0.14)' : 'rgba(255,255,255,0.03)',
-                border: `1px solid ${active ? 'rgba(123,97,255,0.38)' : 'rgba(255,255,255,0.08)'}`,
-                color: active ? 'var(--color-text)' : 'var(--color-text-secondary)',
-              }}
-            >
-              <span style={{ color: active ? 'var(--color-accent)' : 'var(--color-text-dim)' }}>{m.icon}</span>
-              {m.label}
-            </motion.button>
-          );
-        })}
-      </div>
-
-      {/* Input area */}
-      <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-        {mode === 'file' && (
-          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
-            <motion.div
-              onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
-              onDragLeave={() => setDragging(false)}
-              onDrop={handleDrop}
-              onClick={() => fileInputRef.current?.click()}
-              animate={{
-                borderColor: dragging
-                  ? 'rgba(123, 97, 255, 0.55)'
-                  : file
-                    ? 'rgba(123, 97, 255, 0.28)'
-                    : 'rgba(255, 255, 255, 0.1)',
-              }}
-              transition={{ duration: 0.2 }}
-              className="card-subtle"
-              style={{
-                cursor: 'pointer',
-                padding: '36px',
-                display: 'flex',
-                flexDirection: 'column',
-                alignItems: 'center',
-                justifyContent: 'center',
-                textAlign: 'center',
-                borderStyle: 'dashed',
-                borderWidth: '1.5px',
-                minHeight: '190px',
-                background: dragging
-                  ? 'rgba(123,97,255,0.06)'
-                  : file
-                    ? 'rgba(123,97,255,0.03)'
-                    : 'rgba(255,255,255,0.015)',
-              }}
-            >
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept="audio/*,video/*,.mp4,.mkv,.avi,.mov,.webm,.flv,.wav,.mp3,.flac,.ogg,.m4a"
-                style={{ display: 'none' }}
-                onChange={(e) => { const f = e.target.files?.[0]; if (f) handleFile(f); }}
-              />
-
-              {file ? (
-                <motion.div
-                  initial={{ opacity: 0, scale: 0.96 }}
-                  animate={{ opacity: 1, scale: 1 }}
-                  transition={{ duration: 0.25, ease: [0.25, 0.46, 0.45, 0.94] }}
-                  style={{ display: 'flex', flexDirection: 'column', gap: '14px', width: '100%', alignItems: 'center' }}
+      <div className="tx-work">
+        {/* Quelle und Einstellungen leben in einem Panel — die Modellwahl
+            verändert das Ergebnis und gehört sichtbar neben die Datei. */}
+        <aside className="card tx-panel">
+          <div className="tx-sec">
+            <div className="tx-modes">
+              {modes.map((m) => (
+                <button
+                  key={m.key}
+                  type="button"
+                  onClick={() => { setMode(m.key); setError(null); }}
+                  className={`tx-mode${mode === m.key ? ' tx-mode-active' : ''}`}
                 >
-                  <WaveformBars active={audio.playing} size="md" bars={14} color="accent" />
-                  <div style={{ textAlign: 'center' }}>
-                    <p
-                      style={{
-                        fontSize: '14px',
-                        fontWeight: 600,
-                        fontFamily: 'var(--font-display)',
-                        letterSpacing: 0,
-                        color: 'var(--color-text)',
-                        overflow: 'hidden',
-                        textOverflow: 'ellipsis',
-                        whiteSpace: 'nowrap',
-                        maxWidth: '420px',
-                        margin: 0,
-                      }}
-                    >
-                      {file.name}
-                    </p>
-                    <p
-                      style={{
-                        fontSize: '11px',
-                        fontFamily: 'var(--font-mono)',
-                        color: 'var(--color-text-dim)',
-                        marginTop: '4px',
-                        letterSpacing: 0,
-                      }}
-                    >
-                      {(file.size / (1024 * 1024)).toFixed(1)} MB
-                    </p>
-                  </div>
-                  <div style={{ width: '100%', maxWidth: '520px' }}>
+                  <span className="tx-mode-icon">{m.icon}</span>
+                  {m.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="tx-sec tx-sec-input">
+            {mode === 'file' && (
+              <div
+                onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
+                onDragLeave={() => setDragging(false)}
+                onDrop={(e) => { e.preventDefault(); setDragging(false); const f = e.dataTransfer.files[0]; if (f) handleFile(f); }}
+                onClick={() => !file && fileInputRef.current?.click()}
+                className={`tx-drop${dragging ? ' tx-drop-over' : ''}${file ? ' tx-drop-filled' : ''}`}
+              >
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="audio/*,video/*,.mp4,.mkv,.avi,.mov,.webm,.flv,.wav,.mp3,.flac,.ogg,.m4a"
+                  style={{ display: 'none' }}
+                  onChange={(e) => { const f = e.target.files?.[0]; if (f) handleFile(f); }}
+                />
+                {file ? (
+                  <div className="tx-file">
+                    <div className="tx-file-head">
+                      <WaveformBars active={audio.playing} size="sm" bars={8} color="accent" />
+                      <div className="tx-file-name">
+                        <span>{file.name}</span>
+                        <span className="tx-file-size">{(file.size / (1024 * 1024)).toFixed(1)} MB</span>
+                      </div>
+                      <button
+                        type="button"
+                        className="tx-file-drop"
+                        onClick={(e) => { e.stopPropagation(); setFile(null); audio.stop(); setResult(null); }}
+                        aria-label="Datei entfernen"
+                      >
+                        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
+                          <path d="M4 4l8 8M12 4l-8 8" />
+                        </svg>
+                      </button>
+                    </div>
                     <AudioPlayer
                       playing={audio.playing}
                       progress={audio.progress}
                       duration={audio.duration}
                       onToggle={audio.toggle}
                       onSeek={audio.seek}
+                      compact
                     />
                   </div>
+                ) : (
+                  <>
+                    <svg width="26" height="26" viewBox="0 0 44 44" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" style={{ opacity: 0.4 }}>
+                      <path d="M22 5v22M14 13l8-8 8 8" /><path d="M5 28v7a4 4 0 004 4h26a4 4 0 004-4v-7" />
+                    </svg>
+                    <p className="tx-drop-title">Datei hierher ziehen</p>
+                    <p className="tx-drop-hint">oder klicken — Audio und Video</p>
+                  </>
+                )}
+              </div>
+            )}
+
+            {mode === 'url' && (
+              <div className="tx-url">
+                <input
+                  type="text"
+                  value={url}
+                  onChange={(e) => { setUrl(e.target.value); setError(null); setResult(null); }}
+                  className="input-field"
+                  style={{ fontFamily: 'var(--font-mono)', fontSize: '12.5px' }}
+                  placeholder="https://www.youtube.com/watch?v=…"
+                />
+                <p className="tx-drop-hint">YouTube und Vimeo. Der Ton wird auf dem Server geholt und umgewandelt.</p>
+              </div>
+            )}
+
+            {mode === 'mic' && (
+              <div className="tx-mic">
+                <div className="tx-mic-ring">
+                  {recording && (
+                    <motion.span
+                      aria-hidden
+                      initial={{ opacity: 0.5, scale: 1 }}
+                      animate={{ opacity: 0, scale: 1.8 }}
+                      transition={{ duration: 1.6, repeat: Infinity, ease: 'easeOut' }}
+                      className="tx-mic-pulse"
+                    />
+                  )}
                   <button
-                    onClick={(e) => { e.stopPropagation(); setFile(null); audio.stop(); setResult(null); }}
-                    style={{
-                      fontSize: '12px',
-                      color: 'var(--color-text-dim)',
-                      background: 'transparent',
-                      border: 'none',
-                      cursor: 'pointer',
-                      transition: 'color 0.2s',
-                      letterSpacing: 0,
-                    }}
-                    onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--color-danger)'; }}
-                    onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--color-text-dim)'; }}
+                    type="button"
+                    onClick={handleRecord}
+                    aria-label={recording ? 'Aufnahme beenden' : 'Aufnahme starten'}
+                    className={`tx-mic-btn${recording ? ' tx-mic-btn-rec' : ''}`}
                   >
-                    Remove file
+                    {recording ? (
+                      <svg width="20" height="20" viewBox="0 0 32 32" fill="currentColor"><rect x="9" y="9" width="14" height="14" rx="3" /></svg>
+                    ) : (
+                      <svg width="24" height="24" viewBox="0 0 36 36" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                        <rect x="12" y="4" width="12" height="18" rx="6" /><path d="M6 16a12 12 0 0024 0M18 28v4" />
+                      </svg>
+                    )}
                   </button>
+                </div>
+                <p className={`tx-mic-label${recording ? ' tx-mic-label-rec' : ''}`}>
+                  {recording ? 'Nimmt auf — zum Beenden klicken' : 'Klicken und sprechen'}
+                </p>
+                {file && !recording && (
+                  <AudioPlayer
+                    playing={audio.playing}
+                    progress={audio.progress}
+                    duration={audio.duration}
+                    onToggle={audio.toggle}
+                    onSeek={audio.seek}
+                    compact
+                  />
+                )}
+              </div>
+            )}
+          </div>
+
+          <div className="tx-sec">
+            <span className="tx-sec-label">Modell</span>
+            <div className="tx-choice">
+              {PROFILES.map((p) => (
+                <button
+                  key={p.id}
+                  type="button"
+                  onClick={() => setProfile(p.id)}
+                  className={`tx-choice-btn${profile === p.id ? ' tx-choice-on' : ''}`}
+                >
+                  <span className="tx-choice-label">{p.label}</span>
+                  <span className="tx-choice-hint">{p.hint}</span>
+                </button>
+              ))}
+            </div>
+            <AnimatePresence>
+              {profile === 'swiss' && (
+                <motion.p
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: 'auto' }}
+                  exit={{ opacity: 0, height: 0 }}
+                  transition={{ duration: 0.2 }}
+                  className="tx-warn"
+                >
+                  Bei sauberem Hochdeutsch kippt dieses Modell manchmal ins Englische — nur für Mundart nehmen.
+                </motion.p>
+              )}
+            </AnimatePresence>
+          </div>
+
+          <div className="tx-sec">
+            <span className="tx-sec-label">Sprache</span>
+            <div className="tx-choice">
+              {LANGUAGES.map((l) => (
+                <button
+                  key={l.id || 'de'}
+                  type="button"
+                  onClick={() => setLanguage(l.id)}
+                  className={`tx-choice-btn${language === l.id ? ' tx-choice-on' : ''}`}
+                >
+                  <span className="tx-choice-label">{l.label}</span>
+                  <span className="tx-choice-hint">{l.hint}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="tx-foot">
+            <AnimatePresence>
+              {error && (
+                <motion.div
+                  initial={{ opacity: 0, y: -4 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -4 }}
+                  transition={{ duration: 0.18 }}
+                  className="tx-error"
+                >
+                  {error}
                 </motion.div>
+              )}
+            </AnimatePresence>
+            <button
+              type="button"
+              onClick={run}
+              disabled={transcribing || !canRun}
+              className="btn btn-primary tx-submit"
+            >
+              {transcribing ? (
+                <>
+                  <motion.span animate={{ rotate: 360 }} transition={{ duration: 0.9, repeat: Infinity, ease: 'linear' }} style={{ lineHeight: 0 }}>
+                    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round"><path d="M8 1a7 7 0 106 3.5" /></svg>
+                  </motion.span>
+                  Transkribiere…
+                </>
+              ) : 'Transkribieren'}
+            </button>
+          </div>
+        </aside>
+
+        {/* Das Transkript ist der eigentliche Zweck der Seite und bekommt
+            deshalb dauerhaft die grosse Fläche, auch wenn es noch leer ist. */}
+        <section className="card tx-out">
+          {result === null ? (
+            <div className="tx-out-empty">
+              {transcribing ? (
+                <>
+                  <WaveformBars active size="lg" bars={14} color="accent" />
+                  <p className="tx-out-empty-title">Whisper hört zu…</p>
+                  <p className="tx-out-empty-hint">
+                    Nach längerer Pause lädt das Modell zuerst auf die GPU — der erste Lauf dauert dann etwas.
+                  </p>
+                </>
               ) : (
                 <>
-                  <motion.div
-                    style={{ marginBottom: '14px', color: dragging ? 'var(--color-accent)' : 'var(--color-text-dim)' }}
-                    animate={{ y: [0, -4, 0] }}
-                    transition={{ duration: 2, repeat: Infinity, ease: 'easeInOut' }}
-                  >
-                    <svg width="42" height="42" viewBox="0 0 44 44" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                      <path d="M22 5v22M14 13l8-8 8 8" />
-                      <path d="M5 28v7a4 4 0 004 4h26a4 4 0 004-4v-7" />
-                    </svg>
-                  </motion.div>
-                  <p
-                    style={{
-                      fontSize: '14.5px',
-                      fontWeight: 600,
-                      fontFamily: 'var(--font-display)',
-                      letterSpacing: 0,
-                      color: 'var(--color-text)',
-                      marginBottom: '6px',
-                    }}
-                  >
-                    Drop audio or video here
-                  </p>
-                  <p style={{ fontSize: '12px', color: 'var(--color-text-dim)', letterSpacing: 0 }}>
-                    WAV · MP3 · FLAC · MP4 · MKV · WEBM · and more
+                  <svg width="34" height="34" viewBox="0 0 32 32" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" style={{ opacity: 0.3 }}>
+                    <path d="M6 10h20M6 16h20M6 22h12" />
+                  </svg>
+                  <p className="tx-out-empty-title">Noch kein Transkript</p>
+                  <p className="tx-out-empty-hint">
+                    Quelle links wählen und transkribieren. Das Ergebnis erscheint hier mit Zeitmarken;
+                    ein Klick auf eine Zeile springt in der Vorschau an die Stelle.
                   </p>
                 </>
               )}
-            </motion.div>
-          </motion.div>
-        )}
-
-        {mode === 'url' && (
-          <motion.div
-            initial={{ opacity: 0, y: 4 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.2 }}
-            style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}
-          >
-            <label className="label-eyebrow" style={{ fontSize: '10.5px' }}>Media URL</label>
-            <input
-              type="text"
-              value={url}
-              onChange={(e) => { setUrl(e.target.value); setError(null); setResult(null); }}
-              className="input-field"
-              style={{
-                padding: '14px 16px',
-                fontSize: '14px',
-                fontFamily: 'var(--font-mono)',
-                letterSpacing: 0,
-              }}
-              placeholder="https://www.youtube.com/watch?v=..."
-            />
-            <p style={{ fontSize: '11px', color: 'var(--color-text-dim)', letterSpacing: 0 }}>
-              Supports YouTube, Vimeo, and most streams via yt-dlp.
-            </p>
-          </motion.div>
-        )}
-
-        {mode === 'mic' && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            className="card-subtle"
-            style={{
-              display: 'flex',
-              flexDirection: 'column',
-              alignItems: 'center',
-              gap: '20px',
-              padding: '42px 24px',
-            }}
-          >
-            {/* Pulse halo when recording */}
-            <div style={{ position: 'relative', width: '112px', height: '112px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-              {recording && (
-                <motion.span
-                  aria-hidden
-                  initial={{ opacity: 0.55, scale: 1 }}
-                  animate={{ opacity: 0, scale: 1.8 }}
-                  transition={{ duration: 1.6, repeat: Infinity, ease: 'easeOut' }}
-                  style={{
-                    position: 'absolute',
-                    inset: 0,
-                    borderRadius: '50%',
-                    background: 'radial-gradient(circle, rgba(255,90,101,0.45), transparent 60%)',
-                    pointerEvents: 'none',
-                  }}
-                />
-              )}
-              <motion.button
-                whileTap={{ scale: 0.94 }}
-                whileHover={{ scale: 1.04 }}
-                transition={{ type: 'spring', stiffness: 300, damping: 22 }}
-                onClick={handleRecord}
-                aria-label={recording ? 'Stop recording' : 'Start recording'}
-                style={{
-                  width: '96px',
-                  height: '96px',
-                  borderRadius: '50%',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  cursor: 'pointer',
-                  position: 'relative',
-                  background: recording
-                    ? 'linear-gradient(135deg, rgba(255,90,101,0.9), rgba(255,77,120,0.75))'
-                    : 'linear-gradient(135deg, rgba(123,97,255,0.9), rgba(255,77,210,0.7))',
-                  border: `1px solid ${recording ? 'rgba(255,120,130,0.35)' : 'rgba(255,255,255,0.2)'}`,
-                  color: '#fff',
-                  boxShadow: recording
-                    ? '0 10px 34px rgba(255,90,101,0.4), inset 0 1px 0 rgba(255,255,255,0.2)'
-                    : '0 10px 34px rgba(123,97,255,0.35), inset 0 1px 0 rgba(255,255,255,0.22)',
-                }}
-              >
-                {recording ? (
-                  <svg width="28" height="28" viewBox="0 0 32 32" fill="currentColor">
-                    <rect x="9" y="9" width="14" height="14" rx="3" />
-                  </svg>
-                ) : (
-                  <svg width="34" height="34" viewBox="0 0 36 36" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                    <rect x="12" y="4" width="12" height="18" rx="6" />
-                    <path d="M6 16a12 12 0 0024 0M18 28v4" />
-                  </svg>
-                )}
-              </motion.button>
             </div>
-            <p
-              style={{
-                fontSize: '13.5px',
-                color: recording ? 'var(--color-danger)' : 'var(--color-text-secondary)',
-                fontFamily: 'var(--font-mono)',
-                letterSpacing: 0,
-                margin: 0,
-              }}
+          ) : (
+            <motion.div
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.25, ease: [0.25, 0.46, 0.45, 0.94] }}
+              className="tx-out-full"
             >
-              {recording ? 'Recording · click to stop' : 'Click to start recording'}
-            </p>
-            {file && !recording && (
-              <motion.div
-                initial={{ opacity: 0, y: 4 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ duration: 0.25 }}
-                style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px', width: '100%', maxWidth: '440px' }}
-              >
-                <WaveformBars active={audio.playing} size="sm" bars={12} color="accent" />
-                <p style={{ fontSize: '12px', color: 'var(--color-accent)', fontFamily: 'var(--font-mono)', letterSpacing: 0 }}>
-                  Recording ready
-                </p>
-                <AudioPlayer
-                  playing={audio.playing}
-                  progress={audio.progress}
-                  duration={audio.duration}
-                  onToggle={audio.toggle}
-                  onSeek={audio.seek}
-                />
-              </motion.div>
-            )}
-          </motion.div>
-        )}
-      </div>
-
-      {/* Error */}
-      <AnimatePresence>
-        {error && (
-          <motion.div
-            initial={{ opacity: 0, y: -4 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -4 }}
-            transition={{ duration: 0.2 }}
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: '10px',
-              padding: '12px 16px',
-              borderRadius: '12px',
-              background: 'rgba(255,90,101,0.08)',
-              border: '1px solid rgba(255,90,101,0.22)',
-              fontSize: '13px',
-              color: 'var(--color-danger)',
-            }}
-          >
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-              <circle cx="8" cy="8" r="6" />
-              <path d="M8 5.5v3M8 10.5h.01" />
-            </svg>
-            {error}
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      {/* Transcribe button */}
-      <motion.button
-        whileTap={{ scale: 0.98 }}
-        whileHover={canTranscribe && !transcribing ? { scale: 1.01 } : undefined}
-        transition={{ type: 'spring', stiffness: 300, damping: 22 }}
-        onClick={handleTranscribe}
-        disabled={transcribing || !canTranscribe}
-        className="btn btn-primary"
-        style={{
-          width: '100%',
-          padding: '14px 0',
-          fontSize: '14px',
-          fontWeight: 600,
-          letterSpacing: 0,
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          gap: '10px',
-          opacity: transcribing || !canTranscribe ? 0.5 : 1,
-          cursor: transcribing || !canTranscribe ? 'not-allowed' : 'pointer',
-        }}
-      >
-        {transcribing ? (
-          <>
-            <motion.div animate={{ rotate: 360 }} transition={{ duration: 0.9, repeat: Infinity, ease: 'linear' }}>
-              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round">
-                <path d="M8 1a7 7 0 106 3.5" />
-              </svg>
-            </motion.div>
-            Transcribing
-          </>
-        ) : (
-          <>
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M2 4h10M2 8h8M2 12h6" />
-              <circle cx="13" cy="11" r="2" />
-              <path d="M14.5 12.5L16 14" />
-            </svg>
-            Transcribe
-          </>
-        )}
-      </motion.button>
-
-      {/* Result */}
-      <AnimatePresence>
-        {result !== null && (
-          <motion.div
-            initial={{ opacity: 0, y: 12 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: 8 }}
-            transition={{ duration: 0.3, ease: [0.25, 0.46, 0.45, 0.94] }}
-            className="card"
-            style={{
-              display: 'flex',
-              flexDirection: 'column',
-              gap: '14px',
-              padding: '22px',
-            }}
-          >
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                <span
-                  style={{
-                    width: '28px',
-                    height: '28px',
-                    borderRadius: '8px',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    background: 'linear-gradient(135deg, rgba(123,97,255,0.22), rgba(74,222,128,0.18))',
-                    border: '1px solid rgba(123,97,255,0.25)',
-                    color: 'var(--color-accent)',
-                  }}
-                >
-                  <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M3 3h10v10H3z" />
-                    <path d="M5.5 6h5M5.5 8.5h4M5.5 11h3" />
-                  </svg>
-                </span>
-                <h3 className="label-eyebrow" style={{ fontSize: '10.5px' }}>
-                  Transcription
-                </h3>
-                <span
-                  style={{
-                    fontSize: '10.5px',
-                    fontFamily: 'var(--font-mono)',
-                    color: 'var(--color-text-dim)',
-                    letterSpacing: 0,
-                  }}
-                >
-                  {result.length} chars
-                </span>
+              <div className="tx-out-head">
+                <div className="tx-out-stats">
+                  <strong>Transkript</strong>
+                  <span>
+                    {result.segments.length || 0} Segmente · {plain.length} Zeichen · {result.language}
+                    {' · '}{result.model === 'swiss' ? 'Mundart' : 'Standard'}
+                  </span>
+                </div>
+                <div className="tx-out-actions">
+                  {result.segments.length > 0 && (
+                    <button type="button" className={`tx-chip${withTimes ? ' tx-chip-on' : ''}`} onClick={() => setWithTimes((v) => !v)}>
+                      Zeitmarken
+                    </button>
+                  )}
+                  <button type="button" className={`tx-chip${copied ? ' tx-chip-ok' : ''}`} onClick={copy}>
+                    {copied ? 'Kopiert' : 'Kopieren'}
+                  </button>
+                  <button type="button" className="tx-chip" onClick={() => download(`${baseName}.txt`, plain)}>TXT</button>
+                  {result.segments.length > 0 && (
+                    <button type="button" className="tx-chip" onClick={saveSrt}>SRT</button>
+                  )}
+                </div>
               </div>
-              <motion.button
-                whileTap={{ scale: 0.96 }}
-                onClick={handleCopy}
-                style={{
-                  padding: '7px 12px',
-                  fontSize: '12px',
-                  fontWeight: 500,
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '6px',
-                  borderRadius: '8px',
-                  cursor: 'pointer',
-                  background: copied ? 'rgba(74,222,128,0.1)' : 'rgba(255,255,255,0.04)',
-                  border: `1px solid ${copied ? 'rgba(74,222,128,0.32)' : 'rgba(255,255,255,0.1)'}`,
-                  color: copied ? 'var(--color-success)' : 'var(--color-text-secondary)',
-                  transition: 'all 0.2s',
-                }}
-              >
-                {copied ? (
-                  <>
-                    <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
-                      <path d="M2 6l3 3 5-5" />
-                    </svg>
-                    Copied
-                  </>
+
+              <div className="tx-out-body">
+                {result.segments.length > 0 ? (
+                  result.segments.map((s, i) => (
+                    <button
+                      key={`${s.start}-${i}`}
+                      type="button"
+                      className="tx-seg"
+                      onClick={() => jumpTo(s.start)}
+                      title={audio.duration ? 'In der Vorschau an diese Stelle springen' : undefined}
+                    >
+                      <span className="tx-seg-time">{formatTimestamp(s.start)}</span>
+                      <span className="tx-seg-text">{s.text.trim()}</span>
+                    </button>
+                  ))
+                ) : plain ? (
+                  <p className="tx-seg-plain">{plain}</p>
                 ) : (
-                  <>
-                    <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                      <rect x="4" y="4" width="7" height="7" rx="1.2" />
-                      <path d="M8 4V2.5A1.5 1.5 0 006.5 1h-4A1.5 1.5 0 001 2.5v4A1.5 1.5 0 002.5 8H4" />
-                    </svg>
-                    Copy
-                  </>
+                  <p className="tx-seg-plain" style={{ color: 'var(--color-text-dim)' }}>Der Ton enthielt keine erkennbare Sprache.</p>
                 )}
-              </motion.button>
-            </div>
-            <div
-              className="glass-subtle"
-              style={{
-                padding: '18px 20px',
-                borderRadius: '14px',
-                fontSize: '14.5px',
-                lineHeight: 1.7,
-                color: 'var(--color-text)',
-                whiteSpace: 'pre-wrap',
-                wordBreak: 'break-word',
-                maxHeight: '440px',
-                overflowY: 'auto',
-                fontFamily: 'var(--font-body)',
-                letterSpacing: 0,
-              }}
-            >
-              {result || (
-                <span style={{ color: 'var(--color-text-dim)', fontStyle: 'italic' }}>
-                  (empty transcription)
-                </span>
-              )}
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
+              </div>
+            </motion.div>
+          )}
+        </section>
+      </div>
     </div>
   );
 }

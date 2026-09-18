@@ -1,0 +1,48 @@
+{
+  "name": "Vocarium",
+  "short_name": "Vocarium",
+  "description": "Hörbücher, Podcasts, Hörspiele und Sprachstudio in vier Arbeitsbereichen",
+  "lang": "de",
+  "categories": [
+    "books",
+    "entertainment",
+    "productivity"
+  ],
+  "start_url": "/audiobooks",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#09090b",
+  "theme_color": "#09090b",
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Hörbücher",
+      "url": "/audiobooks"
+    },
+    {
+      "name": "Podcasts",
+      "url": "/podcast"
+    },
+    {
+      "name": "Hörspiele",
+      "url": "/hoerspiele"
+    },
+    {
+      "name": "Sprachstudio",
+      "url": "/"
+    }
+  ]
+}

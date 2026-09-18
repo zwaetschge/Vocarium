@@ -6,16 +6,16 @@ import sqlite3
 import struct
 import time
 import uuid
-import datetime
 from pathlib import Path
 
 from metrics import observe
 
 _db: sqlite3.Connection | None = None
+_db_path: Path | None = None
 
-# Mirrors BUILTIN_SPEAKERS in qwen3-tts/server.py. Every user gets one saved
-# custom-voice preset per speaker on first creation so hosts/podcasts work
-# without forcing a trip through the Custom page first.
+# Speaker presets of the retired Qwen engine. They are kept so existing rows
+# stay resolvable; with QWEN_TTS_ENABLED=false they are hidden everywhere and
+# legacy hosts were remapped to OmniVoice voices.
 _BUILTIN_SPEAKERS = [
     ("Vivian",   "female", "German"),
     ("Serena",   "female", "German"),
@@ -72,14 +72,33 @@ def _sql_operation(sql: str) -> str:
     return "unknown"
 
 
-def init_db(db_path: Path):
-    global _db
-    _db = sqlite3.connect(
-        str(db_path), check_same_thread=False, factory=InstrumentedConnection
+def _connect_database(
+    db_path: Path,
+    *,
+    row_factory=None,  # type: ignore[no-untyped-def]
+    isolation_level: str | None = "",
+) -> sqlite3.Connection:
+    connection = sqlite3.connect(
+        str(db_path),
+        check_same_thread=False,
+        factory=InstrumentedConnection,
+        isolation_level=isolation_level,
     )
-    _db.execute("PRAGMA journal_mode=WAL")
-    _db.execute("PRAGMA busy_timeout=5000")
-    _db.execute("PRAGMA foreign_keys=ON")
+    try:
+        connection.row_factory = row_factory
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA busy_timeout=5000")
+        connection.execute("PRAGMA foreign_keys=ON")
+        return connection
+    except Exception:
+        connection.close()
+        raise
+
+
+def init_db(db_path: Path):
+    global _db, _db_path
+    _db_path = Path(db_path)
+    _db = _connect_database(_db_path)
 
     _db.executescript("""
         CREATE TABLE IF NOT EXISTS users (
@@ -130,8 +149,7 @@ def init_db(db_path: Path):
             role TEXT NOT NULL DEFAULT 'host',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-            FOREIGN KEY (voice_id) REFERENCES voices(id) ON DELETE SET NULL
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         );
 
         CREATE INDEX IF NOT EXISTS idx_hosts_user_id ON hosts(user_id);
@@ -196,6 +214,121 @@ def init_db(db_path: Path):
         CREATE INDEX IF NOT EXISTS idx_podcast_jobs_podcast_id ON podcast_jobs(podcast_id);
         CREATE INDEX IF NOT EXISTS idx_podcast_jobs_created_at ON podcast_jobs(created_at DESC);
 
+        CREATE TABLE IF NOT EXISTS ab_books (
+            id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            author TEXT DEFAULT '',
+            format TEXT NOT NULL,
+            voice_id TEXT,
+            total_chapters INTEGER DEFAULT 0,
+            created_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS ab_bookmarks (
+            id TEXT PRIMARY KEY,
+            book_id TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            chapter_index INTEGER NOT NULL,
+            segment_index INTEGER NOT NULL,
+            note TEXT DEFAULT '',
+            created_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS library_links (
+            user_id INTEGER NOT NULL,
+            book_id TEXT NOT NULL REFERENCES ab_books(id) ON DELETE CASCADE,
+            project_id TEXT NOT NULL,
+            PRIMARY KEY (user_id, book_id, project_id)
+        );
+        CREATE TABLE IF NOT EXISTS ab_progress (
+            book_id TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            chapter_index INTEGER DEFAULT 0,
+            segment_index INTEGER DEFAULT 0,
+            updated_at TEXT,
+            PRIMARY KEY (book_id, user_id)
+        );
+        CREATE TABLE IF NOT EXISTS ab_collections (
+            id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            color TEXT DEFAULT '#c59f5f',
+            created_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS ab_collection_books (
+            collection_id TEXT NOT NULL,
+            book_id TEXT NOT NULL,
+            PRIMARY KEY (collection_id, book_id)
+        );
+        CREATE TABLE IF NOT EXISTS ab_generation_queue (
+            id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            book_id TEXT NOT NULL,
+            voice_id TEXT NOT NULL,
+            chapter_index INTEGER,
+            priority INTEGER NOT NULL DEFAULT 5,
+            status TEXT NOT NULL DEFAULT 'pending',
+            done INTEGER NOT NULL DEFAULT 0,
+            total INTEGER NOT NULL DEFAULT 0,
+            error TEXT DEFAULT '',
+            created_at TEXT,
+            started_at TEXT,
+            finished_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_ab_queue_status ON ab_generation_queue(status, priority, created_at);
+        CREATE TABLE IF NOT EXISTS ab_user_prefs (
+            user_id INTEGER PRIMARY KEY,
+            prefs TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS user_settings (
+            user_id INTEGER NOT NULL,
+            namespace TEXT NOT NULL,
+            prefs TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT,
+            PRIMARY KEY (user_id, namespace)
+        );
+        CREATE TABLE IF NOT EXISTS ab_store_ratings (
+            store_book_id TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            rating INTEGER NOT NULL,
+            created_at TEXT,
+            PRIMARY KEY (store_book_id, user_id)
+        );
+        CREATE TABLE IF NOT EXISTS ab_ambience (
+            id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            created_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS ab_store_books (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            author TEXT DEFAULT '',
+            genre TEXT DEFAULT '',
+            format TEXT NOT NULL,
+            total_chapters INTEGER DEFAULT 0,
+            added_by INTEGER NOT NULL,
+            created_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS ab_listening_sessions (
+            id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            book_id TEXT NOT NULL,
+            started_at TEXT,
+            ended_at TEXT,
+            duration_ms INTEGER NOT NULL DEFAULT 0,
+            segments_played INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_ab_sessions_user ON ab_listening_sessions(user_id, started_at);
+        CREATE TABLE IF NOT EXISTS ab_pronunciation_rules (
+            id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            original TEXT NOT NULL,
+            replacement TEXT NOT NULL,
+            language TEXT DEFAULT 'German',
+            created_at TEXT
+        );
         CREATE TABLE IF NOT EXISTS podcast_sources (
             id TEXT PRIMARY KEY,
             podcast_id TEXT NOT NULL,
@@ -309,6 +442,23 @@ def init_db(db_path: Path):
         _db.execute("ALTER TABLE podcasts ADD COLUMN audio_size INTEGER NOT NULL DEFAULT 0")
     if "audio_sha256" not in podcast_cols:
         _db.execute("ALTER TABLE podcasts ADD COLUMN audio_sha256 TEXT NOT NULL DEFAULT ''")
+    podcast_cols = {row[1] for row in _db.execute("PRAGMA table_info(podcasts)").fetchall()}
+    if "audio_revision" not in podcast_cols:
+        _db.execute("ALTER TABLE podcasts ADD COLUMN audio_revision TEXT NOT NULL DEFAULT ''")
+    progress_cols = {row[1] for row in _db.execute("PRAGMA table_info(ab_progress)").fetchall()}
+    if "completed" not in progress_cols:
+        _db.execute("ALTER TABLE ab_progress ADD COLUMN completed INTEGER NOT NULL DEFAULT 0")
+    ab_cols = {row[1] for row in _db.execute("PRAGMA table_info(ab_books)").fetchall()}
+    if "is_hidden" not in ab_cols:
+        _db.execute("ALTER TABLE ab_books ADD COLUMN is_hidden INTEGER NOT NULL DEFAULT 0")
+    if "store_book_id" not in ab_cols:
+        _db.execute("ALTER TABLE ab_books ADD COLUMN store_book_id TEXT")
+    if "chunker_version" not in ab_cols:
+        # Bestand wurde mit v1 segmentiert — Cache-Pfade bleiben gültig.
+        _db.execute("ALTER TABLE ab_books ADD COLUMN chunker_version TEXT NOT NULL DEFAULT 'v1'")
+    store_cols = {row[1] for row in _db.execute("PRAGMA table_info(ab_store_books)").fetchall()}
+    if "chunker_version" not in store_cols:
+        _db.execute("ALTER TABLE ab_store_books ADD COLUMN chunker_version TEXT NOT NULL DEFAULT 'v1'")
     queue_cols = {
         row[1] for row in _db.execute("PRAGMA table_info(gpu_queue_jobs)").fetchall()
     }
@@ -418,25 +568,34 @@ def init_db(db_path: Path):
 
 
 def _ensure_hosts_foreign_key_rules() -> None:
-    """Rebuild legacy hosts table so voice deletion nulls host.voice_id."""
+    """Rebuild legacy hosts tables so voice_id is a plain engine voice id.
+
+    Voices used to be rows in `voices`, so hosts.voice_id carried a foreign key.
+    Since the OmniVoice/Kikiri migration a podcast voice is named by the engine
+    and has no row anywhere, which made every host with a working voice
+    unsavable. The user FK stays: hosts still belong to a user.
+    """
     if _db is None:
         raise RuntimeError("Database not initialized. Call init_db() first.")
-    rows = _db.execute("PRAGMA foreign_key_list(hosts)").fetchall()
-    by_column = {row[3]: row for row in rows}
-    voice_fk = by_column.get("voice_id")
+    by_column = {row[3]: row for row in _db.execute("PRAGMA foreign_key_list(hosts)").fetchall()}
     user_fk = by_column.get("user_id")
-    if (
-        voice_fk
-        and voice_fk[6].upper() == "SET NULL"
-        and user_fk
-        and user_fk[6].upper() == "CASCADE"
-    ):
+    if "voice_id" not in by_column and user_fk and user_fk[6].upper() == "CASCADE":
         return
+
+    # Carry over every column the old table happens to have; anything the
+    # canonical schema added later falls back to its default.
+    canonical = [
+        "id", "user_id", "name", "personality", "speaking_style",
+        "persona_tagline", "persona_humour", "persona_warmth",
+        "persona_script_length", "voice_id", "role", "created_at", "updated_at",
+    ]
+    existing = {row[1] for row in _db.execute("PRAGMA table_info(hosts)").fetchall()}
+    shared = ", ".join(c for c in canonical if c in existing)
 
     _db.commit()
     _db.execute("PRAGMA foreign_keys=OFF")
     try:
-        _db.executescript("""
+        _db.executescript(f"""
             ALTER TABLE hosts RENAME TO hosts_legacy;
 
             CREATE TABLE hosts (
@@ -445,26 +604,18 @@ def _ensure_hosts_foreign_key_rules() -> None:
                 name TEXT NOT NULL,
                 personality TEXT NOT NULL DEFAULT '',
                 speaking_style TEXT NOT NULL DEFAULT '',
+                persona_tagline TEXT NOT NULL DEFAULT '',
+                persona_humour TEXT NOT NULL DEFAULT '',
+                persona_warmth TEXT NOT NULL DEFAULT '',
+                persona_script_length TEXT NOT NULL DEFAULT 'medium',
                 voice_id TEXT,
                 role TEXT NOT NULL DEFAULT 'host',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-                FOREIGN KEY (voice_id) REFERENCES voices(id) ON DELETE SET NULL
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             );
 
-            INSERT INTO hosts (
-                id, user_id, name, personality, speaking_style, voice_id,
-                role, created_at, updated_at
-            )
-            SELECT
-                id, user_id, name, personality, speaking_style,
-                CASE
-                    WHEN voice_id IN (SELECT id FROM voices) THEN voice_id
-                    ELSE NULL
-                END,
-                role, created_at, updated_at
-            FROM hosts_legacy;
+            INSERT INTO hosts ({shared}) SELECT {shared} FROM hosts_legacy;
 
             DROP TABLE hosts_legacy;
             CREATE INDEX IF NOT EXISTS idx_hosts_user_id ON hosts(user_id);
@@ -572,11 +723,12 @@ def _backfill_podcast_embedding_blobs() -> None:
         )
 
 
-def seed_prebuilt_custom_voices(user_id: int) -> int:
+def _seed_prebuilt_custom_voices(
+    db: sqlite3.Connection, user_id: int
+) -> int:
     """Insert one saved custom-voice preset per built-in speaker for a user.
     Idempotent: skips speakers that already exist as saved voices for this user.
     Returns the number of rows inserted."""
-    db = get_db()
     existing = {
         row[0]
         for row in db.execute(
@@ -596,6 +748,13 @@ def seed_prebuilt_custom_voices(user_id: int) -> int:
             (str(uuid.uuid4()), user_id, name, language, speaker_id, instruct),
         )
         inserted += 1
+    return inserted
+
+
+def seed_prebuilt_custom_voices(user_id: int) -> int:
+    """Seed built-in custom voices and commit any inserted presets."""
+    db = get_db()
+    inserted = _seed_prebuilt_custom_voices(db, user_id)
     if inserted:
         db.commit()
     return inserted
@@ -614,65 +773,35 @@ _BUILTIN_SPEAKER_INSTRUCTS: dict[str, str] = {
     "Sohee": "bright, cheerful, expressive, energetic, warm, engaging",
 }
 
-# Personality profiles for the 9 built-in speakers when auto-created as podcast hosts
-_BUILTIN_HOST_PROFILES: dict[str, tuple[str, str, str]] = {
-    # (personality, speaking_style, role)
-    "Vivian":   ("Energetic and warm podcast host who brings enthusiasm to every topic.", "Energetic, warm, clear articulation", "host"),
-    "Serena":   ("Calm, articulate, and insightful. Ideal for thoughtful discussions and deep dives.", "Calm, articulate, thoughtful", "host"),
-    "Uncle_Fu": ("Wise, grandfatherly figure with a gentle, storytelling tone. Brings cultural depth.", "Gentle, storytelling, wise", "expert"),
-    "Dylan":    ("Young, curious, and dynamic. Great for tech, innovation, and trending topics.", "Young, curious, dynamic", "host"),
-    "Eric":     ("Professional and measured. Classic news-anchor delivery with authority.", "Professional, measured, authoritative", "expert"),
-    "Ryan":     ("Friendly and relatable. Conversational and easy-going with broad appeal.", "Friendly, relatable, conversational", "host"),
-    "Aiden":    ("Bold and confident. Strong presence, perfect for debates and challenging takes.", "Bold, confident, strong presence", "expert"),
-    "Ono_Anna": ("Polite, precise, and elegant. Embodies Japanese cultural grace and clarity.", "Polite, precise, elegant", "expert"),
-    "Sohee":    ("Bright, cheerful, and expressive. Brings Korean pop-culture energy and charm.", "Bright, cheerful, expressive", "host"),
-}
+# Die 9 Qwen-Sprecher wurden früher automatisch als Podcast-Hosts angelegt.
+# Seit dem Host-Hub wählt der Nutzer aus 40 Vorlagen (podcast/host_presets.py),
+# und Qwen ist stillgelegt — ein auto-geseedeter Host zeigt also auf eine Stimme,
+# die keine Engine mehr kennt, und lässt `POST /api/podcasts` mit 400 scheitern.
+# Deshalb wird nichts mehr geseedet; Altbestände werden einmalig zurückgezogen.
+_LEGACY_QWEN_HOST_SPEAKERS = tuple(name for name, _gender, _lang in _BUILTIN_SPEAKERS)
 
 
-def seed_prebuilt_hosts(user_id: int) -> int:
-    """Create a preset podcast host for every custom-voice speaker a user owns.
-    Idempotent: skips if a host with the same name already exists for this user.
-    Returns the number of hosts inserted."""
-    db = get_db()
-    # Find this user's custom voices that correspond to built-in speakers
-    rows = db.execute(
-        "SELECT id, name, speaker FROM voices WHERE user_id=? AND source='custom'",
-        (user_id,),
-    ).fetchall()
+def _retire_legacy_qwen_hosts(db: sqlite3.Connection, user_id: int) -> int:
+    """Remove auto-seeded Qwen hosts that still point at a retired Qwen voice.
 
-    # Build set of existing host names for idempotency
-    existing_host_names = {
-        row[0]
-        for row in db.execute(
-            "SELECT name FROM hosts WHERE user_id=?", (user_id,)
-        ).fetchall()
-    }
-
-    inserted = 0
-    now = datetime.datetime.utcnow().isoformat()
-    for voice_id, voice_name, speaker_id in rows:
-        profile = _BUILTIN_HOST_PROFILES.get(speaker_id)
-        if not profile:
-            continue
-        if voice_name in existing_host_names:
-            # Ensure the existing host is linked to this voice_id
-            db.execute(
-                "UPDATE hosts SET voice_id=? WHERE user_id=? AND name=? AND voice_id IS NULL",
-                (voice_id, user_id, voice_name),
-            )
-            continue
-        personality, speaking_style, role = profile
-        host_id = f"host-{speaker_id.lower()}-{user_id}"
-        db.execute(
-            "INSERT INTO hosts (id, user_id, name, personality, speaking_style, voice_id, role, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (host_id, user_id, voice_name, personality, speaking_style, voice_id, role, now, now),
-        )
-        inserted += 1
-
-    if inserted or db.total_changes > 0:
-        db.commit()
-    return inserted
+    Conservative on purpose: only rows whose id matches the old seeder's pattern
+    AND whose voice is still one of this user's Qwen ``source='custom'`` voices
+    are removed. A host the user has since re-pointed at an OmniVoice/Kikiri
+    voice is a real host now and stays. Podcasts snapshot their cast into
+    ``hosts_json``, so removing the row cannot break an existing podcast.
+    """
+    legacy_ids = [
+        f"host-{speaker.lower()}-{user_id}" for speaker in _LEGACY_QWEN_HOST_SPEAKERS
+    ]
+    if not legacy_ids:
+        return 0
+    placeholders = ",".join("?" * len(legacy_ids))
+    cursor = db.execute(
+        f"DELETE FROM hosts WHERE user_id=? AND id IN ({placeholders}) "
+        "AND voice_id IN (SELECT id FROM voices WHERE user_id=? AND source='custom')",
+        (user_id, *legacy_ids, user_id),
+    )
+    return cursor.rowcount or 0
 
 
 # ---------------------------------------------------------------------------
@@ -704,23 +833,72 @@ def get_or_create_user(username: str) -> dict:
     row = db.execute("SELECT id, username, display_name, created_at FROM users WHERE username=?", (username,)).fetchone()
     if row:
         return {"id": row[0], "username": row[1], "display_name": row[2] or row[1], "created_at": row[3]}
-    db.execute("INSERT INTO users (username, display_name) VALUES (?, ?)", (username, username))
-    db.commit()
-    row = db.execute("SELECT id, username, display_name, created_at FROM users WHERE username=?", (username,)).fetchone()
-    seed_prebuilt_custom_voices(row[0])
-    seed_prebuilt_hosts(row[0])
-    return {"id": row[0], "username": row[1], "display_name": row[2] or row[1], "created_at": row[3]}
+    owned_db = _open_user_creation_connection(db)
+    try:
+        owned_db.execute("BEGIN IMMEDIATE")
+        row = owned_db.execute(
+            "SELECT id, username, display_name, created_at FROM users WHERE username=?",
+            (username,),
+        ).fetchone()
+        if row:
+            owned_db.commit()
+            return {
+                "id": row[0],
+                "username": row[1],
+                "display_name": row[2] or row[1],
+                "created_at": row[3],
+            }
+        cursor = owned_db.execute(
+            "INSERT OR IGNORE INTO users (username, display_name) VALUES (?, ?)",
+            (username, username),
+        )
+        created = cursor.rowcount == 1
+        row = owned_db.execute(
+            "SELECT id, username, display_name, created_at FROM users WHERE username=?",
+            (username,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("User insert completed without a readable row")
+        if created:
+            _seed_prebuilt_custom_voices(owned_db, row[0])
+        owned_db.commit()
+    except Exception:
+        owned_db.rollback()
+        raise
+    finally:
+        owned_db.close()
+    return {
+        "id": row[0],
+        "username": row[1],
+        "display_name": row[2] or row[1],
+        "created_at": row[3],
+    }
 
 
-def backfill_hosts_for_all_users() -> int:
-    """Backfill preset hosts for all existing users who don't have them yet.
-    Called once at startup."""
+def _open_user_creation_connection(
+    main_db: sqlite3.Connection,
+) -> sqlite3.Connection:
+    if _db_path is None or str(_db_path) == ":memory:":
+        raise RuntimeError(
+            "User creation requires an initialized file-backed database"
+        )
+    return _connect_database(
+        _db_path,
+        row_factory=main_db.row_factory,
+        isolation_level=main_db.isolation_level,
+    )
+
+
+def retire_legacy_qwen_hosts_for_all_users() -> int:
+    """Retire auto-seeded Qwen hosts for every user. Called once at startup."""
     db = get_db()
     users = db.execute("SELECT id FROM users").fetchall()
-    total_inserted = 0
+    removed = 0
     for (uid,) in users:
-        total_inserted += seed_prebuilt_hosts(uid)
-    return total_inserted
+        removed += _retire_legacy_qwen_hosts(db, uid)
+    if removed:
+        db.commit()
+    return removed
 
 
 def upsert_gpu_queue_job(job: dict) -> None:

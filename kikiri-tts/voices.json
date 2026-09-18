@@ -1,0 +1,341 @@
+{
+ "note": "Fallback-Stimmbank fuer kikiri-tts. Wird nur benutzt, wenn OmniVoice nicht laufen kann. Erzeugt von scripts/build-fallback-voice-catalog.py.",
+ "voices": [
+  {
+   "id": "fallback-de-thorsten",
+   "name": "Thorsten",
+   "model": "de_DE-thorsten-medium",
+   "speaker_id": 0,
+   "gender": "male",
+   "description": "Studioqualität, neutrale Erzählstimme"
+  },
+  {
+   "id": "fallback-de-eva",
+   "name": "Eva",
+   "model": "de_DE-eva_k-x_low",
+   "speaker_id": 0,
+   "gender": "female",
+   "description": "Ruhige Vorlesestimme"
+  },
+  {
+   "id": "fallback-de-kerstin",
+   "name": "Kerstin",
+   "model": "de_DE-kerstin-low",
+   "speaker_id": 0,
+   "gender": "female",
+   "description": "Freundlich, mittlere Lage"
+  },
+  {
+   "id": "fallback-de-ramona",
+   "name": "Ramona",
+   "model": "de_DE-ramona-low",
+   "speaker_id": 0,
+   "gender": "female",
+   "description": "Warm, leicht dunkel"
+  },
+  {
+   "id": "fallback-de-karlsson",
+   "name": "Karlsson",
+   "model": "de_DE-karlsson-low",
+   "speaker_id": 0,
+   "gender": "male",
+   "description": "Sachlich, nachrichtennah"
+  },
+  {
+   "id": "fallback-de-pavoque",
+   "name": "Pavoque",
+   "model": "de_DE-pavoque-low",
+   "speaker_id": 0,
+   "gender": "male",
+   "description": "Kräftig, erzählend"
+  },
+  {
+   "id": "fallback-de-thorsten-neutral",
+   "name": "Thorsten · Neutral",
+   "model": "de_DE-thorsten_emotional-medium",
+   "speaker_id": 4,
+   "gender": "male",
+   "description": "Sachlicher Grundton"
+  },
+  {
+   "id": "fallback-de-thorsten-amused",
+   "name": "Thorsten · Erheitert",
+   "model": "de_DE-thorsten_emotional-medium",
+   "speaker_id": 0,
+   "gender": "male",
+   "description": "Aufgeräumt, mit Lächeln in der Stimme"
+  },
+  {
+   "id": "fallback-de-thorsten-angry",
+   "name": "Thorsten · Wütend",
+   "model": "de_DE-thorsten_emotional-medium",
+   "speaker_id": 1,
+   "gender": "male",
+   "description": "Scharf, hoher Druck"
+  },
+  {
+   "id": "fallback-de-thorsten-surprised",
+   "name": "Thorsten · Überrascht",
+   "model": "de_DE-thorsten_emotional-medium",
+   "speaker_id": 6,
+   "gender": "male",
+   "description": "Hohe Spannung, steigende Melodie"
+  },
+  {
+   "id": "fallback-de-thorsten-disgusted",
+   "name": "Thorsten · Angewidert",
+   "model": "de_DE-thorsten_emotional-medium",
+   "speaker_id": 2,
+   "gender": "male",
+   "description": "Zurückweisend, gepresst"
+  },
+  {
+   "id": "fallback-de-thorsten-sleepy",
+   "name": "Thorsten · Müde",
+   "model": "de_DE-thorsten_emotional-medium",
+   "speaker_id": 5,
+   "gender": "male",
+   "description": "Langsam, tiefer Tonfall"
+  },
+  {
+   "id": "fallback-de-thorsten-drunk",
+   "name": "Thorsten · Beschwipst",
+   "model": "de_DE-thorsten_emotional-medium",
+   "speaker_id": 3,
+   "gender": "male",
+   "description": "Unpräzise Artikulation"
+  },
+  {
+   "id": "fallback-de-thorsten-whisper",
+   "name": "Thorsten · Flüsternd",
+   "model": "de_DE-thorsten_emotional-medium",
+   "speaker_id": 7,
+   "gender": "male",
+   "description": "Geflüstert, sehr leise"
+  },
+  {
+   "id": "fallback-de-helena",
+   "name": "Helena",
+   "model": "de_DE-mls-medium",
+   "speaker_id": 2,
+   "gender": "female",
+   "description": "Fallback-Stimme, 172 Hz Grundton"
+  },
+  {
+   "id": "fallback-de-roswitha",
+   "name": "Roswitha",
+   "model": "de_DE-mls-medium",
+   "speaker_id": 17,
+   "gender": "female",
+   "description": "Fallback-Stimme, 174 Hz Grundton"
+  },
+  {
+   "id": "fallback-de-katharina",
+   "name": "Katharina",
+   "model": "de_DE-mls-medium",
+   "speaker_id": 113,
+   "gender": "female",
+   "description": "Fallback-Stimme, 179 Hz Grundton"
+  },
+  {
+   "id": "fallback-de-ingrid",
+   "name": "Ingrid",
+   "model": "de_DE-mls-medium",
+   "speaker_id": 131,
+   "gender": "female",
+   "description": "Fallback-Stimme, 187 Hz Grundton"
+  },
+  {
+   "id": "fallback-de-barbara",
+   "name": "Barbara",
+   "model": "de_DE-mls-medium",
+   "speaker_id": 114,
+   "gender": "female",
+   "description": "Fallback-Stimme, 188 Hz Grundton"
+  },
+  {
+   "id": "fallback-de-sabine",
+   "name": "Sabine",
+   "model": "de_DE-mls-medium",
+   "speaker_id": 52,
+   "gender": "female",
+   "description": "Fallback-Stimme, 195 Hz Grundton"
+  },
+  {
+   "id": "fallback-de-antje",
+   "name": "Antje",
+   "model": "de_DE-mls-medium",
+   "speaker_id": 54,
+   "gender": "female",
+   "description": "Fallback-Stimme, 197 Hz Grundton"
+  },
+  {
+   "id": "fallback-de-miriam",
+   "name": "Miriam",
+   "model": "de_DE-mls-medium",
+   "speaker_id": 40,
+   "gender": "female",
+   "description": "Fallback-Stimme, 202 Hz Grundton"
+  },
+  {
+   "id": "fallback-de-franziska",
+   "name": "Franziska",
+   "model": "de_DE-mls-medium",
+   "speaker_id": 174,
+   "gender": "female",
+   "description": "Fallback-Stimme, 210 Hz Grundton"
+  },
+  {
+   "id": "fallback-de-johanna",
+   "name": "Johanna",
+   "model": "de_DE-mls-medium",
+   "speaker_id": 181,
+   "gender": "female",
+   "description": "Fallback-Stimme, 213 Hz Grundton"
+  },
+  {
+   "id": "fallback-de-nele",
+   "name": "Nele",
+   "model": "de_DE-mls-medium",
+   "speaker_id": 26,
+   "gender": "female",
+   "description": "Fallback-Stimme, 216 Hz Grundton"
+  },
+  {
+   "id": "fallback-de-carla",
+   "name": "Carla",
+   "model": "de_DE-mls-medium",
+   "speaker_id": 104,
+   "gender": "female",
+   "description": "Fallback-Stimme, 220 Hz Grundton"
+  },
+  {
+   "id": "fallback-de-josie",
+   "name": "Josie",
+   "model": "de_DE-mls-medium",
+   "speaker_id": 151,
+   "gender": "female",
+   "description": "Fallback-Stimme, 230 Hz Grundton"
+  },
+  {
+   "id": "fallback-de-lilly",
+   "name": "Lilly",
+   "model": "de_DE-mls-medium",
+   "speaker_id": 102,
+   "gender": "female",
+   "description": "Fallback-Stimme, 233 Hz Grundton"
+  },
+  {
+   "id": "fallback-de-konrad",
+   "name": "Konrad",
+   "model": "de_DE-mls-medium",
+   "speaker_id": 194,
+   "gender": "male",
+   "description": "Fallback-Stimme, 86 Hz Grundton"
+  },
+  {
+   "id": "fallback-de-bernhard",
+   "name": "Bernhard",
+   "model": "de_DE-mls-medium",
+   "speaker_id": 6,
+   "gender": "male",
+   "description": "Fallback-Stimme, 93 Hz Grundton"
+  },
+  {
+   "id": "fallback-de-ludwig",
+   "name": "Ludwig",
+   "model": "de_DE-mls-medium",
+   "speaker_id": 152,
+   "gender": "male",
+   "description": "Fallback-Stimme, 100 Hz Grundton"
+  },
+  {
+   "id": "fallback-de-hartmut",
+   "name": "Hartmut",
+   "model": "de_DE-mls-medium",
+   "speaker_id": 56,
+   "gender": "male",
+   "description": "Fallback-Stimme, 104 Hz Grundton"
+  },
+  {
+   "id": "fallback-de-gregor",
+   "name": "Gregor",
+   "model": "de_DE-mls-medium",
+   "speaker_id": 206,
+   "gender": "male",
+   "description": "Fallback-Stimme, 108 Hz Grundton"
+  },
+  {
+   "id": "fallback-de-matthias",
+   "name": "Matthias",
+   "model": "de_DE-mls-medium",
+   "speaker_id": 49,
+   "gender": "male",
+   "description": "Fallback-Stimme, 110 Hz Grundton"
+  },
+  {
+   "id": "fallback-de-roland",
+   "name": "Roland",
+   "model": "de_DE-mls-medium",
+   "speaker_id": 148,
+   "gender": "male",
+   "description": "Fallback-Stimme, 113 Hz Grundton"
+  },
+  {
+   "id": "fallback-de-stefan",
+   "name": "Stefan",
+   "model": "de_DE-mls-medium",
+   "speaker_id": 182,
+   "gender": "male",
+   "description": "Fallback-Stimme, 119 Hz Grundton"
+  },
+  {
+   "id": "fallback-de-andreas",
+   "name": "Andreas",
+   "model": "de_DE-mls-medium",
+   "speaker_id": 21,
+   "gender": "male",
+   "description": "Fallback-Stimme, 124 Hz Grundton"
+  },
+  {
+   "id": "fallback-de-tobias",
+   "name": "Tobias",
+   "model": "de_DE-mls-medium",
+   "speaker_id": 159,
+   "gender": "male",
+   "description": "Fallback-Stimme, 128 Hz Grundton"
+  },
+  {
+   "id": "fallback-de-jonas",
+   "name": "Jonas",
+   "model": "de_DE-mls-medium",
+   "speaker_id": 165,
+   "gender": "male",
+   "description": "Fallback-Stimme, 135 Hz Grundton"
+  },
+  {
+   "id": "fallback-de-fabian",
+   "name": "Fabian",
+   "model": "de_DE-mls-medium",
+   "speaker_id": 208,
+   "gender": "male",
+   "description": "Fallback-Stimme, 140 Hz Grundton"
+  },
+  {
+   "id": "fallback-de-nico",
+   "name": "Nico",
+   "model": "de_DE-mls-medium",
+   "speaker_id": 65,
+   "gender": "male",
+   "description": "Fallback-Stimme, 141 Hz Grundton"
+  },
+  {
+   "id": "fallback-de-lennard",
+   "name": "Lennard",
+   "model": "de_DE-mls-medium",
+   "speaker_id": 105,
+   "gender": "male",
+   "description": "Fallback-Stimme, 149 Hz Grundton"
+  }
+ ]
+}

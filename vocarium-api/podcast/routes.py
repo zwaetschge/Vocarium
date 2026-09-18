@@ -4,9 +4,9 @@ Exposes CRUD for hosts, podcasts (projects), sources, plus SSE-driven script
 and audio generation backed by the GPU queue.
 
 The TTS bridge (``VocariumTTSGenerator``) enforces the project constraint that
-podcasts may only use custom voices (``voices.source = 'custom'``). Custom
-voices are built on the Qwen3-TTS-CustomVoice model — prebuilt speakers plus
-optional ``instruct`` steering — and always target the custom TTS endpoint.
+podcasts use OmniVoice clone voices and Kikiri fine-tunes (the Qwen custom-voice
+path is retired). A voice must exist in the live engine inventory
+(``tts_bridge.engine_voices()``), not merely as a database row.
 """
 
 from __future__ import annotations
@@ -23,29 +23,29 @@ import socket
 import sqlite3
 import struct
 import time
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
 import aiohttp
-from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from metrics import inc, observe
+import user_settings
 
+from .host_presets import CATEGORIES as HOST_CATEGORIES, HOST_PRESETS, PRESETS_BY_ID
 from .audio_assembler import (
     AssemblyOptions,
     AssemblyProgress,
     AudioAssembler,
     AudioFormat,
     MusicGenerator,
-    SFXGenerator,
-    TTSGenerator,
 )
 from .disfluency import ScriptSegment
 from .docling_client import DoclingClient, get_docling_client
 from .embedding_client import EmbeddingClient, get_embedding_client
+from .file_stream import iter_file_range, parse_single_range
 from .helpers import chunk_text, count_words, estimate_speaking_duration, generate_id
 from .script_generator import (
     HostCharacter,
@@ -55,6 +55,7 @@ from .script_generator import (
     SourceChunk,
     SourceInfo,
 )
+from .tags import catalog as tag_catalog, sanitize as sanitize_tags
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +85,7 @@ MAX_MEDIA_DURATION_MS = 10 * 60 * 1000
 ALLOWED_PODCAST_FORMATS = {"dialog", "monolog", "custom"}
 ALLOWED_PODCAST_DURATIONS = {"short", "medium", "long"}
 ALLOWED_AUDIO_FORMATS = {"mp3", "wav"}
-ALLOWED_SEGMENT_TYPES = {"speech", "reaction", "pause", "sfx", "music"}
+ALLOWED_SEGMENT_TYPES = {"speech", "reaction", "pause", "music"}
 
 
 # ---------------------------------------------------------------------------
@@ -100,10 +101,11 @@ class _VoiceRow:
 
 
 class VocariumTTSGenerator:
-    """Concrete TTSGenerator that calls qwen3-tts through a TTS URL pool.
+    """Concrete TTSGenerator that renders segments on the speech engines.
 
-    Podcast TTS must only use custom voices — this is enforced in
-    :meth:`_resolve_voice` and :meth:`default_voice_for_speaker`.
+    Voices resolve against the live OmniVoice / Kikiri inventory — enforced in
+    :meth:`_resolve_voice` and :meth:`default_voice_for_speaker`. The Qwen URL
+    pool is still accepted for signature compatibility but is empty by default.
     """
 
     def __init__(
@@ -115,17 +117,20 @@ class VocariumTTSGenerator:
         extra_tts_urls: list[str] | None = None,
         max_parallel_workers: int = 2,
     ):
-        # Primary TTS endpoint
+        # Primary TTS endpoint (legacy Qwen pool; retired but kept for signature
+        # compatibility). Speech now runs on the clone/finetune engines below.
         self.tts_url = tts_url
-        # Extra TTS endpoints (failover order). Empty entries are filtered so
-        # callers can pass an unconditional list with optional URLs.
+        self.omnivoice_url = os.environ.get("OMNIVOICE_TTS_URL", "http://omnivoice-tts:8880").strip()
+        self.kikiri_url = os.environ.get("KIKIRI_TTS_URL", "http://kikiri-tts:8881").strip()
+        self._engine_voices: tuple[float, dict[str, str]] = (0.0, {})
+        # Extra TTS endpoints are strict fallbacks. Empty entries are filtered
+        # so callers can pass an unconditional list with optional URLs.
         self._extra_tts_urls = [u for u in (extra_tts_urls or []) if u]
         self._db_getter = db_getter
         self._gpu_submit = gpu_submit
         self._tts_urls = [self.tts_url, *self._extra_tts_urls]
-        self._url_semaphores = {url: asyncio.Semaphore(1) for url in self._tts_urls}
-        self._next_url = 0
-        self._url_lock = asyncio.Lock()
+        from collections import defaultdict
+        self._url_semaphores = defaultdict(lambda: asyncio.Semaphore(1))
         self._aiosession: aiohttp.ClientSession | None = None
 
     @property
@@ -143,22 +148,45 @@ class VocariumTTSGenerator:
         self._aiosession = None
 
     async def _ordered_tts_urls(self) -> list[str]:
-        async with self._url_lock:
-            if not self._tts_urls:
-                return []
-            start = self._next_url % len(self._tts_urls)
-            self._next_url += 1
-            return self._tts_urls[start:] + self._tts_urls[:start]
+        """Always try the RTX 3060 endpoint before any emergency fallback."""
+        return list(self._tts_urls)
 
     async def run_batch(self, description: str, work: Callable[[], Any]) -> Any:
-        async def queued_work():
-            result = work()
-            if asyncio.iscoroutine(result):
-                return await result
-            return result
+        # Speech now runs on resident engines (OmniVoice GPU slice, Kikiri CPU);
+        # there is nothing to evict, so the GPU queue is bypassed.
+        del description
+        result = work()
+        if asyncio.iscoroutine(result):
+            return await result
+        return result
 
-        _, future = await self._gpu_submit("tts", description, queued_work)
-        return await future
+    async def engine_voices(self, *, force: bool = False) -> dict[str, str]:
+        """voice_id → engine für alle Podcast-fähigen Stimmen (OmniVoice + Kikiri)."""
+        fetched, cached = self._engine_voices
+        if not force and cached and time.monotonic() - fetched < 30:
+            return cached
+        voices: dict[str, str] = {}
+        timeout = aiohttp.ClientTimeout(total=5)
+        try:
+            async with self._session.get(f"{self.omnivoice_url}/v1/audio/voices", timeout=timeout) as resp:
+                resp.raise_for_status()
+                for item in (await resp.json()).get("voices", []):
+                    if item.get("voice_id"):
+                        voices[str(item["voice_id"])] = "omnivoice"
+        except Exception as exc:
+            logger.warning("Podcast: OmniVoice listing failed (%r)", exc)
+        try:
+            async with self._session.get(f"{self.kikiri_url}/v1/models", timeout=timeout) as resp:
+                resp.raise_for_status()
+                for item in (await resp.json()).get("data", []):
+                    if item.get("id"):
+                        voices[str(item["id"])] = "kikiri"
+        except Exception as exc:
+            logger.warning("Podcast: Kikiri listing failed (%r)", exc)
+        if voices:
+            self._engine_voices = (time.monotonic(), voices)
+            return voices
+        return cached
 
     def _custom_voices(self, user_id: int | None = None) -> list[_VoiceRow]:
         rows = self._db_getter().execute(
@@ -167,35 +195,29 @@ class VocariumTTSGenerator:
         ).fetchall()
         return [_VoiceRow(id=r[0], name=r[1], source=r[2]) for r in rows]
 
-    def _resolve_voice(self, voice: str, user_id: int | None = None) -> str:
-        """Accept either a custom voice_id or a speaker name. Raise if the
-        voice is unknown or not a custom voice."""
-        db = self._db_getter()
-        row = db.execute(
-            "SELECT id, name, source FROM voices WHERE user_id=? AND (id=? OR name=? COLLATE NOCASE)",
-            (user_id, voice, voice),
+    async def _resolve_voice(self, voice: str, user_id: int | None = None) -> tuple[str, str]:
+        """Resolve a voice_id or speaker/host name to ``(voice_id, engine)``.
+
+        Podcast speech runs on the clone/finetune engines (OmniVoice, Kikiri);
+        the retired Qwen custom-voice path is gone. The hosts table still acts
+        as a per-user name → voice alias.
+        """
+        voices = await self.engine_voices()
+        if voice in voices:
+            return voice, voices[voice]
+        lowered = voice.casefold()
+        for vid, engine in voices.items():
+            if vid.casefold() == lowered:
+                return vid, engine
+        host = self._db_getter().execute(
+            "SELECT voice_id FROM hosts WHERE user_id=? AND name=? COLLATE NOCASE AND voice_id IS NOT NULL",
+            (user_id, voice),
         ).fetchone()
-        if not row:
-            # Try to look the name up in hosts → voice_id (scope to user)
-            host = db.execute(
-                "SELECT voice_id FROM hosts WHERE user_id=? AND name=? COLLATE NOCASE AND voice_id IS NOT NULL",
-                (user_id, voice),
-            ).fetchone()
-            if host and host[0]:
-                row = db.execute(
-                    "SELECT id, name, source FROM voices WHERE user_id=? AND id=?",
-                    (user_id, host[0]),
-                ).fetchone()
-        if not row:
-            raise RuntimeError(
-                f"Podcast TTS: voice {voice!r} is not a known custom voice"
-            )
-        if row[2] != "custom":
-            raise RuntimeError(
-                f"Podcast TTS: voice {row[0]} (source={row[2]}) is not a custom voice. "
-                "Podcasts may only use custom voices."
-            )
-        return row[0]
+        if host and host[0] and host[0] in voices:
+            return host[0], voices[host[0]]
+        raise RuntimeError(
+            f"Podcast TTS: voice {voice!r} is not a known OmniVoice or Kikiri voice"
+        )
 
     def _custom_voice_preset(self, voice_id: str, user_id: int | None = None) -> dict:
         """Look up the stored (speaker, instruct, language) preset for a
@@ -232,36 +254,48 @@ class VocariumTTSGenerator:
         user_id: int | None = None,
         notes: str | None = None,
     ) -> float:
-        voice_id = self._resolve_voice(voice, user_id=user_id)
-        preset = self._custom_voice_preset(voice_id, user_id=user_id)
-        response_format = "mp3" if output_format == "mp3" else "wav"
+        voice_id, engine = await self._resolve_voice(voice, user_id=user_id)
+        # Both engines emit WAV; a requested MP3 segment is transcoded by the
+        # assembler's ffmpeg mix anyway, so WAV in flight is always right.
+        response_format = "wav"
 
-        # Only per-segment notes steer the TTS. The voice preset's `instruct`
-        # field is deliberately NOT used as a fallback here: presets are
-        # English-worded (e.g. "warm, energetic, clear articulation") and
-        # bias the model toward English pronunciation when synthesizing
-        # non-English text. The script generator already emits language-
-        # appropriate notes per segment; if notes are missing we prefer an
-        # un-steered generation over a mis-steered one.
-        segment_instruct = (notes or "").strip() or None
+        # Segment notes steered Qwen's instruct field; neither clone engine
+        # exposes prompt steering. Emotion now travels inline as nonverbale
+        # OmniVoice-Tags, die Kikiri buchstabieren würde — deshalb je Engine
+        # aufbereiten. Bleibt danach nichts als ein Tag übrig, hat das Segment
+        # keinen sprechbaren Inhalt mehr.
+        del notes
+        spoken = sanitize_tags(text, engine=engine)
+        if not spoken:
+            raise RuntimeError(
+                f"Podcast TTS: segment has no speakable text for engine {engine!r}"
+            )
+        text = spoken
 
-        payload: dict[str, Any] = {
-            "text": text,
-            "speaker": preset["speaker"],
-            "language": preset["language"],
-            "response_format": response_format,
-        }
-        if segment_instruct:
-            payload["instruct"] = segment_instruct
-
-        urls = await self._ordered_tts_urls()
+        if engine == "omnivoice":
+            endpoint = f"{self.omnivoice_url}/v1/audio/speech"
+            payload: dict[str, Any] = {
+                "model": "omnivoice",
+                "input": text,
+                "voice": voice_id,
+                "response_format": response_format,
+            }
+        else:
+            endpoint = f"{self.kikiri_url}/v1/audio/speech"
+            payload = {
+                "model": voice_id,
+                "input": text,
+                "voice": "default",
+                "response_format": response_format,
+            }
+        urls = [endpoint]
         last_err: Exception | None = None
 
         for attempt, url in enumerate(urls):
             async def work(url: str = url, attempt: int = attempt):
                 logger.info(
-                    "TTS request attempt %d/%d -> %s (speaker=%s, len=%d)",
-                    attempt + 1, len(urls), url, preset["speaker"], len(text),
+                    "TTS request attempt %d/%d -> %s (voice=%s/%s, len=%d)",
+                    attempt + 1, len(urls), url, engine, voice_id, len(text),
                 )
                 timeout = aiohttp.ClientTimeout(
                     total=3600, sock_connect=15, sock_read=3600
@@ -270,7 +304,7 @@ class VocariumTTSGenerator:
                 status: int | str = "error"
                 try:
                     async with self._session.post(
-                        f"{url}/v1/audio/speech/custom",
+                        url,
                         json=payload,
                         timeout=timeout,
                     ) as resp:
@@ -289,7 +323,7 @@ class VocariumTTSGenerator:
                             duration = max(1.0, len(text.split()) / 2.3)
                         return duration
                 finally:
-                    labels = {"path": "/v1/audio/speech/custom", "status": status}
+                    labels = {"path": f"podcast/{engine}", "status": status}
                     inc("vocarium_tts_requests_total", labels=labels)
                     observe(
                         "vocarium_tts_inference_seconds",
@@ -317,15 +351,14 @@ class VocariumTTSGenerator:
             "SELECT voice_id FROM hosts WHERE user_id=? AND name=? COLLATE NOCASE AND voice_id IS NOT NULL",
             (user_id, speaker),
         ).fetchone()
-        if host and host[0]:
+        voices = await self.engine_voices()
+        if host and host[0] and host[0] in voices:
             return host[0]
-
-        custom = self._custom_voices(user_id=user_id)
-        if custom:
-            return custom[0].id
+        if voices:
+            return next(iter(sorted(voices)))
         raise RuntimeError(
-            "No custom voices available — create at least one custom voice "
-            "before generating podcast audio."
+            "No OmniVoice or Kikiri voices available — clone or fine-tune at "
+            "least one voice before generating podcast audio."
         )
 
 
@@ -439,69 +472,6 @@ class VocariumMusicGenerator:
         return await future
 
 
-class VocariumSFXGenerator:
-    """MMAudio bridge for podcast prompted sound effects. Synchronous WAV
-    response, written straight to disk."""
-
-    def __init__(self, sfx_url: str, gpu_submit: Callable[..., Any]):
-        self._sfx_url = sfx_url
-        self._gpu_submit = gpu_submit
-        self._aiosession: aiohttp.ClientSession | None = None
-
-    @property
-    def _session(self) -> aiohttp.ClientSession:
-        if self._aiosession is None or self._aiosession.closed:
-            self._aiosession = aiohttp.ClientSession(
-                connector=aiohttp.TCPConnector(limit=10, ttl_dns_cache=300),
-            )
-        return self._aiosession
-
-    async def aclose(self) -> None:
-        if self._aiosession is not None and not self._aiosession.closed:
-            await self._aiosession.close()
-        self._aiosession = None
-
-    async def generate_to_file(
-        self,
-        prompt: str,
-        duration_s: float,
-        output_path: Path,
-        output_format: AudioFormat,
-        *,
-        user_id: int | None = None,
-    ) -> float:
-        payload = {
-            "prompt": prompt,
-            "negative_prompt": "",
-            "duration": float(duration_s),
-            "cfg_strength": 4.5,
-            "num_steps": 25,
-        }
-        timeout_seconds = int(os.environ.get("SFX_GENERATE_TIMEOUT_SECONDS", "900"))
-        timeout = aiohttp.ClientTimeout(
-            total=timeout_seconds,
-            sock_connect=30,
-            sock_read=timeout_seconds,
-        )
-
-        async def work():
-            async with self._session.post(
-                f"{self._sfx_url}/generate", json=payload, timeout=timeout
-            ) as resp:
-                body = await resp.read()
-                if resp.status >= 400:
-                    raise RuntimeError(
-                        f"sfx failed ({resp.status}): "
-                        f"{body.decode('utf-8', 'replace')[:300]}"
-                    )
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            await asyncio.to_thread(output_path.write_bytes, body)
-            return float(duration_s)
-
-        _, future = await self._gpu_submit("sfx", "Podcast SFX", work)
-        return await future
-
-
 # ---------------------------------------------------------------------------
 # Helpers — DB → dict serialisation
 # ---------------------------------------------------------------------------
@@ -517,11 +487,13 @@ def _host_row_to_dict(row) -> dict:
         "role": row[5] or "host",
         "created_at": row[6],
         "updated_at": row[7],
+        "tagline": row[8] or "",
     }
 
 
 _HOST_COLUMNS = (
-    "id, name, personality, speaking_style, voice_id, role, created_at, updated_at"
+    "id, name, personality, speaking_style, voice_id, role, created_at, updated_at, "
+    "persona_tagline"
 )
 
 
@@ -561,8 +533,45 @@ def _embedding_from_json(text: str | None) -> list[float] | None:
         return None
 
 
+def _script_revision(script: dict | None, hosts: list[dict]) -> str:
+    """Hash audible inputs, not timestamps or mutable display status."""
+    if not script:
+        return ""
+    fields = ("id", "speaker_id", "speaker", "text", "voice", "type", "notes", "prompt", "duration_ms", "overlap_ms", "volume_db")
+    payload = {"segments": [{k: seg.get(k) for k in fields} for seg in script.get("segments", [])],
+               "hosts": sorted([{"id": h.get("id"), "name": h.get("name"), "voice_id": h.get("voice_id")} for h in hosts], key=lambda h: str(h["id"]))}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def _bind_episode_cast(script: dict, hosts: list[dict], *, refresh_voices: bool = False) -> dict:
+    """Resolve legacy names only when unique, then retain stable snapshot IDs."""
+    for segment in script.get("segments", []):
+        if segment.get("type", "speech") != "speech":
+            continue
+        host_id = segment.get("speaker_id")
+        candidates = [h for h in hosts if h.get("id") == host_id] if host_id else [h for h in hosts if str(h.get("name", "")).casefold() == str(segment.get("speaker", "")).casefold()]
+        if len(candidates) == 1:
+            host = candidates[0]
+            segment.update(speaker_id=host["id"], speaker=host["name"])
+            if refresh_voices or not segment.get("voice"):
+                segment["voice"] = host.get("voice_id")
+    return script
+
+
+def _require_idle(podcast: dict) -> None:
+    if podcast.get("status") in {"generating_script", "generating_audio"}:
+        raise HTTPException(409, "A production is already active")
+
+
 def _podcast_row_to_dict(row) -> dict:
+    hosts = json.loads(row[8]) if row[8] else []
+    script = _bind_episode_cast(json.loads(row[10]), hosts) if row[10] else None
+    revision = _script_revision(script, hosts)
+    audio_revision = (row[19] or "") if len(row) > 19 else ""
     return {
+        "script_revision": revision,
+        "audio_revision": audio_revision,
+        "audio_stale": bool(row[11]) and bool(audio_revision) and revision != audio_revision,
         "id": row[0],
         "topic": row[1] or "",
         "format": row[2],
@@ -573,7 +582,7 @@ def _podcast_row_to_dict(row) -> dict:
         "error_message": row[7],
         "hosts": json.loads(row[8]) if row[8] else [],
         "sources": json.loads(row[9]) if row[9] else [],
-        "script": json.loads(row[10]) if row[10] else None,
+        "script": script,
         "audio_path": row[11],
         "audio_duration": row[12] or 0,
         "audio_format": row[13] or "mp3",
@@ -588,7 +597,7 @@ def _podcast_row_to_dict(row) -> dict:
 _PODCAST_COLUMNS = (
     "id, topic, format, disfluency_level, duration, language, status, error_message, "
     "hosts_json, sources_json, script_json, audio_path, audio_duration, audio_format, "
-    "audio_size, audio_sha256, total_words, created_at, updated_at"
+    "audio_size, audio_sha256, total_words, created_at, updated_at, audio_revision"
 )
 
 
@@ -802,25 +811,6 @@ def _get_host_or_404(db: sqlite3.Connection, host_id: str, user_id: int) -> dict
     return _host_row_to_dict(row)
 
 
-def _get_custom_voice_or_400(
-    db: sqlite3.Connection,
-    voice_id: str,
-    user_id: int,
-) -> tuple[str, str]:
-    row = db.execute(
-        "SELECT id, source FROM voices WHERE id=? AND user_id=?",
-        (voice_id, user_id),
-    ).fetchone()
-    if not row:
-        raise HTTPException(400, f"voice_id {voice_id} not found")
-    if row[1] != "custom":
-        raise HTTPException(
-            400,
-            "Only custom voices can be assigned to podcast hosts",
-        )
-    return row[0], row[1]
-
-
 def _coerce_int(value: Any, field: str, default: int = 0) -> int:
     if value is None or value == "":
         return default
@@ -883,8 +873,8 @@ def _validate_segment_semantics(segment: dict) -> None:
     prompt = str(segment.get("prompt") or "").strip()
     if seg_type in ("speech", "reaction") and not text:
         raise HTTPException(400, f"{seg_type} segments require text")
-    if seg_type in ("music", "sfx") and not (prompt or text):
-        raise HTTPException(400, "music/sfx segments require a prompt")
+    if seg_type == "music" and not (prompt or text):
+        raise HTTPException(400, "music segments require a prompt")
 
 
 # ---------------------------------------------------------------------------
@@ -900,9 +890,7 @@ def create_podcast_router(
     gpu_submit: Callable[..., Any],
     extra_tts_urls: list[str] | None = None,
     assembler_output_dir: str | os.PathLike[str] | None = None,
-    assembler_sfx_dir: str | os.PathLike[str] | None = None,
     music_url: str | None = None,
-    sfx_url: str | None = None,
 ) -> tuple[APIRouter, AudioAssembler]:
     """Return (router, assembler). Caller wires the router into the app and
     uses the assembler for startup housekeeping."""
@@ -914,16 +902,25 @@ def create_podcast_router(
     music_bridge: MusicGenerator | None = (
         VocariumMusicGenerator(music_url, gpu_submit) if music_url else None
     )
-    sfx_bridge: SFXGenerator | None = (
-        VocariumSFXGenerator(sfx_url, gpu_submit) if sfx_url else None
-    )
     assembler = AudioAssembler(
         tts=tts_bridge,
         music=music_bridge,
-        sfx=sfx_bridge,
         output_dir=assembler_output_dir,
-        sfx_dir=assembler_sfx_dir,
     )
+
+    async def _require_engine_voice(voice_id: str | None) -> None:
+        """A host/segment voice must be one the speech engines actually serve.
+
+        Voices used to be per-user rows in `voices` with source='custom'.
+        OmniVoice and Kikiri own their own inventories, so the DB no longer
+        knows them and the old check rejected every working voice.
+        """
+        if not voice_id:
+            return
+        if voice_id not in await tts_bridge.engine_voices():
+            raise HTTPException(
+                400, f"voice_id {voice_id!r} is not an OmniVoice or Kikiri voice"
+            )
 
     script_generator = ScriptGenerator()
     embedding_client: EmbeddingClient = get_embedding_client()
@@ -933,13 +930,101 @@ def create_podcast_router(
 
     @router.get("/hosts")
     async def list_hosts(request: Request):
+        """Sprecher des Nutzers, jeder mit `voice_available`.
+
+        Ein gesetzter `voice_id` heißt nicht, dass die Stimme noch existiert —
+        Engines besitzen ihr Inventar selbst. Ohne das Flag zeigt die Oberfläche
+        „Stimme gesetzt" an und `POST /podcasts` scheitert dann mit 400.
+        """
         user = get_current_user(request)
         db = db_getter()
         rows = db.execute(
             f"SELECT {_HOST_COLUMNS} FROM hosts WHERE user_id=? ORDER BY created_at",
             (user["id"],),
         ).fetchall()
-        return {"hosts": [_host_row_to_dict(r) for r in rows]}
+        try:
+            available = set(await tts_bridge.engine_voices())
+        except Exception:  # Engine unerreichbar -> nichts als fehlend melden
+            available = None
+        hosts = []
+        for row in rows:
+            host = _host_row_to_dict(row)
+            host["voice_available"] = (
+                available is None or not host["voice_id"] or host["voice_id"] in available
+            )
+            hosts.append(host)
+        return {"hosts": hosts}
+
+    # Muss vor "/hosts/{host_id}" stehen, sonst schluckt der Pfadparameter
+    # das Wort "presets".
+    @router.get("/hosts/presets")
+    async def list_host_presets(request: Request):
+        """Der Host-Hub: 40 fertige Persönlichkeiten, nach Rubrik sortiert.
+
+        Ob die vorgeschlagene Stimme gerade wirklich existiert, weiß nur die
+        Engine — deshalb wird jedes Preset mit `voice_available` markiert statt
+        ausgeblendet.
+        """
+        user = get_current_user(request)
+        try:
+            available = set(await tts_bridge.engine_voices())
+        except Exception:  # Engine unerreichbar -> Hub trotzdem anzeigen
+            available = set()
+        db = db_getter()
+        taken = {
+            row[0]
+            for row in db.execute(
+                "SELECT name FROM hosts WHERE user_id=?", (user["id"],)
+            ).fetchall()
+        }
+        presets = [
+            {
+                **preset,
+                "voice_available": (not available) or preset["voice"] in available,
+                "already_added": preset["name"] in taken,
+            }
+            for preset in HOST_PRESETS
+        ]
+        return {"categories": HOST_CATEGORIES, "presets": presets}
+
+    @router.post("/hosts/presets/{preset_id}")
+    async def create_host_from_preset(preset_id: str, request: Request, body: dict | None = None):
+        """Preset übernehmen. `voice_id`/`name` im Body überschreiben den Vorschlag."""
+        user = get_current_user(request)
+        preset = PRESETS_BY_ID.get(preset_id)
+        if not preset:
+            raise HTTPException(404, f"unknown host preset {preset_id!r}")
+        body = body or {}
+        name = _clean_limited_text(
+            body.get("name") or preset["name"], "name", MAX_HOST_NAME_CHARS, required=True
+        )
+        voice_id = (body.get("voice_id") or preset["voice"] or "").strip() or None
+        if voice_id and voice_id not in await tts_bridge.engine_voices(force=True):
+            # Vorschlagsstimme fehlt: Host trotzdem anlegen, Stimme nachwählbar.
+            voice_id = None
+        db = db_getter()
+        host_id = generate_id("host")
+        now = _now_iso()
+        db.execute(
+            "INSERT INTO hosts (id, user_id, name, personality, speaking_style, voice_id, role, "
+            "created_at, updated_at, persona_tagline) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                host_id,
+                user["id"],
+                name,
+                preset["personality"],
+                preset["speaking_style"],
+                voice_id,
+                preset["role"],
+                now,
+                now,
+                preset["tagline"],
+            ),
+        )
+        db.commit()
+        host = _get_host_or_404(db, host_id, user["id"])
+        host["voice_missing"] = voice_id is None and bool(preset["voice"])
+        return host
 
     @router.get("/hosts/{host_id}")
     async def get_host(host_id: str, request: Request):
@@ -955,14 +1040,14 @@ def create_podcast_router(
         role = _require_choice(body.get("role") or "host", {"host", "expert"}, "role")
         voice_id = (body.get("voice_id") or "").strip() or None
         db = db_getter()
-        # If voice_id given, verify it belongs to user and is a custom voice
-        if voice_id:
-            _get_custom_voice_or_400(db, voice_id, user["id"])
+        # If voice_id given, it must be a podcast-capable engine voice
+        if voice_id and voice_id not in await tts_bridge.engine_voices(force=True):
+            raise HTTPException(400, f"voice_id {voice_id!r} is not an OmniVoice or Kikiri voice")
         host_id = generate_id("host")
         now = _now_iso()
         db.execute(
-            "INSERT INTO hosts (id, user_id, name, personality, speaking_style, voice_id, role, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO hosts (id, user_id, name, personality, speaking_style, voice_id, role, "
+            "created_at, updated_at, persona_tagline) VALUES (?,?,?,?,?,?,?,?,?,?)",
             (
                 host_id,
                 user["id"],
@@ -973,6 +1058,7 @@ def create_podcast_router(
                 role,
                 now,
                 now,
+                _clean_limited_text(body.get("tagline"), "tagline", MAX_HOST_NAME_CHARS) or "",
             ),
         )
         db.commit()
@@ -985,9 +1071,14 @@ def create_podcast_router(
         _get_host_or_404(db, host_id, user["id"])
         fields: list[str] = []
         values: list[Any] = []
-        for key in ("name", "personality", "speaking_style", "voice_id", "role"):
+        for key in ("name", "personality", "speaking_style", "voice_id", "role", "tagline"):
             if key in body:
                 value = body[key]
+                if key == "tagline":
+                    value = _clean_limited_text(value, "tagline", MAX_HOST_NAME_CHARS) or ""
+                    fields.append("persona_tagline=?")
+                    values.append(value)
+                    continue
                 if key == "name":
                     value = _clean_limited_text(
                         value, "name", MAX_HOST_NAME_CHARS, required=True
@@ -1000,8 +1091,8 @@ def create_podcast_router(
                     value = _require_choice(value, {"host", "expert"}, "role")
                 elif key == "voice_id":
                     value = (value or "").strip() or None
-                    if value:
-                        _get_custom_voice_or_400(db, value, user["id"])
+                    if value and value not in await tts_bridge.engine_voices(force=True):
+                        raise HTTPException(400, f"voice_id {value!r} is not an OmniVoice or Kikiri voice")
                 fields.append(f"{key}=?")
                 values.append(value)
         if not fields:
@@ -1024,6 +1115,16 @@ def create_podcast_router(
         db.commit()
         return {"status": "deleted", "id": host_id}
 
+    # ---- Nonverbale Tags ---------------------------------------------------
+
+    # Muss vor "/podcasts/{podcast_id}" stehen, sonst schluckt der
+    # Pfadparameter das Wort "tags".
+    @router.get("/podcasts/tags")
+    async def list_segment_tags(request: Request):
+        """Katalog der nonverbalen OmniVoice-Tags für die Editor-Palette."""
+        get_current_user(request)
+        return {"tags": tag_catalog()}
+
     # ---- Podcast CRUD ------------------------------------------------------
 
     @router.get("/podcasts")
@@ -1044,15 +1145,20 @@ def create_podcast_router(
     @router.post("/podcasts")
     async def create_podcast(body: dict, request: Request):
         user = get_current_user(request)
-        fmt = _require_choice(body.get("format") or "dialog", ALLOWED_PODCAST_FORMATS, "format")
+        # Was der Client nicht mitschickt, kommt aus den Podcast-Voreinstellungen
+        # des Nutzers (Einstellungen ▸ Podcasts), nicht aus fest verdrahteten Werten.
+        prefs = user_settings.read(db_getter(), user["id"], "podcast")
+        fmt = _require_choice(
+            body.get("format") or prefs["format"], ALLOWED_PODCAST_FORMATS, "format"
+        )
         duration = _require_choice(
-            body.get("duration") or "medium", ALLOWED_PODCAST_DURATIONS, "duration"
+            body.get("duration") or prefs["duration"], ALLOWED_PODCAST_DURATIONS, "duration"
         )
         audio_format = _require_choice(
-            body.get("audio_format") or "mp3", ALLOWED_AUDIO_FORMATS, "audio_format"
+            body.get("audio_format") or prefs["audio_format"], ALLOWED_AUDIO_FORMATS, "audio_format"
         )
         try:
-            disfluency_level = int(body.get("disfluency_level", 2))
+            disfluency_level = int(body.get("disfluency_level", prefs["disfluency_level"]))
         except (TypeError, ValueError):
             raise HTTPException(400, "disfluency_level must be 0..3")
         if disfluency_level not in (0, 1, 2, 3):
@@ -1067,10 +1173,9 @@ def create_podcast_router(
         for hid in host_ids:
             hosts.append(_get_host_or_404(db, hid, user["id"]))
 
-        # Enforce: every host with a voice_id must use a custom voice
+        # Enforce: every host with a voice_id must name a real engine voice
         for h in hosts:
-            if h["voice_id"]:
-                _get_custom_voice_or_400(db, h["voice_id"], user["id"])
+            await _require_engine_voice(h["voice_id"])
 
         podcast_id = generate_id("pod")
         now = _now_iso()
@@ -1086,7 +1191,7 @@ def create_podcast_router(
                 fmt,
                 disfluency_level,
                 duration,
-                _clean_language(body.get("language")),
+                _clean_language(body.get("language") or prefs["language"]),
                 "draft",
                 json.dumps(hosts),
                 json.dumps([]),
@@ -1102,7 +1207,8 @@ def create_podcast_router(
     async def update_podcast(podcast_id: str, body: dict, request: Request):
         user = get_current_user(request)
         db = db_getter()
-        _get_podcast_or_404(db, podcast_id, user["id"])
+        podcast = _get_podcast_or_404(db, podcast_id, user["id"])
+        _require_idle(podcast)
         fields: list[str] = []
         values: list[Any] = []
         for key in ("topic", "format", "duration", "language", "audio_format"):
@@ -1135,12 +1241,21 @@ def create_podcast_router(
             for hid in body["host_ids"] or []:
                 hosts.append(_get_host_or_404(db, hid, user["id"]))
             for h in hosts:
-                if h["voice_id"]:
-                    _get_custom_voice_or_400(db, h["voice_id"], user["id"])
+                await _require_engine_voice(h["voice_id"])
             fields.append("hosts_json=?")
             values.append(json.dumps(hosts))
+            script = podcast.get("script")
+            if script:
+                old_ids = {h["id"] for h in podcast["hosts"]}
+                new_ids = {h["id"] for h in hosts}
+                used_ids = {seg.get("speaker_id") for seg in script.get("segments", []) if seg.get("type", "speech") == "speech"}
+                if (old_ids - new_ids) & used_ids:
+                    raise HTTPException(409, "Assign existing segments to another speaker before removing a cast member")
+                fields.append("script_json=?")
+                values.append(json.dumps(_bind_episode_cast(script, hosts, refresh_voices=True)))
         if not fields:
             return _get_podcast_or_404(db, podcast_id, user["id"])
+        _require_idle(_get_podcast_or_404(db, podcast_id, user["id"]))
         fields.append("updated_at=?")
         values.append(_now_iso())
         values.extend([podcast_id, user["id"]])
@@ -1397,6 +1512,45 @@ def create_podcast_router(
         ).fetchone()
         return _source_row_to_dict(row)
 
+    @router.post("/podcasts/{podcast_id}/sources/{source_id}/reprocess")
+    async def reprocess_source(podcast_id: str, source_id: str, request: Request):
+        """Eine Quelle erneut verarbeiten.
+
+        Verarbeitung laeuft im Hintergrund, ein Fehler landet also nur als
+        `status='failed'` in der Zeile — die hochgeladene Datei liegt aber noch
+        auf der Platte. Damit ein behobener Parser-Fehler nicht bedeutet, dass
+        der Nutzer alles erneut hochlaedt, kann dieselbe Quelle neu angestossen
+        werden.
+        """
+        user = get_current_user(request)
+        db = db_getter()
+        _assert_podcast(db, podcast_id, user["id"])
+        row = db.execute(
+            "SELECT type, content, url FROM podcast_sources WHERE id=? AND podcast_id=?",
+            (source_id, podcast_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Source not found")
+        kind, content, url = row[0], row[1], row[2]
+        if kind == "file" and not (content and Path(content).exists()):
+            raise HTTPException(410, "Uploaded file is gone; please upload it again")
+        db.execute(
+            "UPDATE podcast_sources SET status='pending', error_message=NULL, chunk_count=0 "
+            "WHERE id=? AND podcast_id=?",
+            (source_id, podcast_id),
+        )
+        db.commit()
+
+        asyncio.create_task(
+            _process_source_async(source_id, podcast_id, kind, content, url)
+        )
+
+        row = db.execute(
+            f"SELECT {_SOURCE_COLUMNS} FROM podcast_sources WHERE id=? AND podcast_id=?",
+            (source_id, podcast_id),
+        ).fetchone()
+        return _source_row_to_dict(row)
+
     @router.delete("/podcasts/{podcast_id}/sources/{source_id}")
     async def delete_source(podcast_id: str, source_id: str, request: Request):
         user = get_current_user(request)
@@ -1464,15 +1618,15 @@ def create_podcast_router(
         user = get_current_user(request)
         db = db_getter()
         podcast = _get_podcast_or_404(db, podcast_id, user["id"])
+        _require_idle(podcast)
 
         hosts = _hosts_from_dicts(podcast["hosts"])
         if not hosts:
             raise HTTPException(400, "Podcast has no hosts assigned")
 
-        # Podcasts require custom voices — verify every host with a voice
+        # Verify every host voice still exists on an engine
         for h in hosts:
-            if h.voice_id:
-                _get_custom_voice_or_400(db, h.voice_id, user["id"])
+            await _require_engine_voice(h.voice_id)
 
         chunks = _load_podcast_chunks(db, podcast_id)
         sources = _load_podcast_sources(db, podcast_id)
@@ -1497,12 +1651,14 @@ def create_podcast_router(
             options=options,
         )
 
-        db.execute(
+        claim = db.execute(
             "UPDATE podcasts SET status='generating_script', error_message=NULL, updated_at=? "
-            "WHERE id=? AND user_id=?",
+            "WHERE id=? AND user_id=? AND status NOT IN ('generating_script', 'generating_audio')",
             (_now_iso(), podcast_id, user["id"]),
         )
         db.commit()
+        if claim.rowcount != 1:
+            raise HTTPException(409, "A production is already active")
 
         # --- Real-time SSE: initial event + background worker with queue ---
         event_queue: asyncio.Queue[str | None] = asyncio.Queue()
@@ -1571,7 +1727,14 @@ def create_podcast_router(
             task = asyncio.create_task(worker())
             try:
                 while True:
-                    event = await event_queue.get()
+                    # Ein Denkmodell oder ein langer Render kann minutenlang
+                    # schweigen; Nginx (600 s) und Browser kappen stille
+                    # Verbindungen. Ein SSE-Kommentar alle 15 s haelt sie offen.
+                    try:
+                        event = await asyncio.wait_for(event_queue.get(), timeout=15)
+                    except asyncio.TimeoutError:
+                        yield ": keepalive\n\n"
+                        continue
                     if event is None:
                         break
                     yield event
@@ -1595,6 +1758,7 @@ def create_podcast_router(
         user = get_current_user(request)
         db = db_getter()
         podcast = _get_podcast_or_404(db, podcast_id, user["id"])
+        _require_idle(podcast)
         script = podcast.get("script") or {}
         segments = script.get("segments") or []
         target = None
@@ -1610,8 +1774,7 @@ def create_podcast_router(
                     target[key] = _require_choice(body[key], ALLOWED_SEGMENT_TYPES, "type")
                 elif key == "voice":
                     voice = (body[key] or "").strip() or None
-                    if voice:
-                        _get_custom_voice_or_400(db, voice, user["id"])
+                    await _require_engine_voice(voice)
                     target[key] = voice
                 elif key == "text":
                     target[key] = _validate_segment_text(str(body[key] or ""))
@@ -1632,15 +1795,15 @@ def create_podcast_router(
             target["volume_db"] = _validate_volume_db(
                 _coerce_float(body["volume_db"], "volume_db")
             )
-        if target.get("type") in ("music", "sfx"):
+        if target.get("type") == "music":
             prompt = (target.get("prompt") or target.get("text") or "").strip()
             if not prompt:
-                raise HTTPException(400, "music/sfx segments require a prompt")
+                raise HTTPException(400, "music segments require a prompt")
             target["prompt"] = prompt
         if target.get("type") == "pause" and not target.get("duration_ms"):
             target["duration_ms"] = 500
         _validate_segment_semantics(target)
-        # Cached audio for music/sfx segments must be invalidated when the
+        # Cached audio for music segments must be invalidated when the
         # prompt or duration changes — let the assembler regenerate next run.
         if "prompt" in body or "duration_ms" in body:
             project_dir = Path(
@@ -1657,14 +1820,20 @@ def create_podcast_router(
             text = target.get("text") or ""
             target["word_count"] = count_words(text)
             target["estimated_duration"] = estimate_speaking_duration(target["word_count"])
-        # Music/SFX duration drives estimated_duration directly.
-        if target.get("type") in ("music", "sfx") and target.get("duration_ms"):
+        # Music duration drives estimated_duration directly.
+        if target.get("type") == "music" and target.get("duration_ms"):
             target["estimated_duration"] = target["duration_ms"] / 1000.0
+        if "speaker_id" in body and target.get("type", "speech") == "speech":
+            host = next((h for h in podcast["hosts"] if h["id"] == body["speaker_id"]), None)
+            if not host:
+                raise HTTPException(400, "Speaker is not in this episode cast")
+            target.update(speaker_id=host["id"], speaker=host["name"], voice=host.get("voice_id"))
         target["updated_at"] = _now_iso()
         script["segments"] = segments
         script["total_words"] = sum(s.get("word_count", 0) for s in segments)
         script["estimated_duration"] = sum(s.get("estimated_duration", 0) for s in segments)
 
+        _require_idle(_get_podcast_or_404(db, podcast_id, user["id"]))
         db.execute(
             "UPDATE podcasts SET script_json=?, total_words=?, updated_at=? WHERE id=? AND user_id=?",
             (json.dumps(script), script["total_words"], _now_iso(), podcast_id, user["id"]),
@@ -1674,10 +1843,11 @@ def create_podcast_router(
 
     @router.post("/podcasts/{podcast_id}/script/segments")
     async def add_segment(podcast_id: str, body: dict, request: Request):
-        """Insert a new segment (typically music or sfx) at a given position."""
+        """Insert a new segment (typically music) at a given position."""
         user = get_current_user(request)
         db = db_getter()
         podcast = _get_podcast_or_404(db, podcast_id, user["id"])
+        _require_idle(podcast)
         script = podcast.get("script") or {}
         segments = script.get("segments") or []
 
@@ -1687,16 +1857,15 @@ def create_podcast_router(
 
         text = _validate_segment_text(str(body.get("text") or ""))
         prompt = body.get("prompt")
-        if seg_type in ("music", "sfx"):
+        if seg_type == "music":
             prompt = _validate_segment_prompt(str(prompt or text or ""))
             if not prompt:
-                raise HTTPException(400, "music/sfx segments require a prompt")
+                raise HTTPException(400, "music segments require a prompt")
         elif prompt:
             prompt = _validate_segment_prompt(str(prompt))
 
         voice = (body.get("voice") or "").strip() or None
-        if voice:
-            _get_custom_voice_or_400(db, voice, user["id"])
+        await _require_engine_voice(voice)
 
         duration_ms = _validate_duration_ms(
             _coerce_int(body.get("duration_ms"), "duration_ms")
@@ -1715,8 +1884,6 @@ def create_podcast_router(
             duration_ms = 30000
         if seg_type == "music" and volume_db == 0.0:
             volume_db = -14.0  # ducked under speech by default
-        if seg_type == "sfx" and duration_ms <= 0 and prompt:
-            duration_ms = 4000
 
         now = _now_iso()
         new_seg = {
@@ -1754,6 +1921,7 @@ def create_podcast_router(
         script["total_words"] = sum(s.get("word_count", 0) for s in segments)
         script["estimated_duration"] = sum(s.get("estimated_duration", 0) for s in segments)
 
+        _require_idle(_get_podcast_or_404(db, podcast_id, user["id"]))
         db.execute(
             "UPDATE podcasts SET script_json=?, total_words=?, updated_at=? WHERE id=? AND user_id=?",
             (json.dumps(script), script["total_words"], _now_iso(), podcast_id, user["id"]),
@@ -1766,6 +1934,7 @@ def create_podcast_router(
         user = get_current_user(request)
         db = db_getter()
         podcast = _get_podcast_or_404(db, podcast_id, user["id"])
+        _require_idle(podcast)
         script = podcast.get("script") or {}
         original = script.get("segments") or []
         segments = [s for s in original if s.get("id") != segment_id]
@@ -1776,6 +1945,7 @@ def create_podcast_router(
         script["segments"] = segments
         script["total_words"] = sum(s.get("word_count", 0) for s in segments)
         script["estimated_duration"] = sum(s.get("estimated_duration", 0) for s in segments)
+        _require_idle(_get_podcast_or_404(db, podcast_id, user["id"]))
         db.execute(
             "UPDATE podcasts SET script_json=?, total_words=?, updated_at=? WHERE id=? AND user_id=?",
             (json.dumps(script), script["total_words"], _now_iso(), podcast_id, user["id"]),
@@ -1790,6 +1960,7 @@ def create_podcast_router(
         user = get_current_user(request)
         db = db_getter()
         podcast = _get_podcast_or_404(db, podcast_id, user["id"])
+        _require_idle(podcast)
         script = podcast.get("script")
         if not script or not script.get("segments"):
             raise HTTPException(
@@ -1814,17 +1985,20 @@ def create_podcast_router(
         except Exception:
             pass
 
+        script = _bind_episode_cast(script, podcast["hosts"])
+        input_revision = _script_revision(script, podcast["hosts"])
         segments = [_dict_to_segment(s) for s in script["segments"]]
         audio_format: AudioFormat = "mp3" if (podcast.get("audio_format") or "mp3") == "mp3" else "wav"
 
-        db.execute(
+        claim = db.execute(
             "UPDATE podcasts SET status='generating_audio', error_message=NULL, updated_at=? "
-            "WHERE id=? AND user_id=?",
+            "WHERE id=? AND user_id=? AND status NOT IN ('generating_script', 'generating_audio')",
             (_now_iso(), podcast_id, user["id"]),
         )
         db.commit()
+        if claim.rowcount != 1:
+            raise HTTPException(409, "A production is already active")
 
-        result_holder: dict = {"done": False, "error": None, "result": None}
         event_queue: asyncio.Queue[str | None] = asyncio.Queue()
 
         def make_progress_event(p: AssemblyProgress) -> str:
@@ -1851,6 +2025,16 @@ def create_podcast_router(
         async def worker():
             """Background task that runs the synthesis and pushes events into the queue."""
             try:
+                old_audio = podcast.get("audio_path")
+                if old_audio:
+                    old_path = _safe_audio_path(old_audio)
+                    if old_path.is_file():
+                        old_sha = await asyncio.to_thread(_sha256_file, old_path)
+                        archived = old_path.with_name(f"audio-{old_sha}{old_path.suffix}")
+                        if old_path != archived:
+                            await asyncio.to_thread(shutil.copy2, old_path, archived)
+                            db.execute("UPDATE podcasts SET audio_path=?, audio_sha256=? WHERE id=? AND user_id=?", (str(archived), old_sha, podcast_id, user["id"]))
+                            db.commit()
                 result = await assembler.assemble_from_segments(
                     segments=segments,
                     project_id=podcast_id,
@@ -1860,17 +2044,20 @@ def create_podcast_router(
                     user_id=user["id"],
                 )
                 audio_sha256 = await asyncio.to_thread(_sha256_file, result.file_path)
+                immutable_path = result.file_path.with_name(f"audio-{audio_sha256}{result.file_path.suffix}")
+                await asyncio.to_thread(shutil.copy2, result.file_path, immutable_path)
                 result.audio_sha256 = audio_sha256
                 db.execute(
                     "UPDATE podcasts SET status='ready', audio_path=?, audio_duration=?, "
-                    "audio_format=?, audio_size=?, audio_sha256=?, "
+                    "audio_format=?, audio_size=?, audio_sha256=?, audio_revision=?, "
                     "error_message=NULL, updated_at=? WHERE id=? AND user_id=?",
                     (
-                        str(result.file_path),
+                        str(immutable_path),
                         result.duration,
                         audio_format,
                         result.file_size,
                         audio_sha256,
+                        input_revision,
                         _now_iso(),
                         podcast_id,
                         user["id"],
@@ -1907,7 +2094,14 @@ def create_podcast_router(
             task = asyncio.create_task(worker())
             try:
                 while True:
-                    event = await event_queue.get()
+                    # Ein Denkmodell oder ein langer Render kann minutenlang
+                    # schweigen; Nginx (600 s) und Browser kappen stille
+                    # Verbindungen. Ein SSE-Kommentar alle 15 s haelt sie offen.
+                    try:
+                        event = await asyncio.wait_for(event_queue.get(), timeout=15)
+                    except asyncio.TimeoutError:
+                        yield ": keepalive\n\n"
+                        continue
                     if event is None:
                         break
                     yield event
@@ -1970,35 +2164,35 @@ def create_podcast_router(
     async def stream_audio(podcast_id: str, request: Request):
         user = get_current_user(request)
         podcast = _get_podcast_or_404(db_getter(), podcast_id, user["id"])
-        path = _locate_audio(podcast)
-        fmt = podcast.get("audio_format") or "mp3"
+        revision = request.query_params.get("revision", "")
+        if revision and not re.fullmatch(r"[0-9a-f]{64}", revision):
+            raise HTTPException(400, "Invalid audio revision")
+        if revision and revision != podcast.get("audio_sha256"):
+            directory = assembler.output_dir / podcast_id
+            path = next((p for ext in ("mp3", "wav") if (p := directory / f"audio-{revision}.{ext}").is_file()), None)
+            if path is None:
+                raise HTTPException(404, "Audio revision not found")
+            path = _safe_audio_path(path)
+        else:
+            path = _locate_audio(podcast)
+        fmt = path.suffix.lstrip(".")
         media_type = "audio/mpeg" if fmt == "mp3" else "audio/wav"
 
         file_size = path.stat().st_size
         range_header = request.headers.get("range") or request.headers.get("Range")
 
         if range_header:
-            match = re.match(r"bytes=(\d+)-(\d*)", range_header.strip())
-            if not match:
-                raise HTTPException(416, "Invalid Range header")
-            start = int(match.group(1))
-            end_raw = match.group(2)
-            end = int(end_raw) if end_raw else file_size - 1
-            if start >= file_size or end >= file_size or start > end:
-                raise HTTPException(416, "Range not satisfiable")
+            try:
+                start, end = parse_single_range(range_header, file_size)
+            except ValueError as exc:
+                raise HTTPException(
+                    416,
+                    "Range not satisfiable",
+                    headers={"Content-Range": f"bytes */{file_size}"},
+                ) from exc
             length = end - start + 1
-
-            async def reader():
-                loop = asyncio.get_event_loop()
-                def _read():
-                    with path.open("rb") as fh:
-                        fh.seek(start)
-                        return fh.read(length)
-                data = await loop.run_in_executor(None, _read)
-                yield data
-
             return StreamingResponse(
-                reader(),
+                iter_file_range(path, start, end),
                 status_code=206,
                 media_type=media_type,
                 headers={

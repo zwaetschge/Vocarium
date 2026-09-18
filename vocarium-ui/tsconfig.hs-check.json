@@ -1,0 +1,1 @@
+{"extends":"./tsconfig.app.json","include":["src/main.tsx","src/vite-env.d.ts"],"compilerOptions":{"tsBuildInfoFile":"/tmp/vocarium-hs-check.tsbuildinfo"}}

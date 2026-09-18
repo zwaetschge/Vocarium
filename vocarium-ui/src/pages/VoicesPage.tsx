@@ -6,24 +6,51 @@ import type { Voice } from '../types';
 import VoiceCard from '../components/VoiceCard';
 import SkeletonCard from '../components/SkeletonCard';
 import WaveformBars from '../components/WaveformBars';
-import { voiceSourceLabel } from '../voiceUtils';
+import { describeVoice, engineVoices, isFallbackVoice } from '../voiceUtils';
 
-type SourceFilter = 'all' | 'clone' | 'design' | 'custom';
+/**
+ * Filter entlang der Engines, nicht entlang der alten `source`-Werte.
+ *
+ * Vorher gab es Reiter für `clone`, `design` und `custom` — Quellen, die es
+ * seit der Umstellung auf OmniVoice und Kikiri nicht mehr gibt. Drei von vier
+ * Reitern waren dauerhaft leer. Das hier sind die Unterscheidungen, die die
+ * API tatsächlich liefert und die beim Rendern etwas bedeuten.
+ */
+type Bucket = 'all' | 'omnivoice' | 'finetune' | 'fallback';
+
+const BUCKET_LABEL: Record<Bucket, string> = {
+  all: 'Alle',
+  omnivoice: 'OmniVoice',
+  finetune: 'Finetunes',
+  fallback: 'Fallback',
+};
+
+function bucketOf(voice: Voice): Exclude<Bucket, 'all'> {
+  if (voice.source === 'omnivoice') return 'omnivoice';
+  return isFallbackVoice(voice) ? 'fallback' : 'finetune';
+}
+
+interface Section {
+  key: string;
+  title: string;
+  hint: string;
+  voices: Voice[];
+}
 
 export default function VoicesPage() {
   const [voices, setVoices] = useState<Voice[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState('');
-  const [filter, setFilter] = useState<SourceFilter>('all');
+  const [bucket, setBucket] = useState<Bucket>('all');
 
   const fetchVoices = async () => {
     try {
       const data = await getVoices();
-      setVoices(data);
+      setVoices(engineVoices(data));
       setError(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load voices');
+      setError(err instanceof Error ? err.message : 'Stimmen konnten nicht geladen werden');
     }
     setLoading(false);
   };
@@ -32,39 +59,60 @@ export default function VoicesPage() {
     fetchVoices();
   }, []);
 
+  const counts = useMemo(() => {
+    const base: Record<Bucket, number> = { all: voices.length, omnivoice: 0, finetune: 0, fallback: 0 };
+    for (const v of voices) base[bucketOf(v)] += 1;
+    return base;
+  }, [voices]);
+
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     return voices.filter((v) => {
-      if (filter === 'clone' && v.source !== 'clone') return false;
-      if (filter === 'design' && v.source !== 'design') return false;
-      if (filter === 'custom' && v.source !== 'custom') return false;
+      if (bucket !== 'all' && bucketOf(v) !== bucket) return false;
       if (!q) return true;
       return (
         v.name.toLowerCase().includes(q)
-        || v.language.toLowerCase().includes(q)
-        || voiceSourceLabel(v).toLowerCase().includes(q)
+        || v.id.toLowerCase().includes(q)
+        || describeVoice(v).toLowerCase().includes(q)
+        || (v.notes || '').toLowerCase().includes(q)
       );
     });
-  }, [voices, search, filter]);
+  }, [voices, search, bucket]);
 
-  const counts = useMemo(
-    () => ({
-      all: voices.length,
-      clone: voices.filter((v) => v.source === 'clone').length,
-      design: voices.filter((v) => v.source === 'design').length,
-      custom: voices.filter((v) => v.source === 'custom').length,
-    }),
-    [voices]
-  );
+  /* Die Liste bleibt nach Engine gegliedert, auch gefiltert: sechzig Kacheln am
+     Stück sagen nichts darüber, welche davon auf der GPU laufen. */
+  const sections = useMemo<Section[]>(() => {
+    const pick = (k: Exclude<Bucket, 'all'>) => filtered.filter((v) => bucketOf(v) === k);
+    return [
+      {
+        key: 'omnivoice',
+        title: 'OmniVoice — Klonstimmen',
+        hint: 'Hauptengine, GPU, jede Stimme mit eigener Referenzaufnahme',
+        voices: pick('omnivoice'),
+      },
+      {
+        key: 'finetune',
+        title: 'Kikiri — Finetunes',
+        hint: 'Auf der CPU trainierte Kokoro-Stimmen',
+        voices: pick('finetune'),
+      },
+      {
+        key: 'fallback',
+        title: 'Kikiri — Fallback',
+        hint: 'Piper-Bank auf der CPU, greift nur wenn OmniVoice ausfällt',
+        voices: pick('fallback'),
+      },
+    ].filter((s) => s.voices.length > 0);
+  }, [filtered]);
 
   if (loading) {
     return (
       <div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '16px', marginBottom: '28px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '16px', marginBottom: '22px' }}>
           <div className="skeleton-shimmer" style={{ height: '32px', width: '200px', borderRadius: '10px' }} />
           <div className="skeleton-shimmer" style={{ height: '24px', width: '48px', borderRadius: '999px' }} />
         </div>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))', gap: '18px' }}>
+        <div className="voice-grid">
           {Array.from({ length: 6 }).map((_, i) => (
             <SkeletonCard key={i} />
           ))}
@@ -81,66 +129,50 @@ export default function VoicesPage() {
     return <EmptyState />;
   }
 
+  let tileIndex = 0;
+
   return (
-    <div>
-      {/* Toolbar */}
-      <div
-        className="glass"
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: '14px',
-          padding: '14px 18px',
-          borderRadius: '16px',
-          marginBottom: '28px',
-          flexWrap: 'wrap',
-        }}
-      >
-        {/* Count pill */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-          <motion.span
-            initial={{ scale: 0.8, opacity: 0 }}
-            animate={{ scale: 1, opacity: 1 }}
-            transition={{ type: 'spring', stiffness: 400, damping: 22, delay: 0.08 }}
-            style={{
-              display: 'inline-flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              minWidth: '28px',
-              height: '26px',
-              padding: '0 9px',
-              fontSize: '12px',
-              fontWeight: 700,
-              borderRadius: '999px',
-              background: 'rgba(123,97,255,0.14)',
-              color: 'var(--color-accent)',
-              fontFamily: 'var(--font-mono)',
-              border: '1px solid rgba(123,97,255,0.28)',
-              letterSpacing: 0,
-            }}
-          >
-            {filtered.length}
-          </motion.span>
-          <span
-            style={{
-              fontSize: '13px',
-              color: 'var(--color-text-secondary)',
-              letterSpacing: 0,
-            }}
-          >
-            {filtered.length === 1 ? 'voice' : 'voices'}
-            {search && (
-              <span style={{ color: 'var(--color-text-dim)' }}>
-                {' '}matching "{search}"
-              </span>
-            )}
-          </span>
+    <div className="voices-page">
+      <header className="speech-header">
+        <div>
+          <h1 style={{ fontSize: '26px', marginBottom: '4px' }}>Stimmen</h1>
+          <p style={{ fontSize: '13.5px', color: 'var(--color-text-secondary)', lineHeight: 1.5 }}>
+            Alles, was gerade rendern kann. Antippen öffnet die Kurzprobe, die Play-Taste spielt sofort.
+          </p>
+        </div>
+        <div className="speech-route-pill" title="Verteilung über die beiden Engines">
+          <span className="status-dot status-dot-online" />
+          <span>{counts.omnivoice} GPU · {counts.finetune + counts.fallback} CPU</span>
+        </div>
+      </header>
+
+      <div className="voices-toolbar">
+        <div className="voices-tabs" role="tablist">
+          {(['all', 'omnivoice', 'finetune', 'fallback'] as Bucket[]).map((b) => {
+            const active = bucket === b;
+            return (
+              <button
+                key={b}
+                role="tab"
+                aria-selected={active}
+                onClick={() => setBucket(b)}
+                className={`voices-tab${active ? ' voices-tab-active' : ''}`}
+              >
+                {active && (
+                  <motion.span
+                    layoutId="voices-filter-indicator"
+                    className="voices-tab-indicator"
+                    transition={{ type: 'spring', stiffness: 420, damping: 34 }}
+                  />
+                )}
+                <span style={{ position: 'relative' }}>{BUCKET_LABEL[b]}</span>
+                <span className="voices-tab-count">{counts[b]}</span>
+              </button>
+            );
+          })}
         </div>
 
-        <div style={{ flex: 1 }} />
-
-        {/* Search */}
-        <div style={{ position: 'relative', width: '240px' }}>
+        <div className="voices-search">
           <svg
             width="14"
             height="14"
@@ -149,14 +181,7 @@ export default function VoicesPage() {
             stroke="currentColor"
             strokeWidth="1.6"
             strokeLinecap="round"
-            style={{
-              position: 'absolute',
-              left: '12px',
-              top: '50%',
-              transform: 'translateY(-50%)',
-              color: 'var(--color-text-dim)',
-              pointerEvents: 'none',
-            }}
+            style={{ opacity: 0.45, flexShrink: 0 }}
           >
             <circle cx="7" cy="7" r="5" />
             <path d="M14 14l-3-3" />
@@ -165,148 +190,50 @@ export default function VoicesPage() {
             type="text"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search voices..."
-            className="input-field"
-            style={{
-              width: '100%',
-              height: '36px',
-              paddingLeft: '34px',
-              paddingRight: '12px',
-              fontSize: '13px',
-              boxSizing: 'border-box',
-            }}
+            placeholder="Stimme suchen…"
+            aria-label="Stimme suchen"
           />
-        </div>
-
-        {/* Filter tabs */}
-        <div
-          role="tablist"
-          style={{
-            display: 'flex',
-            padding: '3px',
-            borderRadius: '10px',
-            background: 'rgba(255,255,255,0.04)',
-            border: '1px solid rgba(255,255,255,0.06)',
-          }}
-        >
-          {(['all', 'clone', 'design', 'custom'] as SourceFilter[]).map((f) => {
-            const active = filter === f;
-            return (
-              <button
-                key={f}
-                role="tab"
-                aria-selected={active}
-                onClick={() => setFilter(f)}
-                style={{
-                  position: 'relative',
-                  padding: '6px 12px',
-                  fontSize: '12px',
-                  fontWeight: 500,
-                  letterSpacing: 0,
-                  textTransform: 'capitalize',
-                  color: active ? 'var(--color-text)' : 'var(--color-text-secondary)',
-                  background: 'transparent',
-                  border: 'none',
-                  cursor: 'pointer',
-                  borderRadius: '7px',
-                  transition: 'color 0.15s ease',
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  gap: '7px',
-                }}
-              >
-                {active && (
-                  <motion.span
-                    layoutId="voices-filter-indicator"
-                    style={{
-                      position: 'absolute',
-                      inset: 0,
-                      background: 'rgba(255,255,255,0.08)',
-                      borderRadius: '7px',
-                      border: '1px solid rgba(255,255,255,0.1)',
-                      boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.06)',
-                    }}
-                    transition={{ type: 'spring', stiffness: 400, damping: 30 }}
-                  />
-                )}
-                <span style={{ position: 'relative' }}>{f}</span>
-                <span
-                  style={{
-                    position: 'relative',
-                    fontSize: '10.5px',
-                    fontFamily: 'var(--font-mono)',
-                    color: 'var(--color-text-dim)',
-                    letterSpacing: 0,
-                  }}
-                >
-                  {counts[f]}
-                </span>
-              </button>
-            );
-          })}
+          {search && (
+            <button type="button" onClick={() => setSearch('')} aria-label="Suche leeren" className="btn-ghost" style={{ padding: 2, borderRadius: 6, lineHeight: 0 }}>
+              <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                <path d="M2 2l8 8M10 2l-8 8" />
+              </svg>
+            </button>
+          )}
         </div>
       </div>
 
-      {/* Grid */}
-      {filtered.length === 0 ? (
+      {sections.length === 0 ? (
         <motion.div
-          initial={{ opacity: 0, y: 10 }}
+          initial={{ opacity: 0, y: 8 }}
           animate={{ opacity: 1, y: 0 }}
           className="card-subtle"
-          style={{
-            padding: '60px 32px',
-            textAlign: 'center',
-          }}
+          style={{ padding: '52px 32px', textAlign: 'center' }}
         >
-          <div
-            style={{
-              width: '44px',
-              height: '44px',
-              borderRadius: '12px',
-              display: 'inline-flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              background: 'rgba(255,255,255,0.04)',
-              border: '1px solid rgba(255,255,255,0.08)',
-              color: 'var(--color-text-dim)',
-              marginBottom: '16px',
-            }}
-          >
-            <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
-              <circle cx="9" cy="9" r="6" />
-              <path d="M18 18l-4.5-4.5" />
-            </svg>
-          </div>
-          <h4
-            style={{
-              fontSize: '15px',
-              fontWeight: 600,
-              fontFamily: 'var(--font-display)',
-              color: 'var(--color-text)',
-              margin: '0 0 6px',
-              letterSpacing: 0,
-            }}
-          >
-            No matches
+          <h4 style={{ fontSize: '15px', fontWeight: 600, fontFamily: 'var(--font-display)', margin: '0 0 6px' }}>
+            Keine Treffer
           </h4>
           <p style={{ fontSize: '13px', color: 'var(--color-text-secondary)', margin: 0 }}>
-            Try a different search or filter.
+            {search ? <>Keine Stimme passt zu „{search}“.</> : 'In diesem Bereich gibt es derzeit keine Stimmen.'}
           </p>
         </motion.div>
       ) : (
-        <div
-          style={{
-            display: 'grid',
-            gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))',
-            gap: '18px',
-          }}
-        >
-          <AnimatePresence mode="popLayout">
-            {filtered.map((voice, i) => (
-              <VoiceCard key={voice.id} voice={voice} index={i} onDeleted={fetchVoices} />
-            ))}
-          </AnimatePresence>
-        </div>
+        sections.map((section) => (
+          <section key={section.key} className="voices-section">
+            <div className="voices-section-head">
+              <h2>{section.title}</h2>
+              <span className="voices-section-count">{section.voices.length}</span>
+              <span className="voices-section-hint">{section.hint}</span>
+            </div>
+            <div className="voice-grid">
+              <AnimatePresence mode="popLayout">
+                {section.voices.map((voice) => (
+                  <VoiceCard key={voice.id} voice={voice} index={tileIndex++} onDeleted={fetchVoices} />
+                ))}
+              </AnimatePresence>
+            </div>
+          </section>
+        ))
       )}
     </div>
   );
@@ -356,7 +283,7 @@ function ErrorState({ message, onRetry }: { message: string; onRetry: () => void
           letterSpacing: 0,
         }}
       >
-        Couldn't load voices
+        Stimmen nicht erreichbar
       </h3>
       <p
         style={{
@@ -376,7 +303,7 @@ function ErrorState({ message, onRetry }: { message: string; onRetry: () => void
         className="btn btn-ghost"
         style={{ padding: '10px 22px', fontSize: '13px' }}
       >
-        Try again
+        Erneut versuchen
       </motion.button>
     </motion.div>
   );
@@ -415,7 +342,7 @@ function EmptyState() {
           color: 'var(--color-text)',
         }}
       >
-        Your voice library is empty
+        Keine Stimme verfügbar
       </h3>
       <p
         style={{
@@ -426,29 +353,19 @@ function EmptyState() {
           lineHeight: 1.6,
         }}
       >
-        Clone a voice from a short audio sample, or compose one from a text description.
-        Voices live here for reuse across Speech.
+        Weder OmniVoice noch Kikiri meldet gerade eine Stimme. Prüfe die Dienste — oder klone eine
+        neue Stimme aus einer kurzen Aufnahme.
       </p>
-      <div style={{ display: 'flex', gap: '12px' }}>
-        <Link to="/clone" style={{ textDecoration: 'none' }}>
-          <motion.button whileTap={{ scale: 0.97 }} whileHover={{ scale: 1.02 }} className="btn btn-primary" style={{ padding: '11px 22px', fontSize: '13.5px', gap: '8px' }}>
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
-              <circle cx="8" cy="6" r="3" />
-              <path d="M2.5 14v-.5a4 4 0 014-4h3a4 4 0 014 4V14" />
-              <path d="M13 3l1.5 1.5L13 6" />
-            </svg>
-            Clone a voice
-          </motion.button>
-        </Link>
-        <Link to="/design" style={{ textDecoration: 'none' }}>
-          <motion.button whileTap={{ scale: 0.97 }} whileHover={{ scale: 1.02 }} className="btn btn-ghost" style={{ padding: '11px 22px', fontSize: '13.5px', gap: '8px' }}>
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M2 12l3-1 8.5-8.5a1.8 1.8 0 00-2.5-2.5L2.5 8.5 2 12z" transform="translate(1 1)" />
-            </svg>
-            Design a voice
-          </motion.button>
-        </Link>
-      </div>
+      <Link to="/clone" style={{ textDecoration: 'none' }}>
+        <motion.button whileTap={{ scale: 0.97 }} whileHover={{ scale: 1.02 }} className="btn btn-primary" style={{ padding: '11px 22px', fontSize: '13.5px', gap: '8px' }}>
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+            <circle cx="8" cy="6" r="3" />
+            <path d="M2.5 14v-.5a4 4 0 014-4h3a4 4 0 014 4V14" />
+            <path d="M13 3l1.5 1.5L13 6" />
+          </svg>
+          Stimme klonen
+        </motion.button>
+      </Link>
     </motion.div>
   );
 }

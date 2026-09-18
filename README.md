@@ -4,17 +4,19 @@ Self-hosted voice platform with an ElevenLabs-compatible API. Runs entirely
 on your hardware — no per-character billing, no upload of recordings to a
 third party. One Docker Compose stack gives you:
 
-- **TTS** — Qwen3-TTS 1.7B in three flavours: voice cloning, voice design
-  from a description, and 9 prebuilt speakers with emotion steering.
-- **ASR** — Qwen3-ASR transcription for voice cloning and arbitrary audio.
-- **Music** — ACE-Step text-to-music with optional lyrics.
-- **SFX** — MMAudio sound effects from text prompts.
-- **Podcast Studio (beta)** — turn an uploaded PDF or document into a
-  multi-host dialogue script and render it to audio. Works, but the
-  script-generation prompts and pacing are still being tuned; expect
-  rough edges.
-- **React UI** with pages for every feature, plus a settings panel for
-  per-user LLM provider configuration.
+- **TTS** — OmniVoice zero-shot voice cloning on the GPU (a few seconds of
+  reference audio per voice) plus a CPU bank of German Kokoro fine-tunes and
+  Piper presets (Kikiri) that keeps speech flowing when the GPU is busy.
+- **ASR** — faster-whisper `large-v3` (profile `german`) and a Swiss German
+  fine-tune (profile `swiss`) for transcription and cloning references.
+- **Hörbücher** — upload PDF/EPUB/DOCX/TXT, get chapter segmentation, a
+  reader with live synthesis, M4B/MP3 export and a persistent render queue.
+- **Podcast Studio** — turn an uploaded document into a multi-host dialogue
+  script and render it to audio.
+- **Hörspiele** — turn a series episode (Plex) plus its book into a narrated
+  audio drama: transcript alignment, LLM-written narration, sample-accurate
+  render (ported from Szenenklang).
+- **React UI** for all four areas, plus per-user LLM provider settings.
 
 The API is OpenAI-style on the inference path (`/v1/audio/speech`,
 `/v1/audio/transcriptions`, `/v1/voices`) and ElevenLabs-style on the
@@ -30,15 +32,6 @@ management path (`/api/voices/clone`, `/api/generate`, `/api/transcribe`).
 **Voice Library** — every cloned, designed and prebuilt voice in one place.
 ![Voice Library](docs/screenshots/voice-library.png)
 
-**Custom voices** — nine prebuilt speakers with optional steering prompt.
-![Custom](docs/screenshots/custom-voice.png)
-
-**Music Studio** — ACE-Step text-to-music with optional lyrics and presets.
-![Music](docs/screenshots/music.png)
-
-**Sound Effects** — MMAudio cinematic sound design from a sentence.
-![Sound Effects](docs/screenshots/sound-effects.png)
-
 **Podcast Studio (beta)** — turn a PDF into a multi-voice scripted podcast.
 ![Podcast Studio](docs/screenshots/podcast-studio.png)
 
@@ -46,17 +39,13 @@ management path (`/api/voices/clone`, `/api/generate`, `/api/transcribe`).
 
 ## Hardware
 
-- **GPU**: NVIDIA, ≥ 12 GB VRAM. **One GPU is the default** — TTS, ASR,
-  music, and SFX share the GPU and auto-unload when idle. A second GPU
-  is optional (opt-in via `COMPOSE_PROFILES=dual-gpu`) and adds a parallel
-  TTS replica plus dedicated music/SFX placement.
-- Tested on **RTX 3060 (12 GB)** and **RTX 5060 Ti (16 GB, Blackwell SM 12.0)**.
-- **CPU/RAM**: 8 cores, 32 GB RAM is comfortable.
-- **Disk**: ~25 GB for model weights + working space for generated audio.
-
-> **Blackwell users (RTX 50xx)**: `flash-attn` is incompatible. The default
-> `TTS_ATTN_IMPL=eager` works. First inference compiles kernels (~15 s) —
-> not a hang.
+- **GPU**: NVIDIA, ≥ 8 GB VRAM. **One GPU is the default** — OmniVoice
+  stays resident (~2 GB), Whisper loads lazily and unloads after
+  `WHISPER_IDLE_TIMEOUT`. Everything is pinned to GPU 0 by `GPU_*` in `.env`.
+- Tested on **RTX 3060 (12 GB)**.
+- **CPU/RAM**: 8 cores, 32 GB RAM is comfortable (Kikiri and the embedding
+  service run on the CPU).
+- **Disk**: ~20 GB for model weights + working space for generated audio.
 
 ---
 
@@ -71,8 +60,8 @@ cd Vocarium
 That's it. The installer:
 1. Verifies Docker, Compose v2, and the NVIDIA Container Toolkit.
 2. Copies `.env.example` → `.env` (review it before re-running).
-3. Pulls the Qwen3 TTS + ASR weights (~10 GB) into `./models/` and
-   `./qwen3-tts/models/`.
+3. Pulls the Whisper and embedding weights into `./models/` and
+   `llama-embeddings/models/`; OmniVoice fetches its weights on first start.
 4. Builds and starts the containers.
 5. Smoke-tests the API.
 
@@ -108,35 +97,19 @@ Everything is in `.env`. Highlights:
 |--------------------|----------------|-----------------------------------------------------------|
 | `VOCARIUM_UI_PORT` | `3100`         | Public UI port.                                           |
 | `VOCARIUM_API_PORT`| `8280`         | Gateway API.                                              |
-| `GPU_TTS_1`        | `0`            | GPU index for the primary TTS replica.                    |
-| `GPU_ASR`          | `0`            | GPU index for ASR. Coexists with TTS via idle-unload.     |
-| `GPU_MUSIC` / `GPU_SFX` | `0` / `0` | Default: same GPU as TTS. Re-pin to `1` for dual-GPU.     |
-| `COMPOSE_PROFILES` | (empty)        | Set to `dual-gpu` to enable a second TTS replica.         |
-| `TTS_URL_2`        | (empty)        | Set to `http://qwen3-tts-2:8880` in dual-GPU mode.        |
-| `TTS_IDLE_TIMEOUT` | `120` s        | Auto-unload after this idle period. `0` = never.          |
-| `ALLOW_ANONYMOUS`  | `true`         | Single-user fallback when no `Remote-User` header.        |
-| `CORS_ORIGINS`     | `*`            | Restrict to your UI origins in production.                |
+| `GPU_TTS_1`        | `0`            | GPU index for OmniVoice.                                  |
+| `GPU_ASR`          | `0`            | GPU index the queue bills STT (whisper-stt) against.      |
+| `WHISPER_IDLE_TIMEOUT` | `300` s    | Whisper unloads after this idle period.                   |
+| `DEFAULT_TTS_ENGINE` | `omnivoice`  | Decides ties and the built-in `default` voice (`kikiri` reverses it). |
+| `ALLOW_ANONYMOUS`  | `false`        | Route header-less requests to a shared `api` user.        |
+| `VOCARIUM_ADMIN_USERS` | (empty)    | Comma-separated admins (gateway admin routes + Hörspiele settings). |
+| `VOCARIUM_PROXY_SECRET` | (empty)   | Shared secret proving `Remote-User` came through `vocarium-ui`. |
+| `CORS_ORIGINS`     | (empty)        | Only needed if a foreign origin calls the API directly.   |
 | `MAX_VOICE_UPLOAD_BYTES` | `52428800` | Max reference-audio upload size.                         |
 | `MAX_TRANSCRIBE_UPLOAD_BYTES` | `524288000` | Max STT upload/download size.                   |
 | `MAX_TTS_TEXT_CHARS` | `20000`      | Max request text length for TTS endpoints.                |
-| `DEFAULT_TTS_MODEL`| `1.7b-base`    | One of `1.7b-base`, `1.7b-design`, `1.7b-custom`.         |
 | `LLM_API_URL` etc. | (empty)        | Required for **Podcast Studio**; see below.               |
-
-### Dual-GPU mode (optional)
-
-If you have two GPUs, uncomment two lines in `.env` to spin up a second
-TTS replica on GPU 1 and pin music/SFX there:
-
-```
-COMPOSE_PROFILES=dual-gpu
-TTS_URL_2=http://qwen3-tts-2:8880
-GPU_MUSIC=1
-GPU_SFX=1
-```
-
-Then `docker compose up -d` brings up the extra `qwen3-tts-2` and
-`vocarium-api-2` containers. With one GPU, leave these commented and the
-auto-unload logic (`*_IDLE_TIMEOUT`) keeps everything coexisting on GPU 0.
+| `PLEX_BASE_URL`, `CODEX_AGENT_BASE_URL` | (empty) | Required for **Hörspiele**; see `.env.example`. |
 
 ### Authentication
 
@@ -148,9 +121,15 @@ Identity is read from the `Remote-User` (Authelia) or `X-Forwarded-User`
 client → reverse proxy (auth) → vocarium-ui:3000 → vocarium-api:8280
 ```
 
-For a quick local single-user setup, leave `ALLOW_ANONYMOUS=true`. Every
+For a quick local single-user setup, set `ALLOW_ANONYMOUS=true`. Every
 header-less request is then routed to a shared `api` user. **Do not use
 this in any deployment exposed to the internet.**
+
+Because any container on the Docker network could set `Remote-User` itself,
+set `VOCARIUM_PROXY_SECRET` in `.env`: the UI's Nginx then attaches it as
+`X-Vocarium-Proxy-Secret` and the API ignores identity headers that arrive
+without it. Admin rights (gateway admin routes, Hörspiele settings) come only
+from `VOCARIUM_ADMIN_USERS`; an empty list means nobody.
 
 ### Podcast Studio (beta, optional)
 
@@ -161,8 +140,11 @@ this in any deployment exposed to the internet.**
 The podcast pipeline depends on three external services that you supply:
 
 - **LLM** — any OpenAI-compatible chat-completions endpoint (vLLM,
-  llama.cpp, Ollama, an OpenAI key, etc.).
-- **Embeddings** — same shape, e.g. Jina v5 served via vLLM.
+  llama.cpp, an OpenAI key, etc.).
+- **Embeddings** — shipped in the stack: the `embeddings` service runs
+  `bge-m3` on the CPU via llama.cpp. Fetch the weights once with
+  `scripts/download-embedding-model.sh`, or point `EMBEDDING_API_URL` at any
+  other OpenAI-compatible embedding endpoint.
 - **Docling** — the [`docling-serve`](https://github.com/DS4SD/docling)
   HTTP service for PDF/document text extraction.
 
@@ -180,24 +162,24 @@ Vocarium works without them.
                     ▼
               vocarium-api:8280 (FastAPI)
                     │
-                    ├──► qwen3-tts        (port 8880)
-                    ├──► qwen3-tts-2      (port 8880) — dual-gpu profile only
-                    ├──► qwen3-asr        (port 8000) — lazy
-                    ├──► acestep          (port 8003) — lazy
-                    └──► mmaudio          (port 8004) — lazy
+                    ├──► omnivoice-tts    (port 8880) — GPU 0, resident, cloned voices
+                    ├──► kikiri-tts       (port 8881) — CPU, Kokoro fine-tunes + Piper presets
+                    ├──► whisper-stt      (port 8000) — GPU 0, lazy, self-unloading
+                    ├──► embeddings       (port 8080) — CPU, bge-m3 via llama.cpp
+                    └──► hoerspiele-agent (port 8090) — Hörspiele LLM runner (vocarium-agent/)
 ```
 
 - **GPU coordination** is handled by `vocarium-api/gpu_queue.py` (FIFO with
   per-job kind; conflicting models are evicted before the next job runs).
-- **Lazy services** (ASR / music / SFX) start a child process on first
-  request and shut it down after `*_IDLE_TIMEOUT` seconds — this is what
-  makes single-GPU operation viable.
-- **Dual-GPU mode** adds a second TTS replica on the secondary GPU and
-  uses it as a failover/parallel target for podcast rendering.
+- **Whisper** loads on first request and unloads after
+  `WHISPER_IDLE_TIMEOUT` seconds — this is what makes single-GPU operation
+  viable next to the resident OmniVoice model.
+- **Kikiri** never touches the GPU queue, so speech keeps flowing while the
+  GPU transcribes.
 
 See `CLAUDE.md` for the full architecture write-up and `AGENTS.md` for
-non-obvious gotchas (CUDA-graph hangs on Blackwell, pycache poisoning
-with read-only mounts, SSE buffering pitfalls, …).
+non-obvious gotchas (pycache poisoning with read-only mounts, SSE
+buffering pitfalls, …).
 
 ---
 
@@ -206,10 +188,10 @@ with read-only mounts, SSE buffering pitfalls, …).
 ```bash
 # Logs
 docker compose logs -f vocarium-api
-docker compose logs -f qwen3-tts
+docker compose logs -f omnivoice-tts
 
 # Restart a service after editing a volume-mounted .py file
-docker compose restart vocarium-api      # or qwen3-tts, qwen3-tts-2, …
+docker compose restart vocarium-api      # or whisper-stt, omnivoice-tts, …
 
 # Rebuild after Dockerfile / requirements change
 docker compose build vocarium-api && docker compose up -d vocarium-api
@@ -218,17 +200,18 @@ docker compose build vocarium-api && docker compose up -d vocarium-api
 curl http://localhost:8280/api/health
 curl http://localhost:8280/api/queue/status
 
-# Manual model load / unload
-curl -X POST http://localhost:8201/v1/models/load \
-  -H 'Content-Type: application/json' \
-  -d '{"model_id":"1.7b-custom"}'
-curl -X POST http://localhost:8201/unload
+# Free GPU 0 by unloading Whisper by hand
+curl -X POST http://localhost:8210/unload
 
-# Quick TTS test
-curl -s -X POST http://localhost:8201/v1/audio/speech/custom \
+# Quick TTS test through the gateway
+curl -s -X POST http://localhost:8280/v1/audio/speech \
   -H 'Content-Type: application/json' \
-  -d '{"text":"Hello world","speaker":"Vivian","language":"English"}' \
+  -d '{"input":"Hallo Welt","voice":"default","response_format":"wav"}' \
   -o test.wav
+
+# Backend tests (inside the API image) and UI lint
+scripts/run-api-tests.sh
+(cd vocarium-ui && npm run lint)
 ```
 
 ---
@@ -251,10 +234,12 @@ before any commercial use:
 
 | Model              | License page                                                                                              |
 |--------------------|-----------------------------------------------------------------------------------------------------------|
-| Qwen3-TTS variants | https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base                                                      |
-| Qwen3-ASR          | https://huggingface.co/Qwen/Qwen3-ASR-0.6B                                                                |
-| ACE-Step           | https://github.com/ACE-Step/ACE-Step-1.5                                                                  |
-| MMAudio            | https://github.com/hkchengrex/MMAudio                                                                     |
+| OmniVoice          | https://huggingface.co/k2-fsa/OmniVoice                                                                   |
+| Kokoro (Kikiri)    | https://huggingface.co/hexgrad/Kokoro-82M                                                                 |
+| Piper voices       | https://huggingface.co/rhasspy/piper-voices                                                               |
+| faster-whisper     | https://huggingface.co/Systran/faster-whisper-large-v3                                                    |
+| Flix Swiss German  | https://huggingface.co/Flix-AI/flix-swissgerman-full                                                      |
+| bge-m3 (GGUF)      | https://huggingface.co/BAAI/bge-m3                                                                        |
 
 Vocarium itself is MIT-licensed — see [LICENSE](LICENSE).
 
@@ -265,10 +250,6 @@ Vocarium itself is MIT-licensed — see [LICENSE](LICENSE).
 **`nvidia runtime not found`**
 Install the NVIDIA Container Toolkit and restart Docker:
 https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
-
-**TTS first-call hang on RTX 50xx (Blackwell)**
-Not a hang — `TTS_ATTN_IMPL=eager` triggers kernel compilation on first
-use (~15 s, GPU at 100 %). Subsequent calls are fast.
 
 **`fix didn't work` after editing a volume-mounted `*.py`**
 Stale `__pycache__` from before `PYTHONDONTWRITEBYTECODE=1` was set.

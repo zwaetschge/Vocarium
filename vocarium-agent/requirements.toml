@@ -1,0 +1,18 @@
+allowed_sandbox_modes = ["read-only"]
+
+[permissions.filesystem]
+# Nur die Geheimnisse im Codex-Home sperren. Codex 0.145 legt seine eigenen
+# Laufzeitverzeichnisse (tmp/arg0, .tmp, log) unter CODEX_HOME an und weigert
+# sich zu starten, wenn eine deny_read-Regel diese mit abdeckt.
+deny_read = [
+  "/home/agent/.codex/auth.json",
+  "/home/agent/.codex/config.toml",
+  "/home/agent/.codex/history.jsonl",
+  "/home/agent/.codex/sessions",
+  "/home/agent/.codex/sessions/**",
+]
+
+[rules]
+prefix_rules = [
+  { pattern = [{ any_of = ["bash", "sh", "zsh"] }], decision = "prompt", justification = "The mapping researcher uses only the built-in web-search tool and must not execute shell commands." },
+]

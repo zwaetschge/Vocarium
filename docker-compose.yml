@@ -15,156 +15,184 @@ x-podcast-env: &podcast-env
   LLM_API_KEY: ${LLM_API_KEY:-}
   LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0.8}
   LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-16384}
+  LLM_ENABLE_THINKING: ${LLM_ENABLE_THINKING:-false}
   LLM_ALLOW_PRIVATE_BASE_URLS: ${LLM_ALLOW_PRIVATE_BASE_URLS:-false}
   LLM_ALLOWED_PRIVATE_HOSTS: ${LLM_ALLOWED_PRIVATE_HOSTS:-}
   LLM_VALIDATE_BASE_URL_DNS: ${LLM_VALIDATE_BASE_URL_DNS:-true}
-  EMBEDDING_API_URL: ${EMBEDDING_API_URL:-}
-  EMBEDDING_MODEL: ${EMBEDDING_MODEL:-}
+  # Embeddings run locally on CPU via llama.cpp (service `embeddings` below).
+  EMBEDDING_API_URL: ${EMBEDDING_API_URL:-http://embeddings:8080/v1}
+  EMBEDDING_MODEL: ${EMBEDDING_MODEL:-bge-m3}
   EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
   EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1024}
   DOCLING_API_URL: ${DOCLING_API_URL:-}
 
 services:
-  # --- ASR (Qwen3-ASR with on-demand vLLM backend) ---------------------------
-  qwen3-asr:
-    image: qwenllm/qwen3-asr:latest
-    container_name: qwen3-asr
-    runtime: nvidia
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=${GPU_ASR:-0}
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      - GPU_MEM_UTIL=0.3
-      - MAX_MODEL_LEN=2048
-      - IDLE_TIMEOUT=${ASR_IDLE_TIMEOUT:-300}
+  # --- Embeddings (llama.cpp, CPU-only) --------------------------------------
+  # Replaces the removed Ollama backend. bge-m3 is multilingual and keeps the
+  # 1024-dim vector shape, so embedding caches written by the old backend stay
+  # valid -- no re-import needed.
+  #
+  # -ub must be >= -c: bge-m3 is non-causal, llama.cpp refuses to split an
+  # embedding sequence across micro-batches.
+  embeddings:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    container_name: vocarium-embeddings
+    command:
+      - "-m"
+      - "/models/${EMBEDDING_GGUF:-bge-m3-Q8_0.gguf}"
+      - "--embeddings"
+      - "--pooling"
+      - "cls"
+      - "-c"
+      - "2048"
+      - "-b"
+      - "2048"
+      - "-ub"
+      - "2048"
+      - "-t"
+      - "${EMBEDDING_THREADS:-16}"
+      - "--parallel"
+      - "1"
+      - "--alias"
+      - "${EMBEDDING_MODEL:-bge-m3}"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8080"
     ports:
-      - "127.0.0.1:${ASR_PORT:-8200}:8000"
+      - "127.0.0.1:${EMBEDDING_PORT:-8211}:8080"
     volumes:
-      - ${HF_CACHE_DIR:-./models}:/root/.cache/huggingface
-      - ./entrypoint.sh:/entrypoint.sh:ro
-      - ./asr_proxy.py:/app/asr_proxy.py:ro
-    entrypoint: ["/bin/bash", "/entrypoint.sh"]
-    shm_size: "4g"
-    restart: unless-stopped
-    networks:
-      - voice-network
-      - traefik-public
-
-  # --- TTS replica 1 ---------------------------------------------------------
-  qwen3-tts:
-    build:
-      context: ./qwen3-tts
-      dockerfile: Dockerfile
-    container_name: qwen3-tts
-    runtime: nvidia
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=${GPU_TTS_1:-0}
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      - MODELS_DIR=/app/models
-      - VOICES_DIR=/app/voices
-      - DEFAULT_MODEL=${DEFAULT_TTS_MODEL:-1.7b-base}
-      - IDLE_TIMEOUT=${TTS_IDLE_TIMEOUT:-120}
-      - MAX_VOICE_UPLOAD_BYTES=${MAX_VOICE_UPLOAD_BYTES:-52428800}
-      - ATTN_IMPL=${TTS_ATTN_IMPL:-eager}
-      - TTS_ENABLE_CUDA_GRAPHS=${TTS_ENABLE_CUDA_GRAPHS:-false}
-      - TTS_CLONE_XVEC_ONLY=${TTS_CLONE_XVEC_ONLY:-true}
-      - TTS_CLONE_NON_STREAMING_MODE=${TTS_CLONE_NON_STREAMING_MODE:-false}
-      - TTS_TOKEN_BUDGET_MIN=${TTS_TOKEN_BUDGET_MIN:-40}
-      - PYTHONDONTWRITEBYTECODE=1
-      - PYTHONUNBUFFERED=1
-    ports:
-      - "127.0.0.1:${TTS_PORT:-8201}:8880"
-    volumes:
-      - ./qwen3-tts/models:/app/models
-      - ./qwen3-tts/server.py:/app/server.py:ro
-      - ./qwen3-tts/ref_audio:/app/ref_audio:ro
-      - type: tmpfs
-        target: /app/__pycache__
-      - voices-data:/app/voices
-    shm_size: "4g"
-    restart: unless-stopped
-    networks:
-      - voice-network
-      - traefik-public
-
-  # --- TTS replica 2 (opt-in: enable with COMPOSE_PROFILES=dual-gpu) --------
-  qwen3-tts-2:
-    profiles: ["dual-gpu"]
-    build:
-      context: ./qwen3-tts
-      dockerfile: Dockerfile
-    container_name: qwen3-tts-2
-    runtime: nvidia
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=${GPU_TTS_2:-1}
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      - MODELS_DIR=/app/models
-      - VOICES_DIR=/app/voices
-      - DEFAULT_MODEL=${DEFAULT_TTS_MODEL:-1.7b-base}
-      - IDLE_TIMEOUT=${TTS_IDLE_TIMEOUT:-120}
-      - MAX_VOICE_UPLOAD_BYTES=${MAX_VOICE_UPLOAD_BYTES:-52428800}
-      - ATTN_IMPL=${TTS_ATTN_IMPL:-eager}
-      - TTS_ENABLE_CUDA_GRAPHS=${TTS_ENABLE_CUDA_GRAPHS:-false}
-      - TTS_CLONE_XVEC_ONLY=${TTS_CLONE_XVEC_ONLY:-true}
-      - TTS_CLONE_NON_STREAMING_MODE=${TTS_CLONE_NON_STREAMING_MODE:-false}
-      - TTS_TOKEN_BUDGET_MIN=${TTS_TOKEN_BUDGET_MIN:-40}
-      - PYTHONDONTWRITEBYTECODE=1
-      - PYTHONUNBUFFERED=1
-    ports:
-      - "127.0.0.1:${TTS_PORT_2:-8202}:8880"
-    volumes:
-      - ./qwen3-tts/models:/app/models
-      - ./qwen3-tts/server.py:/app/server.py:ro
-      - ./qwen3-tts/ref_audio:/app/ref_audio:ro
-      - type: tmpfs
-        target: /app/__pycache__
-      - voices-data:/app/voices
-    shm_size: "4g"
+      - ${VOCARIUM_HOST_ROOT:-.}/llama-embeddings/models:/models:ro
+    cpus: ${EMBEDDING_CPUS:-16}
+    mem_limit: ${EMBEDDING_MEMORY_LIMIT:-3g}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
     restart: unless-stopped
     networks:
       - voice-network
 
-  # --- ACE-Step (music) ------------------------------------------------------
-  acestep:
+  # --- Kikiri fixed voice (CPU-only) -----------------------------------------
+  kikiri-tts:
     build:
-      context: ./acestep
+      context: ./kikiri-tts
       dockerfile: Dockerfile
-    container_name: acestep
-    runtime: nvidia
+    container_name: kikiri-tts
     environment:
-      - NVIDIA_VISIBLE_DEVICES=${GPU_MUSIC:-0}
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      - ACESTEP_CONFIG_PATH=acestep-v15-xl-turbo
-      - ACESTEP_LM_MODEL_PATH=acestep-5Hz-lm-1.7B
-      - ACESTEP_LM_BACKEND=pt
-      - IDLE_TIMEOUT=${MUSIC_IDLE_TIMEOUT:-600}
+      KIKIRI_MODEL_ID: ${KIKIRI_DEFAULT_MODEL:-default-1}
+      KIKIRI_VOICE_ID: default
+      KIKIRI_MAX_RESIDENT_MODELS: ${KIKIRI_MAX_RESIDENT_MODELS:-2}
+      KIKIRI_MAX_RESIDENT_PIPER: ${KIKIRI_MAX_RESIDENT_PIPER:-3}
+      PIPER_ONNX_THREADS: ${KIKIRI_PIPER_ONNX_THREADS:-4}
+      KIKIRI_TORCH_THREADS: ${KIKIRI_TORCH_THREADS:-12}
+      KIKIRI_MAX_TEXT_CHARS: ${MAX_TTS_TEXT_CHARS:-5000}
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
     ports:
-      - "127.0.0.1:${MUSIC_PORT:-8203}:8003"
+      - "127.0.0.1:${KIKIRI_TTS_PORT:-8205}:8881"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8881/health', timeout=5).status == 200 else 1)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
     volumes:
-      - ./acestep/proxy.py:/app/proxy.py:ro
-      - acestep-cache:/root/.cache/huggingface
-      - acestep-output:/app/acestep/.cache/acestep
-    shm_size: "4g"
+      - ${VOCARIUM_HOST_ROOT:-.}/kikiri-tts/models:/models:ro
+      # Fallback voice bank (Piper/ONNX). Read-only, never baked into the image.
+      - ${VOCARIUM_HOST_ROOT:-.}/kikiri-tts/piper-models:/piper-models:ro
+    cpus: ${KIKIRI_CPUS:-12}
+    mem_limit: ${KIKIRI_MEMORY_LIMIT:-4g}
     restart: unless-stopped
     networks:
       - voice-network
 
-  # --- MMAudio (sound effects) -----------------------------------------------
-  mmaudio:
+  # --- Shared CUDA + PyTorch base (build only, never started) ----------------
+  # Build-only: the "build" profile keeps `docker compose up` from starting it.
+  # omnivoice-tts and whisper-stt build FROM this image; build it first.
+  gpu-base:
+    profiles: ["build"]
     build:
-      context: ./mmaudio
+      context: ./gpu-base
       dockerfile: Dockerfile
-    container_name: mmaudio
+    image: vocarium-gpu-base:latest
+
+  # --- OmniVoice (GPU, resident ~2.1 GB, no queue) ---------------------------
+  # Zero-shot cloning from a few seconds of reference audio. Voices are pairs in
+  # omnivoice-api/voices/: <Name>.wav (3-10 s, 24 kHz) + <Name>.txt (transcript).
+  # Build gpu-base first: this image reuses its CUDA + PyTorch layers.
+  omnivoice-tts:
+    build:
+      context: ./omnivoice-api
+      dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: ${OMNIVOICE_BASE_IMAGE:-vocarium-gpu-base:latest}
+    image: vocarium-omnivoice:latest
+    container_name: omnivoice-tts
     runtime: nvidia
     environment:
-      - NVIDIA_VISIBLE_DEVICES=${GPU_SFX:-0}
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      - IDLE_TIMEOUT=${SFX_IDLE_TIMEOUT:-600}
+      NVIDIA_VISIBLE_DEVICES: ${GPU_TTS_1:-0}
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      # Without expandable_segments the allocator keeps every voice-prompt encode
+      # and every generation as reserved-but-unallocated blocks: measured 7.8 GB
+      # resident with 17 voices instead of ~2.1 GB.
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      OMNIVOICE_DEVICE: ${OMNIVOICE_DEVICE:-cuda}
+      OMNIVOICE_VOICES_DIR: /voices
+      HF_HOME: /hf
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
     ports:
-      - "127.0.0.1:${SFX_PORT:-8204}:8004"
+      - "127.0.0.1:${OMNIVOICE_PORT:-8208}:8880"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8880/health', timeout=5).status == 200 else 1)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
     volumes:
-      - ./mmaudio/server.py:/app/server.py:ro
-      - mmaudio-cache:/root/.cache
-    shm_size: "4g"
+      - ${OMNIVOICE_HF_CACHE:-${VOCARIUM_HOST_ROOT:-.}/omnivoice-api/cache}:/hf
+      - ${VOCARIUM_HOST_ROOT:-.}/omnivoice-api/voices:/voices
+      - ${VOCARIUM_HOST_ROOT:-.}/omnivoice-api/server.py:/srv/server.py:ro
+    restart: unless-stopped
+    networks:
+      - voice-network
+
+  # --- Whisper STT (GPU, lazy, self-unloading) -------------------------------
+  # Two profiles served one at a time: "german" (vanilla large-v3, default) and
+  # "swiss" (Flix finetune). Do not make swiss the default -- it silently
+  # translates some clean standard-German audio to English.
+  # Build gpu-base first: this image reuses its CUDA + PyTorch layers.
+  whisper-stt:
+    build:
+      context: ./whisper-stt
+      dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: ${WHISPER_BASE_IMAGE:-vocarium-gpu-base:latest}
+    image: vocarium-whisper-stt:latest
+    container_name: whisper-stt
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ${GPU_ASR:-0}
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      WHISPER_MODEL: ${WHISPER_SWISS_MODEL:-Flix-AI/flix-swissgerman-full}
+      HF_HOME: /models
+      IDLE_TIMEOUT: ${WHISPER_IDLE_TIMEOUT:-300}
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "127.0.0.1:${WHISPER_PORT:-8210}:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).status == 200 else 1)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    volumes:
+      - ${WHISPER_MODEL_DIR:-${VOCARIUM_HOST_ROOT:-.}/models}:/models
+      - ${VOCARIUM_HOST_ROOT:-.}/whisper-stt/server.py:/srv/server.py:ro
     restart: unless-stopped
     networks:
       - voice-network
@@ -177,16 +205,23 @@ services:
     container_name: vocarium-api
     environment:
       <<: *podcast-env
-      TTS_URL: http://qwen3-tts:8880
+      # Qwen3-TTS is retired: no Compose service, empty URL, voices hidden.
+      # To resurrect it, restore the service and set both back.
+      TTS_URL: ${TTS_URL:-}
+      QWEN_TTS_ENABLED: ${QWEN_TTS_ENABLED:-false}
       TTS_URL_2: ${TTS_URL_2:-}
-      ASR_URL: http://qwen3-asr:8000
-      MUSIC_URL: http://acestep:8003
-      SFX_URL: http://mmaudio:8004
+      # VibeVoice is retired too (its clones were migrated to OmniVoice). A
+      # non-empty default costs a DNS lookup against a dead host per resolution.
+      VIBEVOICE_TTS_URL: ${VIBEVOICE_TTS_URL:-}
+      OMNIVOICE_TTS_URL: ${OMNIVOICE_TTS_URL:-http://omnivoice-tts:8880}
+      KIKIRI_TTS_URL: http://kikiri-tts:8881
+      DEFAULT_TTS_ENGINE: ${DEFAULT_TTS_ENGINE:-omnivoice}
+      WHISPER_URL: ${WHISPER_URL:-http://whisper-stt:8000}
+      MUSIC_URL: ""
       GPU_TTS_PRIMARY: ${GPU_TTS_1:-0}
       GPU_TTS_EXTRA: ${GPU_TTS_2:-1}
-      GPU_ASR: ${GPU_ASR:-0}
+      GPU_ASR: ${GPU_ASR:-0}  # Whisper-STT
       GPU_MUSIC: ${GPU_MUSIC:-0}
-      GPU_SFX: ${GPU_SFX:-0}
       GPUTASKS_URL: ${GPUTASKS_URL:-http://gpu-task-manager:3000}
       GPU_GUARD_ENABLED: ${GPU_GUARD_ENABLED:-true}
       GPU_GUARD_FAIL_OPEN: ${GPU_GUARD_FAIL_OPEN:-false}
@@ -194,110 +229,152 @@ services:
       GPU_PROTECTED_NAMES: ${GPU_PROTECTED_NAMES:-5060}
       GPU_PROTECTED_PROCESS_PATTERNS: ${GPU_PROTECTED_PROCESS_PATTERNS:-comfyui}
       GPU_PROTECTED_UNKNOWN_USED_MIB: ${GPU_PROTECTED_UNKNOWN_USED_MIB:-1024}
-      GPU_ESTIMATE_MIB_TTS: ${GPU_ESTIMATE_MIB_TTS:-8500}
+      GPU_ESTIMATE_MIB_TTS: ${GPU_ESTIMATE_MIB_TTS:-5500}
+      GPU_GUARD_MEMORY_TOLERANCE_MIB_TTS: ${GPU_GUARD_MEMORY_TOLERANCE_MIB_TTS:-512}
       GPU_ESTIMATE_MIB_ASR: ${GPU_ESTIMATE_MIB_ASR:-2500}
       GPU_ESTIMATE_MIB_MUSIC: ${GPU_ESTIMATE_MIB_MUSIC:-8000}
-      GPU_ESTIMATE_MIB_SFX: ${GPU_ESTIMATE_MIB_SFX:-7000}
+      GPU_CUDA_OVERHEAD_MIB: ${GPU_CUDA_OVERHEAD_MIB:-500}
       DATA_DIR: /app/data
       VOICES_DIR: /app/voices
       PODCAST_AUDIO_PATH: /app/data/podcast_audio
-      PODCAST_SFX_PATH: /app/data/podcast_sfx
       PODCAST_UPLOAD_PATH: /app/data/podcast_uploads
       PODCAST_VALIDATE_SOURCE_DNS: ${PODCAST_VALIDATE_SOURCE_DNS:-true}
-      ALLOW_ANONYMOUS: ${ALLOW_ANONYMOUS:-true}
-      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+      # Sicher-by-default: kein anonymer Zugriff, niemand Admin, kein CORS.
+      # Der Einzelnutzer-Betrieb setzt die drei Werte bewusst in .env.
+      ALLOW_ANONYMOUS: ${ALLOW_ANONYMOUS:-false}
+      VOCARIUM_ADMIN_USERS: ${VOCARIUM_ADMIN_USERS:-}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+      # Nachweis, dass Remote-User vom Proxy (vocarium-ui/Nginx) stammt.
+      VOCARIUM_PROXY_SECRET: ${VOCARIUM_PROXY_SECRET:-}
       VOCARIUM_INSTANCE_ID: vocarium-api
+      # --- Hörspiele ------------------------------------------------------------
+      HOERSPIELE_DATA_DIR: /app/data/hoerspiele
+      MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-52428800}
+      PLEX_BASE_URL: ${PLEX_BASE_URL:-}
+      PLEX_TOKEN: ${PLEX_TOKEN:-}
+      PLEX_TOKEN_FILE: ${PLEX_TOKEN_FILE:-/run/secrets/plex-token}
+      PLEX_LIBRARY_SECTION: ${PLEX_LIBRARY_SECTION:-}
+      PLEX_MEDIA_SERVER_ROOT: ${PLEX_MEDIA_SERVER_ROOT:-/data}
+      PLEX_MEDIA_LOCAL_ROOT: ${PLEX_MEDIA_LOCAL_ROOT:-/plex-media}
+      # Vocarium-eigener Recherche-/Dramaturgie-Agent (Service hoerspiele-agent).
+      CODEX_AGENT_BASE_URL: ${CODEX_AGENT_BASE_URL:-http://hoerspiele-agent:8090}
+      CODEX_RESEARCH_TIMEOUT_SECONDS: ${CODEX_RESEARCH_TIMEOUT_SECONDS:-1200}
+      ASR_CHUNK_SECONDS: ${ASR_CHUNK_SECONDS:-90}
+      WHISPER_PROFILE: ${WHISPER_PROFILE:-}
       PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONPYCACHEPREFIX: /tmp/vocarium-pycache
       PYTHONUNBUFFERED: "1"
     ports:
       - "127.0.0.1:${VOCARIUM_API_PORT:-8280}:8280"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8280/api/health', timeout=5).status == 200 else 1)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
     volumes:
-      - ./vocarium-api/main.py:/app/main.py:ro
-      - ./vocarium-api/database.py:/app/database.py:ro
-      - ./vocarium-api/gpu_queue.py:/app/gpu_queue.py:ro
-      - ./vocarium-api/metrics.py:/app/metrics.py:ro
-      - ./vocarium-api/request_context.py:/app/request_context.py:ro
-      - ./vocarium-api/artifact_cleanup.py:/app/artifact_cleanup.py:ro
-      - ./vocarium-api/url_security.py:/app/url_security.py:ro
-      - ./vocarium-api/podcast:/app/podcast:ro
+      - ${VOCARIUM_HOST_ROOT:-.}/vocarium-api/main.py:/app/main.py:ro
+      - ${VOCARIUM_HOST_ROOT:-.}/vocarium-api/library.py:/app/library.py:ro
+      - ${VOCARIUM_HOST_ROOT:-.}/vocarium-api/access_control.py:/app/access_control.py:ro
+      - ${VOCARIUM_HOST_ROOT:-.}/vocarium-api/database.py:/app/database.py:ro
+      - ${VOCARIUM_HOST_ROOT:-.}/vocarium-api/gpu_queue.py:/app/gpu_queue.py:ro
+      - ${VOCARIUM_HOST_ROOT:-.}/vocarium-api/metrics.py:/app/metrics.py:ro
+      - ${VOCARIUM_HOST_ROOT:-.}/vocarium-api/health_public.py:/app/health_public.py:ro
+      - ${VOCARIUM_HOST_ROOT:-.}/vocarium-api/request_context.py:/app/request_context.py:ro
+      - ${VOCARIUM_HOST_ROOT:-.}/vocarium-api/artifact_cleanup.py:/app/artifact_cleanup.py:ro
+      - ${VOCARIUM_HOST_ROOT:-.}/vocarium-api/url_security.py:/app/url_security.py:ro
+      - ${VOCARIUM_HOST_ROOT:-.}/vocarium-api/user_settings.py:/app/user_settings.py:ro
+      - ${VOCARIUM_HOST_ROOT:-.}/vocarium-api/podcast:/app/podcast:ro
+      - ${VOCARIUM_HOST_ROOT:-.}/vocarium-api/audiobooks:/app/audiobooks:ro
+      - ${VOCARIUM_HOST_ROOT:-.}/vocarium-api/hoerspiele:/app/hoerspiele:ro
+      # Plex liefert nur Pfade; die Mediendateien liest der Renderer selbst.
+      - ${PLEX_MEDIA_HOST_ROOT:-/mnt/user/Plex}:/plex-media:ro
+      # Plex-Token aus dem Vocarium-eigenen Secrets-Verzeichnis (siehe .env).
+      - ${PLEX_TOKEN_HOST_FILE:-/dev/null}:/run/secrets/plex-token:ro
       - type: tmpfs
-        target: /app/__pycache__
-      - type: tmpfs
-        target: /app/podcast/__pycache__
-      - acestep-output:/app/acestep/.cache/acestep:ro
+        target: /tmp/vocarium-pycache
       - vocarium-data:/app/data
       - voices-data:/app/voices
     restart: unless-stopped
     depends_on:
-      - qwen3-tts
+      - kikiri-tts
+      - omnivoice-tts
+      - whisper-stt
+      - embeddings
+      - hoerspiele-agent
     networks:
       - voice-network
       - subwave-internal
 
-  # --- Gateway API (replica 2 — opt-in: COMPOSE_PROFILES=dual-gpu) ----------
-  vocarium-api-2:
-    profiles: ["dual-gpu"]
+  # --- Hörspiele: Recherche-/Dramaturgie-Agent ------------------------------
+  # Vocarium-eigener KI-Runner (früher der Agent des Szenenklang-Stacks). Er
+  # führt Kapitelzuordnung, Folgenkontext-Recherche und Szenenausrichtung aus
+  # (Provider zai direkt, Codex/Claude Code über die eingebauten CLIs).
+  # Zugangsdaten liegen unter ${VOCARIUM_AGENT_HOST_ROOT} und werden über die
+  # Hörspiele-Einstellungen (Zugänge) gepflegt.
+  hoerspiele-agent:
     build:
-      context: ./vocarium-api
+      context: ./vocarium-agent
       dockerfile: Dockerfile
-    container_name: vocarium-api-2
+    image: vocarium-hoerspiele-agent:latest
+    container_name: hoerspiele-agent
+    user: "1000:1000"
     environment:
-      <<: *podcast-env
-      TTS_URL: http://qwen3-tts-2:8880
-      TTS_URL_2: http://qwen3-tts:8880
-      ASR_URL: http://qwen3-asr:8000
-      MUSIC_URL: http://acestep:8003
-      SFX_URL: http://mmaudio:8004
-      GPU_TTS_PRIMARY: ${GPU_TTS_2:-1}
-      GPU_TTS_EXTRA: ${GPU_TTS_1:-0}
-      GPU_ASR: ${GPU_ASR:-0}
-      GPU_MUSIC: ${GPU_MUSIC:-0}
-      GPU_SFX: ${GPU_SFX:-0}
-      GPUTASKS_URL: ${GPUTASKS_URL:-http://gpu-task-manager:3000}
-      GPU_GUARD_ENABLED: ${GPU_GUARD_ENABLED:-true}
-      GPU_GUARD_FAIL_OPEN: ${GPU_GUARD_FAIL_OPEN:-false}
-      GPU_PROTECTED_IDS: ${GPU_PROTECTED_IDS:-1}
-      GPU_PROTECTED_NAMES: ${GPU_PROTECTED_NAMES:-5060}
-      GPU_PROTECTED_PROCESS_PATTERNS: ${GPU_PROTECTED_PROCESS_PATTERNS:-comfyui}
-      GPU_PROTECTED_UNKNOWN_USED_MIB: ${GPU_PROTECTED_UNKNOWN_USED_MIB:-1024}
-      GPU_ESTIMATE_MIB_TTS: ${GPU_ESTIMATE_MIB_TTS:-8500}
-      GPU_ESTIMATE_MIB_ASR: ${GPU_ESTIMATE_MIB_ASR:-2500}
-      GPU_ESTIMATE_MIB_MUSIC: ${GPU_ESTIMATE_MIB_MUSIC:-8000}
-      GPU_ESTIMATE_MIB_SFX: ${GPU_ESTIMATE_MIB_SFX:-7000}
-      DATA_DIR: /app/data
-      VOICES_DIR: /app/voices
-      PODCAST_AUDIO_PATH: /app/data/podcast_audio
-      PODCAST_SFX_PATH: /app/data/podcast_sfx
-      PODCAST_UPLOAD_PATH: /app/data/podcast_uploads
-      PODCAST_VALIDATE_SOURCE_DNS: ${PODCAST_VALIDATE_SOURCE_DNS:-true}
-      ALLOW_ANONYMOUS: ${ALLOW_ANONYMOUS:-true}
-      CORS_ORIGINS: ${CORS_ORIGINS:-*}
-      VOCARIUM_INSTANCE_ID: vocarium-api-2
+      HOME: /home/agent
+      CODEX_HOME: /home/agent/.codex
+      CLAUDE_CONFIG_DIR: /home/agent/.claude
+      CODEX_RESEARCH_TIMEOUT_SECONDS: ${CODEX_RESEARCH_TIMEOUT_SECONDS:-1200}
+      ZAI_API_KEY_FILE: /run/secrets/zai-api-key
+      ZAI_BASE_URL: ${ZAI_BASE_URL:-https://api.z.ai/api/anthropic}
+      # Ein einzelner API-Aufruf darf nicht länger hängen als das Lauf-Limit.
+      ZAI_API_TIMEOUT_MS: ${ZAI_API_TIMEOUT_MS:-7200000}
+      CLAUDE_MAX_TURNS: ${CLAUDE_MAX_TURNS:-}
+      ZAI_MAX_THINKING_TOKENS: ${ZAI_MAX_THINKING_TOKENS:-0}
+      ZAI_DISABLE_THINKING: ${ZAI_DISABLE_THINKING:-true}
+      ZAI_DIRECT: ${ZAI_DIRECT:-true}
+      ZAI_DIRECT_MAX_TOKENS: ${ZAI_DIRECT_MAX_TOKENS:-32000}
+      MAX_INVALID_OUTPUT_ATTEMPTS: ${MAX_INVALID_OUTPUT_ATTEMPTS:-14}
+      NARRATION_MS_PER_WORD: ${NARRATION_MS_PER_WORD:-450}
+      PROVIDER_SECRETS_DIR: /home/agent/.provider-secrets
       PYTHONDONTWRITEBYTECODE: "1"
-      PYTHONUNBUFFERED: "1"
-    ports:
-      - "127.0.0.1:${VOCARIUM_API_PORT_2:-8281}:8280"
     volumes:
-      - ./vocarium-api/main.py:/app/main.py:ro
-      - ./vocarium-api/database.py:/app/database.py:ro
-      - ./vocarium-api/gpu_queue.py:/app/gpu_queue.py:ro
-      - ./vocarium-api/metrics.py:/app/metrics.py:ro
-      - ./vocarium-api/request_context.py:/app/request_context.py:ro
-      - ./vocarium-api/artifact_cleanup.py:/app/artifact_cleanup.py:ro
-      - ./vocarium-api/url_security.py:/app/url_security.py:ro
-      - ./vocarium-api/podcast:/app/podcast:ro
-      - type: tmpfs
-        target: /app/__pycache__
-      - type: tmpfs
-        target: /app/podcast/__pycache__
-      - acestep-output:/app/acestep/.cache/acestep:ro
-      - vocarium-data:/app/data
-      - voices-data:/app/voices
+      - ${VOCARIUM_AGENT_HOST_ROOT:-/mnt/user/appdata/vocarium/agent}/codex-home:/home/agent/.codex
+      - ${VOCARIUM_AGENT_HOST_ROOT:-/mnt/user/appdata/vocarium/agent}/claude-home:/home/agent/.claude
+      - ${VOCARIUM_AGENT_HOST_ROOT:-/mnt/user/appdata/vocarium/agent}/provider-secrets:/home/agent/.provider-secrets
+      - ${ZAI_API_KEY_HOST_FILE:-/dev/null}:/run/secrets/zai-api-key:ro
+    expose:
+      - "8090"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=2)"]
+      interval: 20s
+      timeout: 4s
+      retries: 3
+      start_period: 5s
     restart: unless-stopped
-    depends_on:
-      - qwen3-tts-2
+    security_opt:
+      - no-new-privileges:true
+      # Codex ≥0.145 kapselt Dateizugriffe mit bubblewrap und braucht dafür
+      # unprivilegierte User-Namespaces; Dockers Standard-seccomp-Profil
+      # verbietet clone/unshare mit Namespace-Flags ohne CAP_SYS_ADMIN.
+      # Capabilities bleiben komplett entzogen, das Dateisystem read-only.
+      - seccomp=unconfined
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+      - /work:size=64m,mode=0700,uid=1000,gid=1000
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: "1.0"
     networks:
-      - voice-network
+      voice-network:
+        # Alias für Container, die noch mit CODEX_AGENT_BASE_URL=http://agent:8090
+        # laufen (Stand vor dem Abbau des Szenenklang-Stacks).
+        aliases:
+          - agent
 
   # --- UI --------------------------------------------------------------------
   vocarium-ui:
@@ -305,8 +382,15 @@ services:
       context: ./vocarium-ui
       dockerfile: Dockerfile
     container_name: vocarium-ui
+    environment:
+      VOCARIUM_PROXY_SECRET: ${VOCARIUM_PROXY_SECRET:-}
     ports:
       - "127.0.0.1:${VOCARIUM_UI_PORT:-3100}:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     restart: unless-stopped
     depends_on:
       - vocarium-api
@@ -317,14 +401,11 @@ services:
 volumes:
   voices-data:
   vocarium-data:
-  acestep-cache:
-  acestep-output:
-  mmaudio-cache:
 
 networks:
   voice-network:
     name: voice-network
-    driver: bridge
+    external: true
   traefik-public:
     external: true
     name: brian_traefik-public

@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "alignments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "cue_id": { "type": "string" },
+          "narration_text": { "type": "string" },
+          "purpose": {
+            "type": "string",
+            "enum": [
+              "character_introduction",
+              "scene_transition",
+              "visual_action",
+              "internal_motivation",
+              "offscreen_context",
+              "continuity_bridge",
+              "foreshadowing",
+              "book_boundary"
+            ]
+          },
+          "introduced_characters": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "information_gain": { "type": "string" },
+          "source_detail_coverage": { "type": "number", "minimum": 0, "maximum": 1 },
+          "native_audio_relation": {
+            "type": "string",
+            "enum": [
+              "complements_existing_audio",
+              "no_relevant_existing_narration"
+            ]
+          },
+          "retained_visual_details": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "beat_type": {
+            "type": "string",
+            "enum": [
+              "scene_setup",
+              "pre_action",
+              "action_sync",
+              "reaction",
+              "dialogue_bridge",
+              "scene_close"
+            ]
+          },
+          "audio_strategy": {
+            "type": "string",
+            "enum": [
+              "prefer_ambience_overlay",
+              "pause_at_scene_boundary"
+            ]
+          },
+          "target_duration_ms": {
+            "type": "integer",
+            "minimum": 1500,
+            "maximum": 120000
+          },
+          "anchor_segment_id": { "type": "string" },
+          "placement": { "type": "string", "enum": ["before_anchor", "after_anchor"] },
+          "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+          "reasoning": { "type": "string" }
+        },
+        "required": [
+          "cue_id",
+          "narration_text",
+          "purpose",
+          "introduced_characters",
+          "information_gain",
+          "source_detail_coverage",
+          "native_audio_relation",
+          "retained_visual_details",
+          "beat_type",
+          "audio_strategy",
+          "target_duration_ms",
+          "anchor_segment_id",
+          "placement",
+          "confidence",
+          "reasoning"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "character_introductions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "research_name": { "type": "string" },
+          "spoken_name": { "type": "string" },
+          "cue_id": { "type": "string" },
+          "episode_id": { "type": "string" }
+        },
+        "required": ["research_name", "spoken_name", "cue_id", "episode_id"],
+        "additionalProperties": false
+      }
+    },
+    "name_aliases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "canonical": { "type": "string" },
+          "aliases": { "type": "array", "items": { "type": "string" } },
+          "evidence": { "type": "string" },
+          "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+        },
+        "required": ["canonical", "aliases", "evidence", "confidence"],
+        "additionalProperties": false
+      }
+    },
+    "notes": { "type": "array", "items": { "type": "string" } }
+  },
+  "required": ["alignments", "character_introductions", "name_aliases", "notes"],
+  "additionalProperties": false
+}

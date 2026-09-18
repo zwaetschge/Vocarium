@@ -26,13 +26,42 @@ logger = logging.getLogger(__name__)
 _http_client: httpx.AsyncClient | None = None
 
 
+_http_client_loop: "asyncio.AbstractEventLoop | None" = None
+
+
+def _provider_extras(base_url: str) -> dict[str, object]:
+    """Anbieter-spezifische Felder, die ein generischer OpenAI-Client nicht kennt.
+
+    Z.AI/Zhipu-Modelle (GLM-4.5+) denken standardmaessig erst minutenlang und
+    liefern bei knappem Token-Budget leeren Inhalt. Fuer Skripte mit festem
+    JSON-Format ist das nur Wartezeit; der Schalter ist ein Z.AI-Feld, andere
+    Anbieter lehnen unbekannte Felder ab und bekommen es deshalb nicht.
+    """
+    host = (base_url or "").lower()
+    if os.environ.get("LLM_ENABLE_THINKING", "").lower() in ("1", "true", "yes"):
+        return {}
+    if "z.ai" in host or "bigmodel.cn" in host:
+        return {"thinking": {"type": "disabled"}}
+    return {}
+
+
 def _client() -> httpx.AsyncClient:
-    global _http_client
-    if _http_client is None or _http_client.is_closed:
+    """Ein AsyncClient pro Event-Loop.
+
+    Der Client haelt anyio-Primitive, die an die Loop gebunden sind, in der er
+    erzeugt wurde. Wird er z. B. von einem Startup-Check in einer Nebenloop
+    angelegt und spaeter aus der Uvicorn-Loop benutzt, haengt der Aufruf
+    still und ohne Timeout -- genau das Bild einer Skriptgenerierung, die
+    ewig bei "preparing" steht.
+    """
+    global _http_client, _http_client_loop
+    loop = asyncio.get_running_loop()
+    if _http_client is None or _http_client.is_closed or _http_client_loop is not loop:
         _http_client = httpx.AsyncClient(
             limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
             timeout=None,
         )
+        _http_client_loop = loop
     return _http_client
 
 
@@ -180,6 +209,7 @@ class LLMClient:
             "temperature": temperature if temperature is not None else self.config.temperature,
             "max_tokens": max_tokens if max_tokens is not None else self.config.max_tokens,
             "stream": False,
+            **_provider_extras(self.config.base_url),
         }
 
         last_err: Exception | None = None
@@ -244,6 +274,7 @@ class LLMClient:
             "temperature": temperature if temperature is not None else self.config.temperature,
             "max_tokens": max_tokens if max_tokens is not None else self.config.max_tokens,
             "stream": True,
+            **_provider_extras(self.config.base_url),
         }
 
         start = time.perf_counter()

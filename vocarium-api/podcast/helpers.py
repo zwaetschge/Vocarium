@@ -8,6 +8,8 @@ import secrets
 import time
 from typing import TypeVar
 
+from .tags import strip_tags
+
 
 WORDS_PER_MINUTE = 140
 _WORD_SPLIT = re.compile(r"\s+")
@@ -23,7 +25,9 @@ def generate_id(prefix: str = "") -> str:
 
 
 def count_words(text: str) -> int:
-    stripped = text.strip()
+    """Gesprochene Wörter. Nonverbale Tags wie ``[laughter]`` zählen nicht mit —
+    sie sind Regieanweisung an OmniVoice, kein Wort im Skript."""
+    stripped = strip_tags(text)
     if not stripped:
         return 0
     return sum(1 for w in _WORD_SPLIT.split(stripped) if w)
