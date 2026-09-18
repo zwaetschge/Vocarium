@@ -1680,7 +1680,7 @@ def create_podcast_router(
         async def worker():
             push_progress("preparing", 5, "Preparing script generation")
             try:
-                result = await script_generator.generate(ctx, user_id=user["id"])
+                result = await script_generator.generate(ctx, user_id=user["id"], progress=push_progress)
             except asyncio.CancelledError:
                 logger.info("Script generation cancelled (podcast=%s user=%s)", podcast_id, user["id"])
                 db.execute(

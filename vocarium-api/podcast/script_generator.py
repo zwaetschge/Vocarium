@@ -8,10 +8,11 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Callable,  Any, Literal
 
 from .disfluency import DisfluencyOptions, ScriptSegment, create_disfluency_engine
 from .embedding_client import EmbeddingClient, get_embedding_client
+from .analysis import format_dossier, review_script, run_analysis
 from .helpers import count_words, estimate_speaking_duration, top_k_by_similarity
 from .llm_client import LLMClient, LLMMessage, get_llm_client
 from .tags import TAG_CATALOG, enrich_tags, sanitize as sanitize_tags
@@ -182,8 +183,19 @@ class ScriptGenerator:
         self.embeddings = embeddings or get_embedding_client()
 
     async def generate(
-        self, context: ScriptGenerationContext, *, user_id: int | None = None
+        self,
+        context: ScriptGenerationContext,
+        *,
+        user_id: int | None = None,
+        progress: Callable[[str, int, str], None] | None = None,
     ) -> ScriptGenerationResult:
+        def report(stage: str, percent: int, message: str) -> None:
+            if progress is not None:
+                try:
+                    progress(stage, percent, message)
+                except Exception:  # noqa: BLE001 - Fortschritt darf die Produktion nie stoppen
+                    logger.debug("progress callback failed", exc_info=True)
+
         logger.info(
             "Starting script generation: project=%s format=%s duration=%s",
             context.project_id,
@@ -197,12 +209,22 @@ class ScriptGenerator:
 
         source_context = self._build_source_context(relevant_chunks, context.sources)
         llm = self._resolve_llm(user_id=user_id)
+        segment_target = _SEGMENT_COUNTS[context.options.duration]
+        report("analyzing", 15, "Drei Analyse-Agenten lesen die Quellen: Belege, Gegenlesart, Dramaturgie")
+        dossier = await run_analysis(source_context, context, llm, segment_target)
+        delivered = [name for name, value in dossier.items() if value]
+        logger.info("Analysis dossier delivered by: %s", ", ".join(delivered) or "none")
+        report("writing", 45, f"Skript wird geschrieben ({len(delivered)} von {max(len(dossier), 1)} Analysen im Dossier)")
         logger.info(
             "Calling LLM %s at %s with %d chars of source context",
             llm.config.model, llm.config.base_url, len(source_context),
         )
-        raw_segments = await self._generate_script_segments(source_context, context, llm=llm)
+        raw_segments = await self._generate_script_segments(source_context, context, llm=llm, dossier=dossier)
         logger.info("LLM returned %d raw segments", len(raw_segments))
+        report("reviewing", 80, "Lektorat prüft das Skript und schreibt schwache Segmente um")
+        raw_segments, review = await review_script(raw_segments, dossier, context, llm)
+        if review:
+            report("reviewing", 90, f"Lektorat: Bewertung {review.get('score')}/10, {review.get('rewrites', 0)} Segmente überarbeitet")
 
         segments, _stats = self._apply_disfluency(
             raw_segments,
@@ -285,10 +307,14 @@ class ScriptGenerator:
         return "\n\n---\n\n".join(parts)
 
     async def _generate_script_segments(
-        self, source_context: str, context: ScriptGenerationContext, llm: LLMClient
+        self,
+        source_context: str,
+        context: ScriptGenerationContext,
+        llm: LLMClient,
+        dossier: dict[str, Any] | None = None,
     ) -> list[ScriptSegment]:
         system_prompt = self._get_system_prompt(context.options)
-        user_prompt = self._get_user_prompt(source_context, context)
+        user_prompt = self._get_user_prompt(source_context, context, dossier=dossier)
 
         response = await llm.complete(
             [
@@ -837,11 +863,28 @@ NATURAL (✅):
 REMEMBER: Include fill words, reactions, self-corrections, and natural speech patterns throughout the script."""
 
     def _get_user_prompt(
-        self, source_context: str, context: ScriptGenerationContext
+        self,
+        source_context: str,
+        context: ScriptGenerationContext,
+        dossier: dict[str, Any] | None = None,
     ) -> str:
         custom = ""
         if context.options.custom_prompt:
             custom = f"\n\n## Additional Instructions\n{context.options.custom_prompt}\n"
+        dossier_block = format_dossier(dossier or {})
+        dossier_section = ""
+        if dossier_block:
+            dossier_section = f"""
+{dossier_block}
+
+## So nutzt du das Dossier (verbindlich)
+- Der Hook der Dramaturgie ist der Einstieg. Die Akte sind die Reihenfolge; ihre Anteile bestimmen, wie viele Segmente jeder Akt bekommt.
+- Mindestens fünf Anker aus den Belegen werden wörtlich oder eng paraphrasiert zitiert und mit ihrer Fundstelle benannt.
+- Mindestens drei Streitpunkte der Gegenlesart werden ausgetragen: eine Person vertritt A, eine andere B, mit den genannten Gründen; niemand knickt ohne Argument ein.
+- Mindestens zwei Verbindungen nach außen und zwei benannte Schwächen aus dem Dossier kommen vor.
+- Jede Person spricht so, wie es ihre Notiz „in dieser Folge“ beschreibt; ihr Steckenpferd taucht mindestens einmal auf.
+- Die Callbacks werden im letzten Drittel wieder aufgegriffen.
+"""
 
         segment_count = _SEGMENT_COUNTS[context.options.duration]
         lang_code = _lang_code(context.options.language)
@@ -870,7 +913,18 @@ REMEMBER: Include fill words, reactions, self-corrections, and natural speech pa
 - Host und Experte müssen mindestens zweimal echt uneinig sein (bei Dialog).
 - Reaktionen und Fill-Words sind die FARBE — ersetzen keinen Inhalt.
 - Kein "Wow, ist das spannend" ohne konkreten Bezug.
-{custom}
+
+## Schreibqualität (Lektorat prüft das)
+
+- **Rhythmus:** Segmentlängen variieren. Kurze Einwürfe (unter 12 Wörter), mittlere Gedanken (20-45 Wörter), wenige längere Ausführungen (max. 70 Wörter). Nie zwei lange Ausführungen hintereinander; nach jeder längeren folgt eine Reaktion oder ein kurzer Widerspruch.
+- **Zeigen statt behaupten:** Statt „das ist gut geschrieben“ ein Zitat und ein Satz, was daran wirkt. Statt „das ist problematisch“ der konkrete Fehler.
+- **Verbotene Füllwörter:** spannend, interessant, faszinierend, wirklich gut, am Ende des Tages, ein Stück weit, definitiv, absolut (als Zustimmung). Wer zustimmt, sagt womit.
+- **Figurentreue:** Jede Person hat einen eigenen Ton. Ein Zuhörer muss ohne Sprechernamen erkennen, wer redet. Keine Person übernimmt die Redeweise der anderen.
+- **Echte Uneinigkeit:** Widerspruch hat immer ein Argument aus dem Material. „Seh ich anders“ ohne Begründung ist verboten. Streitpunkte bleiben auch mal offen.
+- **Konkretion:** Namen, Zahlen, Stellen, Zitate. Mindestens ein Drittel der Sprech-Segmente enthält einen konkreten Bezug aus dem Material.
+- **Übergänge:** Kein „Kommen wir zum nächsten Punkt“. Übergänge entstehen aus einem Gedanken, einer Frage oder einem Callback.
+- **Ende:** Kein Fazit-Monolog. Ein Urteil, eine offene Frage oder eine Empfehlung mit Vorbehalt, dann der Vocarium-Sign-off.
+{dossier_section}{custom}
 
 Generate exactly {segment_count} segments following the format specified in the system prompt.
 
